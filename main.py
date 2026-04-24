@@ -9,10 +9,11 @@ model_name = "Qwen/Qwen2-7B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
+    local_files_only=True,
     torch_dtype=torch.bfloat16,
-    device_map="auto"
+    device_map="cuda:0"
 )
-
+model.eval()
 prompt = "Explain KV cache in Transformer. "
 
 inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
