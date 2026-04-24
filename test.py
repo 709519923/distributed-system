@@ -72,6 +72,9 @@ class ModelPartition:
         self.embed = self.model.model.embed_tokens
         self.norm = self.model.model.norm
         self.lm_head = self.model.lm_head
+        
+        # 保存旋转位置编码层
+        # self.rotary_emb = self.model.model.rotary_emb
 
         print(f"Total layers: {n}")
         print(f"Stage0: {len(self.stage0)}")
@@ -90,32 +93,34 @@ class PipelineEngine:
     def forward(self, input_ids):
         timing = {}
 
-        # ----- Stage 0 -----
+        # ----- Embedding -----
         t0 = time.time()
         x = self.p.embed(input_ids)
+        seq_len = x.shape[1]
+        # 计算 position_ids，传给每一层让其内部自行计算 position_embeddings
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
 
+        # ----- Stage 0 -----
         for layer in self.p.stage0:
-            x = layer(x)[0]
+            x = layer(x, position_ids=position_ids)[0]
 
         t1 = time.time()
         timing["stage0"] = t1 - t0
-
         x = self.net.transfer(x)
 
         # ----- Stage 1 -----
         t2 = time.time()
         for layer in self.p.stage1:
-            x = layer(x)[0]
+            x = layer(x, position_ids=position_ids)[0]
 
         t3 = time.time()
         timing["stage1"] = t3 - t2
-
         x = self.net.transfer(x)
 
         # ----- Stage 2 -----
         t4 = time.time()
         for layer in self.p.stage2:
-            x = layer(x)[0]
+            x = layer(x, position_ids=position_ids)[0]
 
         x = self.p.norm(x)
         logits = self.p.lm_head(x)
@@ -124,7 +129,6 @@ class PipelineEngine:
         timing["stage2"] = t5 - t4
 
         return logits, timing
-
 
 # =========================
 # Generator
