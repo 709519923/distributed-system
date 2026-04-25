@@ -1,3 +1,5 @@
+# 3 stage cannot run 4.25.2026
+
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch

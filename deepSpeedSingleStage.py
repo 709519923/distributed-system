@@ -1,3 +1,4 @@
+# successfully run 4.25.2026 with deepspeed single stage inference.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import deepspeed
