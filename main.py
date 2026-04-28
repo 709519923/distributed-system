@@ -1,102 +1,109 @@
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 国内镜像
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import os
+import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ================= 配置区域 =================
-# 选项 A: 如果是本地绝对路径
-LOCAL_MODEL_PATH = "/home/dingcong/models/google/gemma-2-2b-it"
+# ======================================================================
+# Configuration Section
+# ======================================================================
 
-# 选项 B: 如果是 Hugging Face 模型 ID (如果本地路径不存在则回退到此)
-HF_MODEL_ID = "google/gemma-2-2b-it"
+MODEL_ID = "/home/dingcong/models/google/gemma-2-2b-it"
 
-# 检查本地路径是否存在，决定使用哪个标识符
-if os.path.exists(LOCAL_MODEL_PATH):
-    model_id_or_path = LOCAL_MODEL_PATH
-    print(f"✅ 使用本地路径: {LOCAL_MODEL_PATH}")
-else:
-    model_id_or_path = HF_MODEL_ID
-    print(f"⚠️ 本地路径不存在，尝试从 HuggingFace 下载/加载: {HF_MODEL_ID}")
+# Simulated Network Bandwidth (in Bytes per second)
+# Example: 10 Gbps Ethernet ≈ 1.25 GB/s = 1,250,000,000 Bytes/s
+# Example: Slow WAN connection ≈ 100 Mbps = 12,500,000 Bytes/s
+SIMULATED_BANDWIDTH_BPS = 1_000_000_000  # 1 GB/s (Simulating a fast LAN/InfiniBand)
 
-# ================= 核心逻辑 =================
+# Fixed overhead latency (seconds) - e.g., TCP handshake, serialization start
+FIXED_LATENCY_SEC = 0.0001  # 0.1ms
 
-def run_gemma_inference():
-    # 1. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+DEVICE_MAP = {
+    "model.embed_tokens": "cuda:0",
+    "model.layers.0": "cpu",          # CPU Layer (Source of transfer)
+    **{f"model.layers.{i}": "cuda:0" for i in range(1, 26)}, # GPU Layers
+    "model.norm": "cuda:0",
+    "lm_head": "cuda:0"
+}
+
+# ======================================================================
+# Model Loading
+# ======================================================================
+
+print("Loading model...")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    device_map=DEVICE_MAP,
+    torch_dtype=torch.float16
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+tokenizer.pad_token = tokenizer.eos_token
+print("Model loaded.")
+
+# ======================================================================
+# Data-Dependent Latency Simulation Hook
+# ======================================================================
+
+def simulate_data_dependent_latency_hook(module, input_args, output):
+    """
+    Simulates network transfer latency based on the size of the output tensor.
     
-    # Gemma 需要设置 pad_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # 2. 定义手动 Device Map
-    # Gemma-2-2b 通常有 26 层 (model.layers.0 ~ 25)
-    # 要求：CPU 只分配一个 layer (这里选第 0 层)，其余尽量放 GPU
-    device_map = {
-        "model.embed_tokens": "cuda:0",       # 嵌入层放 GPU (加速输入处理)
-        "model.layers.0": "cpu",              # 【关键】强制第 0 层在 CPU
-        **{f"model.layers.{i}": "cuda:0" for i in range(1, 26)}, # 其余 1-25 层放 GPU
-        "model.norm": "cuda:0",               # 最终 Norm 放 GPU
-        "lm_head": "cuda:0"                   # 输出头放 GPU
-    }
-
-    # 如果没有 GPU，将所有 cuda:0 改为 "cpu" 以允许运行，但会失去“跨设备”演示意义
-    if not torch.cuda.is_available():
-        print("❌ 未检测到 GPU，将所有设备映射改为 CPU (无法演示跨设备张量切换)")
-        device_map = {k: "cpu" for k in device_map.keys()}
+    Formula: Total Delay = Fixed Latency + (Tensor Size in Bytes / Bandwidth)
+    """
+    # 1. Calculate the size of the output tensor in Bytes
+    # output can be a tuple or a single tensor. We handle both.
+    if isinstance(output, tuple):
+        # Sum up sizes of all tensors in the tuple
+        total_bytes = sum(t.element_size() * t.nelement() for t in output if isinstance(t, torch.Tensor))
+    elif isinstance(output, torch.Tensor):
+        total_bytes = output.element_size() * output.nelement()
     else:
-        print("✅ 检测到 GPU，将执行跨设备 (CPU <-> GPU) 张量切换演示")
-
-    print("\n🗺️ 预设的设备映射:")
-    for k, v in sorted(device_map.items()):
-        print(f"  {k:<30} -> {v}")
-
-    # 3. 加载模型并应用 Device Map
-    # from_pretrained 内部会自动调用 accelerate 的 dispatch 逻辑
-    print("\n⏳ 正在加载模型权重并分发到指定设备...")
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id_or_path,
-            device_map=device_map,
-            torch_dtype=torch.float16,  # Gemma 推荐 fp16/bf16
-            trust_remote_code=True      # 某些自定义模型可能需要
-        )
-    except Exception as e:
-        print(f"❌ 加载失败: {e}")
-        return
-
-    # 4. 验证实际生效的映射
-    print("\n🔍 实际生效的设备映射 (hf_device_map):")
-    for name, device in model.hf_device_map.items():
-        print(f"  {name:<30} -> {device}")
-
-    # 5. 推理测试
-    prompt = "The capital of France is"
-    inputs = tokenizer(prompt, return_tensors="pt")
-    
-    # ⚠️ 重要：输入必须放在 device_map 中第一个执行模块的设备上
-    # 在我们的 map 中，embed_tokens 在 cuda:0，所以输入要去 cuda:0
-    first_layer_device = device_map["model.embed_tokens"]
-    inputs = {k: v.to(first_layer_device) for k, v in inputs.items()}
-    
-    print(f"\n🚀 开始推理 (输入位于: {first_layer_device})...")
-    print(f"   提示词: '{prompt}'")
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs, 
-            max_new_tokens=20, 
-            do_sample=False  # 确定性输出以便复现
-        )
+        total_bytes = 0
         
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    print(f"\n📝 生成结果:\n{generated_text}")
+    # 2. Calculate variable delay based on bandwidth
+    if SIMULATED_BANDWIDTH_BPS > 0:
+        variable_delay_sec = total_bytes / SIMULATED_BANDWIDTH_BPS
+    else:
+        variable_delay_sec = 0
+        
+    # 3. Total delay
+    total_delay_sec = FIXED_LATENCY_SEC + variable_delay_sec
     
-    # 6. 验证张量切换是否发生 (可选调试)
-    # 如果 model.layers.0 在 CPU，而 embed_tokens 在 GPU，
-    # Accelerate 会在 forward 过程中自动插入 .to('cpu') 和 .to('cuda:0')
-    print("\n✅ 完成！如果未报错，说明跨设备张量路由正常工作。")
+    # 4. Sleep to simulate the transfer time
+    if total_delay_sec > 0:
+        time.sleep(total_delay_sec)
+        
+    # Optional: Print debug info for the first few layers to verify
+    # if hasattr(module, 'layer_idx') and module.layer_idx < 3:
+    #     print(f"Layer {module.layer_idx}: Output Size={total_bytes/1024:.2f} KB, Simulated Delay={total_delay_sec*1000:.2f} ms")
 
-if __name__ == "__main__":
-    run_gemma_inference()
+    return output
+
+# Register hook only on the boundary layer (CPU -> GPU transition)
+# Here, Layer 0 is on CPU, its output goes to Layer 1 on GPU.
+model.model.layers[0].register_forward_hook(simulate_data_dependent_latency_hook)
+
+print(f"Data-dependent latency simulation enabled.")
+print(f"  Fixed Latency: {FIXED_LATENCY_SEC*1000:.2f} ms")
+print(f"  Simulated Bandwidth: {SIMULATED_BANDWIDTH_BPS / 1_000_000:.2f} MB/s")
+
+# ======================================================================
+# Inference Execution
+# ======================================================================
+
+prompt = "The capital of France is"
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
+
+print("\nStarting inference with data-dependent delays...")
+start_time = time.time()
+with torch.no_grad():
+    outputs = model.generate(**inputs, max_new_tokens=20, do_sample=False)
+end_time = time.time()
+
+generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+elapsed_time = end_time - start_time
+
+print(f"\nTotal Inference Time: {elapsed_time:.2f} seconds")
+print(f"Generated Text:\n{generated_text}")
+print("\nDone.")
