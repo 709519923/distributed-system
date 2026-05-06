@@ -47,6 +47,38 @@ If you add `--build_dataset`, prompts will be repeated/truncated to exactly `bat
 - `.txt`: one prompt per line.
 - `.csv`: must contain a `prompt` column.
 
+## build_qwen_inference_dataset usage
+
+Use `build_qwen_inference_dataset` to generate a CSV dataset for inference, then pass that CSV to `main5.py`.
+
+Typical flow:
+
+1. Build dataset (example):
+
+```bash
+python build_qwen_inference_dataset.py
+```
+
+2. Confirm output CSV has a `prompt` column (for example: `input_64.csv`).
+
+3. Run inference with that CSV:
+
+```bash
+python main5.py \
+  --model_id /home/dingcong/models/google/gemma-2-2b-it \
+  --input_file input_64.csv \
+  --output_file outputs_bs64_sl256.txt \
+  --summary_file summary_bs64_sl256.txt \
+  --batch_size 64 \
+  --sequence_length 256 \
+  --num_cpu_layers 3 \
+  --mid_gpu_layer 12
+```
+
+Notes:
+- Keep `--build_dataset` disabled if you want to process all rows in the CSV.
+- Enable `--build_dataset` only when you want exactly one synthetic batch (size = `batch_size`).
+
 ## Output files
 
 - `output_file`: includes config + decoded generated samples.
