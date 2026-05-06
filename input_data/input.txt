@@ -1,0 +1,63 @@
+Explain pipeline parallelism in large language models.
+Explain micro-batching in distributed inference.
+What is model partitioning across devices?
+Describe edge-cloud collaborative inference architecture.
+What is KV cache and why is it important?
+Explain the attention mechanism in Transformers.
+What is the difference between latency and throughput?
+Describe GPU memory bottlenecks in LLM inference.
+Explain tensor parallelism.
+Explain pipeline parallelism.
+Explain data parallelism.
+What is model sharding?
+How does communication overhead affect distributed inference?
+Explain the role of bandwidth in model inference.
+What is inference scheduling?
+Explain dynamic batching.
+What is padding and why does it affect performance?
+Explain sequence length impact on inference latency.
+What is autoregressive decoding?
+Explain greedy decoding.
+Explain beam search.
+What is speculative decoding?
+Explain transformer architecture briefly.
+What is hidden dimension in LLM?
+Explain attention head.
+What is multi-head attention?
+Explain feed-forward network in transformer.
+What is normalization layer?
+Explain residual connection.
+What is tokenization?
+Explain subword tokenization.
+What is BPE encoding?
+Explain WordPiece.
+What is sentencepiece?
+Explain prompt engineering.
+What is instruction tuning?
+Explain fine-tuning.
+What is zero-shot inference?
+What is few-shot learning?
+Explain context window.
+What is sliding window attention?
+Explain sparse attention.
+What is flash attention?
+Explain CUDA parallelism.
+What is GPU warp?
+Explain shared memory in GPU.
+What is memory bandwidth?
+Explain PCIe bottleneck.
+What is NVLink?
+Explain CPU-GPU communication.
+What is distributed system?
+Explain load balancing.
+What is request queueing?
+Explain tail latency.
+What is service level objective?
+Explain throughput optimization.
+What is latency optimization?
+Explain batching trade-offs.
+Explain microservice architecture.
+What is cloud computing?
+Explain edge computing.
+What is hybrid cloud?
+Explain inference optimization strategies.

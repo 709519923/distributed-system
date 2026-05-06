@@ -1,0 +1,5 @@
+batch_size=64
+sequence_length=11
+num_cpu_layers=14
+mid_gpu_layer=21
+total_time_sec=59.563141
