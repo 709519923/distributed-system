@@ -79,6 +79,31 @@ Notes:
 - Keep `--build_dataset` disabled if you want to process all rows in the CSV.
 - Enable `--build_dataset` only when you want exactly one synthetic batch (size = `batch_size`).
 
+## run_layer_grid.py usage
+
+Use this script to sweep `num_cpu_layers` and `mid_gpu_layer` automatically.
+
+Example command:
+
+```bash
+python run_layer_grid.py \
+  --model_id /home/dingcong/models/google/gemma-2-2b-it \
+  --input_file input.txt \
+  --batch_size 64 \
+  --sequence_length 256 \
+  --num_cpu_layers_list 1,3,12 \
+  --mid_gpu_layer_list 3,12,20 \
+  --enable_build_dataset
+```
+
+Behavior:
+- Only valid combinations are run: `num_cpu_layers < mid_gpu_layer`.
+- With `1,3,12` and `3,12,20`, total valid runs are `6`.
+- Progress is printed after each run: done / remaining / total.
+- Output folders are timestamped:
+  - `outputs_runs_YYYYMMDDHHMM`
+  - `summaries_runs_YYYYMMDDHHMM`
+
 ## Output files
 
 - `output_file`: includes config + decoded generated samples.
