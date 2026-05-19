@@ -293,3 +293,169 @@ init_method="tcp://10.50.0.57:29501"
 ```
 
 然后分别在两台机器进入该目录执行对应命令。
+
+## 10. TinyLlama 双节点分层联合推理
+
+当前项目新增 `distributed_tinyllama_inference.py`，用于把本地 TinyLlama 按 decoder layer 切到两个节点上进行联合推理。
+
+默认切分位置是第 5 层：
+
+- Rank 0：负责 tokenizer、embedding、前 5 个 decoder layer，也就是 layer `0` 到 layer `4`。
+- Rank 1：负责从第 5 层开始的剩余 decoder layer、final norm 和 `lm_head`。
+- Rank 0 会把 hidden states 通过 NCCL 发送给 Rank 1。
+- Rank 1 计算 next token 后，再通过 NCCL 把 token 发回 Rank 0。
+- Rank 0 继续拼接 token，并逐 token 生成最终输出。
+
+### 模型目录
+
+请在项目目录下创建模型目录，并把 TinyLlama 放进去：
+
+```text
+C:\Users\smbu\Desktop\distributed-nccl-inference\model\tinyllama
+```
+
+目录里应该包含 Hugging Face 格式模型文件，例如：
+
+```text
+config.json
+tokenizer.json
+tokenizer.model
+model.safetensors
+```
+
+如果模型是分片保存，也可以是多个 `model-0000x-of-0000x.safetensors` 文件。
+
+### CSV 输入格式
+
+默认输入文件是：
+
+```text
+prompts.csv
+```
+
+一行一条 prompt。当前脚本支持两种格式。
+
+有表头时：
+
+```csv
+prompt
+Please introduce TinyLlama in one short paragraph.
+Write a short checklist for debugging NCCL communication.
+```
+
+运行时加上：
+
+```bash
+--csv-has-header --prompt-column prompt
+```
+
+没有表头时：
+
+```csv
+Please introduce TinyLlama in one short paragraph.
+Write a short checklist for debugging NCCL communication.
+```
+
+默认读取第一列。
+
+### Rank 0 运行命令
+
+在 master 节点进入项目目录后执行：
+
+```bash
+cd ~/distributed-nccl-inference
+
+export RANK=0
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --model-dir model/tinyllama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt \
+  --max-new-tokens 64
+```
+
+如果 master 地址不是脚本默认的 `tcp://ksai.scnet.cn:29500`，可以显式指定：
+
+```bash
+python distributed_tinyllama_inference.py \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir model/tinyllama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### Rank 1 运行命令
+
+在 slave 节点进入相同项目目录后执行：
+
+```bash
+cd ~/distributed-nccl-inference
+
+export RANK=1
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --model-dir model/tinyllama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --max-new-tokens 64
+```
+
+Rank 1 不会读取 CSV，也不会写输出文件；它只接收 Rank 0 发来的 hidden states，继续跑剩余模型层，并把 next token 发回 Rank 0。
+
+### 输出文件
+
+Rank 0 默认生成：
+
+```text
+outputs.csv
+```
+
+输出列包括：
+
+- `prompt`：原始输入。
+- `generated_text`：模型新生成的文本。
+- `full_text`：prompt 加生成文本的完整结果。
+
+### 常用参数
+
+```bash
+--split-layer 5
+```
+
+指定切分位置。默认是 5，也就是 Rank 1 从第 5 层开始执行。
+
+```bash
+--max-new-tokens 64
+```
+
+每条 prompt 最多生成多少个新 token。
+
+```bash
+--temperature 0
+```
+
+默认使用贪心解码。设置为大于 0 的值时启用采样，例如 `--temperature 0.7`。
+
+```bash
+--dtype float16
+```
+
+默认使用 `float16`。如果 GPU 支持 BF16，也可以使用 `--dtype bfloat16`。
+
+### 推荐测试顺序
+
+1. 先确认原来的 `test_dist_nccl.py` 仍然可以双节点成功。
+2. 确认两台机器上都存在相同的 `model/tinyllama` 目录。
+3. 在 Rank 0 准备 `prompts.csv`。
+4. 先启动 Rank 0，再启动 Rank 1。
+5. Rank 0 生成完成后检查 `outputs.csv`。
