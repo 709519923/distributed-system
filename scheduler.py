@@ -8,9 +8,9 @@ belongs to Rank 0 and Rank 1 for a given batch:
     123,"[0,5)","[5,22)"
 
 If allocation.csv already contains a row for a batch, that row wins. Otherwise
-the scheduler creates one from the default midpoint passed by the caller. This
-keeps the first dynamic-loading version deterministic and easy to debug, while
-still letting you edit allocation.csv later to try different split points.
+the scheduler inherits the latest earlier allocation and continues inference
+with that split. The default midpoint is only used when there is no earlier
+allocation at all.
 """
 
 import csv
@@ -88,10 +88,18 @@ class Scheduler:
         self._load_existing_file()
 
     def get_or_create(self, batch):
-        """Return the allocation for batch, creating a default row if needed."""
+        """Return the allocation for batch, inheriting the latest split if needed.
+
+        Example: if allocation.csv only defines batch 1 and batch 20, then batch
+        2-19 inherit batch 1, and batch 21+ inherit batch 20. This matches the
+        runtime meaning of "latest way to continue inference".
+        """
         batch = int(batch)
         if batch not in self.allocations:
-            self.allocations[batch] = self._make_allocation(batch, self.default_midpoint)
+            self.allocations[batch] = self._make_allocation(
+                batch,
+                self._latest_midpoint_before(batch),
+            )
             self.save()
         return self.allocations[batch]
 
@@ -156,6 +164,18 @@ class Scheduler:
             rank1_start=midpoint,
             rank1_end=self.total_layers,
         )
+
+    def _latest_midpoint_before(self, batch):
+        """Find the most recent allocation before batch.
+
+        If no previous allocation exists, fall back to the constructor's default
+        midpoint so the scheduler can bootstrap an empty allocation.csv.
+        """
+        earlier_batches = [known for known in self.allocations if known < batch]
+        if not earlier_batches:
+            return self.default_midpoint
+        latest_batch = max(earlier_batches)
+        return self.allocations[latest_batch].midpoint
 
     def _validate_midpoint(self, midpoint):
         if midpoint <= 0 or midpoint >= self.total_layers:
