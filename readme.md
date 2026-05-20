@@ -585,3 +585,183 @@ model.safetensors.index.json
 ```
 
 即可回到之前已经验证通过的完整加载模式。
+
+## 12. 2026-05-20 版本更新：动态加载与 Scheduler 批调度
+
+本版本新增动态加载功能，用于 prompt 数量很多时按 batch 推理，并在每个 batch 开始前检查两台节点各自负责的模型层范围是否发生变化。
+
+### 新增文件
+
+新增：
+
+```text
+scheduler.py
+```
+
+其中包含 `Scheduler` 类，负责维护：
+
+```text
+allocation.csv
+```
+
+`allocation.csv` 的格式为：
+
+```csv
+batch,rank0,rank1
+1,"[0,5)","[5,22)"
+2,"[0,5)","[5,22)"
+```
+
+含义：
+
+- `batch`：第几个 batch，当前实现从 1 开始计数。
+- `rank0`：Rank 0 负责的 decoder layer 区间，格式为 `[start,end)`。
+- `rank1`：Rank 1 负责的 decoder layer 区间，格式为 `[start,end)`。
+
+例如：
+
+```csv
+batch,rank0,rank1
+123,"[0,8)","[8,22)"
+```
+
+表示从 batch 123 开始：
+
+- Rank 0 执行 layer `0` 到 layer `7`。
+- Rank 1 执行 layer `8` 到最后一层。
+
+### 动态加载的工作方式
+
+开启动态加载后，Rank 0 会：
+
+1. 读取 CSV 中的所有 prompt。
+2. 按 `--batch-size` 分成多个 batch。
+3. 每个 batch 开始前询问 `Scheduler` 当前 batch 的 layer 分配。
+4. 把当前 batch 的 midpoint 广播给 Rank 1。
+5. Rank 0 和 Rank 1 对比当前已加载模型分区和新的 midpoint。
+6. 如果 midpoint 没变，继续复用已加载的模型分区。
+7. 如果 midpoint 变化，才释放旧分区并懒加载新的分区。
+8. 当前 batch 推理结束后保留模型分区，进入下一个 batch。
+
+Rank 1 不读取 prompt，也不写输出文件。Rank 1 只接收 Rank 0 广播的 midpoint，并把收到的分配记录到本地 `allocation.csv`，便于调试和对照日志。
+
+### 重要要求
+
+动态加载依赖懒加载，因此必须同时启用：
+
+```bash
+--lazy-load --dynamic-load
+```
+
+如果只写 `--dynamic-load`，脚本会直接报错：
+
+```text
+--dynamic-load requires --lazy-load.
+```
+
+### Rank 0 运行示例
+
+```bash
+export RANK=0
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=enp6s18
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### Rank 1 运行示例
+
+```bash
+export RANK=1
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### 手动调整 allocation.csv
+
+如果 `allocation.csv` 已经存在，`Scheduler` 会优先读取里面已有的 batch 分配。
+
+例如可以手动写：
+
+```csv
+batch,rank0,rank1
+1,"[0,5)","[5,22)"
+2,"[0,8)","[8,22)"
+3,"[0,10)","[10,22)"
+```
+
+这样第 1、2、3 个 batch 会使用不同的层切分位置。没有写入的 batch 会使用默认 `--split-layer` 生成分配。
+
+### 新增参数
+
+```bash
+--dynamic-load
+```
+
+开启动态加载模式。
+
+```bash
+--batch-size 64
+```
+
+每个 batch 包含多少条 prompt。默认值是 `64`。对于 1k 到 100k 级别的输入文件，通常可以按机器吞吐和显存情况选择 `32`、`64` 或 `128`。
+
+```bash
+--allocation-csv allocation.csv
+```
+
+指定 Scheduler 维护的分配文件。默认值是 `allocation.csv`。
+
+### 日志现象
+
+动态加载模式下，每个 batch 会看到类似日志：
+
+```text
+[Rank 0] Batch 1: rank0=[0,5) rank1=[5,22); prompts=64
+[Rank 0] Batch 1 model loaded; midpoint=5; load_mode=lazy
+[Rank 0] Batch 1 complete.
+[Rank 0] Batch 2: reuse cached model partition for midpoint=5.
+
+[Rank 1] Batch 1: rank0=[0,5) rank1=[5,22)
+[Rank 1] Batch 1 model loaded; midpoint=5; load_mode=lazy
+[Rank 1] Batch 1 complete.
+[Rank 1] Batch 2: reuse cached model partition for midpoint=5.
+```
+
+这表示 batch 1 按 `allocation.csv` 完成了模型层分配和加载；batch 2 的分配没有变化，因此直接复用已加载的模型分区。只有当后续 batch 的 midpoint 变化时，脚本才会释放旧分区并重新懒加载。
+
+### 回退方式
+
+如果动态加载过程中需要回到上一版稳定行为，去掉：
+
+```bash
+--dynamic-load
+```
+
+如果需要回到完整加载模式，同时去掉：
+
+```bash
+--lazy-load --dynamic-load
+```

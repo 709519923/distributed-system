@@ -22,6 +22,7 @@ safetensors weights it actually needs.
 import argparse
 import contextlib
 import csv
+import gc
 import inspect
 import json
 import os
@@ -34,6 +35,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from scheduler import Scheduler
+
 
 # Default distributed rendezvous address. Rank 1 connects to this address when
 # torch.distributed initializes the process group. It can also be overridden by
@@ -43,6 +46,16 @@ DEFAULT_INIT_METHOD = "tcp://10.50.0.57:29500"
 # Rank 1 starts from this decoder layer index. With the default value 5:
 # Rank 0 runs layers 0, 1, 2, 3, 4; Rank 1 runs layers 5 ... last.
 DEFAULT_SPLIT_LAYER = 5
+
+# Small message protocol used by Rank 0 when talking to Rank 1.
+# STATUS_HIDDEN means a hidden_states tensor follows the metadata message.
+# STATUS_STOP means the whole job is complete.
+# STATUS_BATCH_DONE means the current dynamic-loading batch is complete. Rank 1
+# keeps its current model partition cached unless the next batch uses a different
+# scheduler midpoint.
+STATUS_HIDDEN = 0
+STATUS_STOP = 1
+STATUS_BATCH_DONE = 2
 
 
 # -----------------------------------------------------------------------------
@@ -135,6 +148,25 @@ def parse_args():
             "Requires a safetensors-format Hugging Face checkpoint."
         ),
     )
+    parser.add_argument(
+        "--dynamic-load",
+        action="store_true",
+        help=(
+            "Process prompts in batches and reload the rank-local layer partition "
+            "only when Scheduler changes the split point. Requires --lazy-load."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Number of prompts per dynamic-loading batch. Default: 64",
+    )
+    parser.add_argument(
+        "--allocation-csv",
+        default="allocation.csv",
+        help="Scheduler allocation CSV path. Default: allocation.csv",
+    )
     return parser.parse_args()
 
 
@@ -173,6 +205,15 @@ def resolve_dtype(dtype_name):
     if dtype_name == "float32":
         return torch.float32
     raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
+def get_total_layers_from_config(model_dir):
+    """Read total decoder layer count without loading any checkpoint weights."""
+    config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
+    total_layers = getattr(config, "num_hidden_layers", None)
+    if total_layers is None:
+        raise RuntimeError("config.json does not define num_hidden_layers.")
+    return int(total_layers)
 
 
 def load_model_part_full(model_dir, rank, split_layer, dtype, device):
@@ -555,10 +596,16 @@ def send_stop(device):
     """Tell Rank 1 that Rank 0 has no more prompts to process.
 
     The first value in meta is a status code:
-    - 0 means a hidden_states tensor will follow.
-    - 1 means stop serving and exit the receive loop.
+    - STATUS_HIDDEN means a hidden_states tensor will follow.
+    - STATUS_STOP means stop serving and exit the receive loop.
     """
-    meta = torch.tensor([1, 0, 0, 0], dtype=torch.long, device=device)
+    meta = torch.tensor([STATUS_STOP, 0, 0, 0], dtype=torch.long, device=device)
+    dist.send(meta, dst=1)
+
+
+def send_batch_done(device):
+    """Tell Rank 1 that the current dynamic-loading batch is complete."""
+    meta = torch.tensor([STATUS_BATCH_DONE, 0, 0, 0], dtype=torch.long, device=device)
     dist.send(meta, dst=1)
 
 
@@ -570,7 +617,11 @@ def send_hidden_to_rank1(hidden_states):
     hidden_size] so Rank 1 knows exactly what buffer to allocate.
     """
     batch_size, seq_len, hidden_size = hidden_states.shape
-    meta = torch.tensor([0, batch_size, seq_len, hidden_size], dtype=torch.long, device=hidden_states.device)
+    meta = torch.tensor(
+        [STATUS_HIDDEN, batch_size, seq_len, hidden_size],
+        dtype=torch.long,
+        device=hidden_states.device,
+    )
     dist.send(meta, dst=1)
     dist.send(hidden_states, dst=1)
 
@@ -578,14 +629,20 @@ def send_hidden_to_rank1(hidden_states):
 def recv_hidden_from_rank0(device, dtype):
     """Receive one message from Rank 0.
 
-    Returns a CUDA hidden_states tensor, or None when Rank 0 sends the stop code.
+    Returns a CUDA hidden_states tensor for normal inference data.
+
+    Special returns:
+    - None means the whole job is complete.
+    - STATUS_BATCH_DONE means only the current dynamic-loading batch is complete.
     """
     meta = torch.empty(4, dtype=torch.long, device=device)
     dist.recv(meta, src=0)
     status, batch_size, seq_len, hidden_size = meta.tolist()
-    if status == 1:
+    if status == STATUS_STOP:
         return None
-    if status != 0:
+    if status == STATUS_BATCH_DONE:
+        return STATUS_BATCH_DONE
+    if status != STATUS_HIDDEN:
         raise RuntimeError(f"Unknown message status from Rank 0: {status}")
 
     hidden_states = torch.empty(
@@ -648,32 +705,33 @@ def read_prompts(csv_path, has_header, prompt_column):
 # Rank-specific execution loops
 # -----------------------------------------------------------------------------
 
-def rank0_generate(args, model, tokenizer, device):
-    """Rank 0 driver loop.
+def chunk_items(items, batch_size):
+    """Yield (batch_number, start_index, chunk) for dynamic prompt batching.
 
-    For every prompt, Rank 0 repeatedly:
-    1. Encodes or extends the current token sequence.
-    2. Runs embeddings and early decoder layers.
-    3. Sends hidden states to Rank 1.
-    4. Receives one next-token id from Rank 1.
-    5. Appends that token and continues until EOS or max_new_tokens.
-
-    Only Rank 0 writes outputs.csv because it owns the original prompts and final
-    generated token sequence.
+    batch_number is 1-based because it is written to allocation.csv and is meant
+    to be read by humans. start_index is 0-based and is only used for progress
+    logging.
     """
-    prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
-    if not prompts:
-        print(f"[Rank 0] No prompts found in {args.input_csv}")
-        send_stop(device)
-        return
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be greater than 0.")
+    for start in range(0, len(items), batch_size):
+        batch_number = start // batch_size + 1
+        yield batch_number, start, items[start:start + batch_size]
 
-    output_path = Path(args.output_csv)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
+def generate_rows_for_prompts(args, model, tokenizer, device, prompts, start_index=0, total_count=None):
+    """Generate outputs for an in-memory list of prompts using the active model.
+
+    This function is shared by normal mode and dynamic-loading mode. Rank 0 owns
+    tokenization and receives one next-token id from Rank 1 for every generation
+    step.
+    """
     eos_token_id = tokenizer.eos_token_id
     rows = []
+    total_count = total_count if total_count is not None else len(prompts)
 
-    for index, prompt in enumerate(prompts, start=1):
+    for local_index, prompt in enumerate(prompts, start=1):
+        global_index = start_index + local_index
         encoded = tokenizer(
             prompt,
             return_tensors="pt",
@@ -683,7 +741,7 @@ def rank0_generate(args, model, tokenizer, device):
         input_ids = encoded["input_ids"].to(device)
         prompt_len = input_ids.shape[1]
 
-        print(f"[Rank 0] Prompt {index}/{len(prompts)}: {prompt}")
+        print(f"[Rank 0] Prompt {global_index}/{total_count}: {prompt}")
 
         with torch.inference_mode():
             for _ in range(args.max_new_tokens):
@@ -707,7 +765,15 @@ def rank0_generate(args, model, tokenizer, device):
                 "full_text": full_text,
             }
         )
-        print(f"[Rank 0] Output {index}: {generated_text}")
+        print(f"[Rank 0] Output {global_index}: {generated_text}")
+
+    return rows
+
+
+def write_output_rows(output_csv, rows):
+    """Write Rank 0 generation results to CSV."""
+    output_path = Path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "generated_text", "full_text"])
@@ -715,7 +781,138 @@ def rank0_generate(args, model, tokenizer, device):
         writer.writerows(rows)
 
     print(f"[Rank 0] Wrote {len(rows)} rows to {output_path}")
+
+
+def release_model(model):
+    """Release the current model partition before loading a different one."""
+    if model is None:
+        return
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def rank0_generate(args, model, tokenizer, device):
+    """Rank 0 driver loop.
+
+    For every prompt, Rank 0 repeatedly:
+    1. Encodes or extends the current token sequence.
+    2. Runs embeddings and early decoder layers.
+    3. Sends hidden states to Rank 1.
+    4. Receives one next-token id from Rank 1.
+    5. Appends that token and continues until EOS or max_new_tokens.
+
+    Only Rank 0 writes outputs.csv because it owns the original prompts and final
+    generated token sequence.
+    """
+    prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
+    if not prompts:
+        print(f"[Rank 0] No prompts found in {args.input_csv}")
+        send_stop(device)
+        return
+
+    rows = generate_rows_for_prompts(
+        args,
+        model,
+        tokenizer,
+        device,
+        prompts,
+        start_index=0,
+        total_count=len(prompts),
+    )
+    write_output_rows(args.output_csv, rows)
     send_stop(device)
+
+
+def broadcast_midpoint(midpoint, device, rank):
+    """Broadcast the next dynamic-loading split point from Rank 0 to Rank 1.
+
+    midpoint=0 is reserved as the global stop signal for the dynamic scheduler
+    loop. Valid layer split points are always between 1 and total_layers - 1.
+    """
+    value = int(midpoint) if rank == 0 else 0
+    tensor = torch.tensor([value], dtype=torch.long, device=device)
+    dist.broadcast(tensor, src=0)
+    return int(tensor.item())
+
+
+def rank0_generate_dynamic(args, tokenizer, dtype, device):
+    """Rank 0 dynamic-loading driver.
+
+    Rank 0 reads all prompts, groups them into batches, asks Scheduler which
+    layer split should be used for each batch, broadcasts that split to Rank 1,
+    and keeps the current model partition cached. It only releases and reloads
+    weights when the scheduler midpoint changes between batches.
+    """
+    prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
+    if not prompts:
+        print(f"[Rank 0] No prompts found in {args.input_csv}")
+        broadcast_midpoint(0, device, rank=0)
+        return
+
+    total_layers = get_total_layers_from_config(args.model_dir)
+    scheduler = Scheduler(args.allocation_csv, total_layers, args.split_layer)
+    all_rows = []
+    model = None
+    current_midpoint = None
+
+    try:
+        for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
+            allocation = scheduler.get_or_create(batch_number)
+            midpoint = allocation.midpoint
+            print(
+                f"[Rank 0] Batch {batch_number}: rank0={allocation.rank0_interval} "
+                f"rank1={allocation.rank1_interval}; prompts={len(prompt_batch)}"
+            )
+
+            broadcast_midpoint(midpoint, device, rank=0)
+            if model is None or midpoint != current_midpoint:
+                if model is not None:
+                    release_model(model)
+                    model = None
+                    print(
+                        f"[Rank 0] Batch {batch_number}: split changed "
+                        f"{current_midpoint}->{midpoint}; old partition released."
+                    )
+
+                model, _, load_mode = load_model_part(
+                    args.model_dir,
+                    rank=0,
+                    split_layer=midpoint,
+                    dtype=dtype,
+                    device=device,
+                    lazy_load=True,
+                )
+                current_midpoint = midpoint
+                print(
+                    f"[Rank 0] Batch {batch_number} model loaded; "
+                    f"midpoint={midpoint}; load_mode={load_mode}"
+                )
+            else:
+                print(
+                    f"[Rank 0] Batch {batch_number}: reuse cached model partition "
+                    f"for midpoint={midpoint}."
+                )
+
+            rows = generate_rows_for_prompts(
+                args,
+                model,
+                tokenizer,
+                device,
+                prompt_batch,
+                start_index=start_index,
+                total_count=len(prompts),
+            )
+            all_rows.extend(rows)
+
+            send_batch_done(device)
+            print(f"[Rank 0] Batch {batch_number} complete.")
+
+        write_output_rows(args.output_csv, all_rows)
+        broadcast_midpoint(0, device, rank=0)
+    finally:
+        release_model(model)
 
 
 def rank1_serve(args, model, device):
@@ -731,10 +928,85 @@ def rank1_serve(args, model, device):
             hidden_states = recv_hidden_from_rank0(device, model.dtype)
             if hidden_states is None:
                 break
+            if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+                continue
             logits = rank1_forward_logits(model, hidden_states, device)
             next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
             dist.send(next_token, dst=0)
     print("[Rank 1] Stop signal received.")
+
+
+def rank1_serve_dynamic(args, dtype, device):
+    """Rank 1 dynamic-loading service loop.
+
+    Rank 1 waits for Rank 0 to broadcast a midpoint. For each positive midpoint,
+    it records the allocation locally and compares the new midpoint with the
+    currently loaded partition. It only reloads weights when the midpoint changes.
+    """
+    total_layers = get_total_layers_from_config(args.model_dir)
+    scheduler = Scheduler(args.allocation_csv, total_layers, args.split_layer)
+    batch_number = 1
+    model = None
+    current_midpoint = None
+
+    try:
+        while True:
+            midpoint = broadcast_midpoint(0, device, rank=1)
+            if midpoint == 0:
+                break
+
+            allocation = scheduler.record_allocation(batch_number, midpoint)
+            print(
+                f"[Rank 1] Batch {batch_number}: rank0={allocation.rank0_interval} "
+                f"rank1={allocation.rank1_interval}"
+            )
+
+            if model is None or midpoint != current_midpoint:
+                if model is not None:
+                    release_model(model)
+                    model = None
+                    print(
+                        f"[Rank 1] Batch {batch_number}: split changed "
+                        f"{current_midpoint}->{midpoint}; old partition released."
+                    )
+
+                model, _, load_mode = load_model_part(
+                    args.model_dir,
+                    rank=1,
+                    split_layer=midpoint,
+                    dtype=dtype,
+                    device=device,
+                    lazy_load=True,
+                )
+                current_midpoint = midpoint
+                print(
+                    f"[Rank 1] Batch {batch_number} model loaded; "
+                    f"midpoint={midpoint}; load_mode={load_mode}"
+                )
+            else:
+                print(
+                    f"[Rank 1] Batch {batch_number}: reuse cached model partition "
+                    f"for midpoint={midpoint}."
+                )
+
+            with torch.inference_mode():
+                while True:
+                    hidden_states = recv_hidden_from_rank0(device, model.dtype)
+                    if hidden_states is None:
+                        return
+                    if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+                        break
+
+                    logits = rank1_forward_logits(model, hidden_states, device)
+                    next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
+                    dist.send(next_token, dst=0)
+
+            print(f"[Rank 1] Batch {batch_number} complete.")
+            batch_number += 1
+
+        print("[Rank 1] Dynamic loading stop signal received.")
+    finally:
+        release_model(model)
 
 
 # -----------------------------------------------------------------------------
@@ -755,6 +1027,9 @@ def main():
     print(f"[Rank {rank}] Starting on host {socket.gethostname()}")
     print(f"[Rank {rank}] init_method={args.init_method}")
 
+    if args.dynamic_load and not args.lazy_load:
+        raise RuntimeError("--dynamic-load requires --lazy-load.")
+
     # NCCL is used because all tensors passed between ranks are CUDA tensors.
     # The init_method address must be reachable from both nodes.
     dist.init_process_group(
@@ -766,6 +1041,22 @@ def main():
     )
 
     dtype = resolve_dtype(args.dtype)
+    if args.dynamic_load:
+        try:
+            if rank == 0:
+                tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
+                if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                rank0_generate_dynamic(args, tokenizer, dtype, device)
+            else:
+                rank1_serve_dynamic(args, dtype, device)
+
+            dist.barrier()
+            print(f"[Rank {rank}] SUCCESS")
+            return
+        finally:
+            dist.destroy_process_group()
+
     model, total_layers, load_mode = load_model_part(
         args.model_dir,
         rank,
