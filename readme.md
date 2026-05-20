@@ -459,3 +459,129 @@ outputs.csv
 3. 在 Rank 0 准备 `prompts.csv`。
 4. 先启动 Rank 0，再启动 Rank 1。
 5. Rank 0 生成完成后检查 `outputs.csv`。
+
+## 11. 2026-05-19 版本更新：按节点懒加载 TinyLlama 权重
+
+本版本在 `distributed_tinyllama_inference.py` 中新增 `--lazy-load` 参数，用于解决之前两个节点都会完整读取 checkpoint 的问题。
+
+### 改动背景
+
+旧版本的加载流程是：
+
+```text
+两个 Rank 都调用 AutoModelForCausalLM.from_pretrained()
+两个 Rank 都完整读取 TinyLlama checkpoint
+再按 split_layer 删除本节点不执行的 decoder layers
+```
+
+因此即使 Rank 0 只执行前 5 层、Rank 1 只执行后 17 层，日志里仍然会看到两个节点都在加载完整权重，例如 `201/201`。
+
+新版本增加了选择性加载路径：
+
+```text
+读取 config.json 构建模型结构
+按 Rank 先裁剪模型模块
+读取 safetensors index
+只从 checkpoint 中读取当前 Rank 需要的 tensor
+```
+
+### 默认行为保持不变
+
+为了保留已经验证成功的稳定路径，默认命令仍然使用完整加载：
+
+```bash
+python distributed_tinyllama_inference.py \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+默认路径会打印：
+
+```text
+load_mode=full
+```
+
+### 启用懒加载
+
+在 Rank 0 和 Rank 1 两边都加上：
+
+```bash
+--lazy-load
+```
+
+Rank 0 示例：
+
+```bash
+export RANK=0
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=enp6s18
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+Rank 1 示例：
+
+```bash
+export RANK=1
+export WORLD_SIZE=2
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+懒加载成功时会看到类似输出：
+
+```text
+[Rank 0] Lazy-loaded xx tensors from x safetensors shard(s).
+[Rank 0] Loaded TinyLlama from ...; total_layers=22; split_layer=5; load_mode=lazy
+
+[Rank 1] Lazy-loaded xx tensors from x safetensors shard(s).
+[Rank 1] Loaded TinyLlama from ...; total_layers=22; split_layer=5; load_mode=lazy
+```
+
+### 当前权重分配
+
+默认 `--split-layer 5` 时：
+
+- Rank 0 加载并执行 `model.embed_tokens` 和 `model.layers.0` 到 `model.layers.4`。
+- Rank 1 加载并执行 `model.layers.5` 到最后一层、`model.norm` 和 `lm_head`。
+- Rank 0 不再加载 `lm_head` 和后半部分 decoder layer。
+- Rank 1 不再加载 token embedding 和前 5 层 decoder layer。
+
+### 重要限制
+
+`--lazy-load` 当前要求模型是 Hugging Face `safetensors` 格式。模型目录中至少需要存在以下文件之一：
+
+```text
+model.safetensors
+model.safetensors.index.json
+```
+
+如果模型是 `pytorch_model.bin` 格式，建议先继续使用默认完整加载路径，或者把模型转换为 safetensors 后再使用 `--lazy-load`。
+
+### 回退方式
+
+如果懒加载运行中遇到 checkpoint key 不匹配、safetensors 缺失、模型结构差异等问题，直接去掉：
+
+```bash
+--lazy-load
+```
+
+即可回到之前已经验证通过的完整加载模式。
