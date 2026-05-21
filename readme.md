@@ -944,3 +944,188 @@ batch,rank0,rank1,rank2
 
 - 没变：继续复用当前已加载模型分区。
 - 变化：释放旧分区，按新区间懒加载。
+
+## 14. 2026-05-21 版本更新：按功能拆分推理代码
+
+本版本将原来较长的 `distributed_tinyllama_inference.py` 按功能拆成多个文件。启动入口仍然不变，继续运行：
+
+```bash
+python distributed_tinyllama_inference.py ...
+```
+
+### 最新文件结构
+
+```text
+distributed_tinyllama_inference.py   # 主入口，只负责启动流程
+config.py                            # 参数解析、默认值、层切分、状态码
+distributed_env.py                   # RANK/WORLD_SIZE、CUDA device、NCCL 初始化
+model_loader.py                      # full load、lazy load、模型裁剪、权重读取
+model_forward.py                     # attention mask、position ids、各 rank forward
+pipeline_comm.py                     # NCCL send/recv、hidden/token/status/boundaries
+csv_io.py                            # prompts.csv 读取、outputs.csv 写入、batch 切分
+inference_loops.py                   # Rank 0 推理循环、Rank 1/2 服务循环
+scheduler.py                         # 动态加载 allocation.csv 管理
+```
+
+### 排查定位
+
+如果启动参数、模型目录、batch size、split layers 不符合预期，先看 `config.py`。
+
+如果进程启动失败、CUDA 设备不对、NCCL 初始化卡住，先看 `distributed_env.py`，同时检查 `RANK`、`WORLD_SIZE`、`NCCL_SOCKET_IFNAME` 和 `--init-method`。
+
+如果懒加载权重缺失、层范围错误、仍然像完整加载一样读取太多权重，先看 `model_loader.py`。
+
+如果 batch 推理、padding、attention mask、position ids、输出 token 质量异常，先看 `model_forward.py`。
+
+如果卡在节点通信、hidden shape 不一致、`batch_size` 跨节点不一致、三节点转发异常，先看 `pipeline_comm.py`。
+
+如果输入 prompt 数量不对、CSV 表头列名不对、输出文件异常，先看 `csv_io.py`。
+
+如果动态加载没有复用模型、batch 切换逻辑异常、scheduler 分配和实际加载不一致，先看 `inference_loops.py` 和 `scheduler.py`。
+
+### 新增 CUDA 设备参数
+
+本版本新增：
+
+```bash
+--cuda-device 1
+```
+
+默认值仍然是：
+
+```bash
+--cuda-device 0
+```
+
+如果某台机器的 `cuda:0` 被占用，可以临时指定其他 GPU。例如：
+
+```bash
+python distributed_tinyllama_inference.py \
+  --cuda-device 1 \
+  --lazy-load \
+  --dynamic-load \
+  --model-dir /home/dingcong/models/TinyLlama
+```
+
+也可以继续使用 `CUDA_VISIBLE_DEVICES` 控制进程能看到的 GPU。`--cuda-device` 是当前进程视角下的设备编号。
+
+### 两节点动态加载启动命令
+
+Rank 0：
+
+```bash
+export WORLD_SIZE=2
+export RANK=0
+export NCCL_SOCKET_IFNAME=enp6s18
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --split-layers 5 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt \
+  --cuda-device 0
+```
+
+Rank 1：
+
+```bash
+export WORLD_SIZE=2
+export RANK=1
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --split-layers 5 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --cuda-device 0
+```
+
+### 三节点动态加载启动命令
+
+Rank 0：
+
+```bash
+export WORLD_SIZE=3
+export RANK=0
+export NCCL_SOCKET_IFNAME=enp6s18
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt \
+  --cuda-device 0
+```
+
+Rank 1：
+
+```bash
+export WORLD_SIZE=3
+export RANK=1
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --cuda-device 0
+```
+
+Rank 2：
+
+```bash
+export WORLD_SIZE=3
+export RANK=2
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 64 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --cuda-device 0
+```
+
+三节点数据流仍然是：
+
+```text
+Rank 0 -> Rank 1 -> Rank 2 -> Rank 1 -> Rank 0
+```
+
+Rank 0 负责 tokenizer、embedding、前段 decoder layers、读取输入 CSV、写输出 CSV。Rank 1 负责中间 decoder layers 和转发。Rank 2 负责后段 decoder layers、final norm、lm_head 和 next token 选择。
