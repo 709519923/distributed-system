@@ -6,6 +6,7 @@ makes startup failures easier to isolate.
 """
 
 from datetime import timedelta
+import os
 
 import torch
 import torch.distributed as dist
