@@ -43,11 +43,12 @@ from scheduler import Scheduler
 # --init-method or the DIST_INIT_METHOD environment variable.
 DEFAULT_INIT_METHOD = "tcp://10.50.0.57:29500"
 
-# Rank 1 starts from this decoder layer index. With the default value 5:
-# Rank 0 runs layers 0, 1, 2, 3, 4; Rank 1 runs layers 5 ... last.
+# Rank 1 starts from this decoder layer index in two-node mode. In three-node
+# mode, this is the first split and DEFAULT_SECOND_SPLIT_LAYER is the second.
 DEFAULT_SPLIT_LAYER = 5
+DEFAULT_SECOND_SPLIT_LAYER = 15
 
-# Small message protocol used by Rank 0 when talking to Rank 1.
+# Small message protocol used between neighboring pipeline ranks.
 # STATUS_HIDDEN means a hidden_states tensor follows the metadata message.
 # STATUS_STOP means the whole job is complete.
 # STATUS_BATCH_DONE means the current dynamic-loading batch is complete. Rank 1
@@ -121,7 +122,15 @@ def parse_args():
         "--split-layer",
         type=int,
         default=DEFAULT_SPLIT_LAYER,
-        help="Layer index where Rank 1 starts. Default: 5",
+        help="Two-node split layer, or first split in three-node mode. Default: 5",
+    )
+    parser.add_argument(
+        "--split-layers",
+        default=None,
+        help=(
+            "Comma-separated split layers. Use one value for WORLD_SIZE=2 "
+            "(example: 5), or two values for WORLD_SIZE=3 (example: 5,15)."
+        ),
     )
     parser.add_argument(
         "--init-method",
@@ -187,10 +196,10 @@ def get_rank_world_size():
     except KeyError as exc:
         raise RuntimeError("Please set RANK and WORLD_SIZE before running this script.") from exc
 
-    if world_size != 2:
-        raise RuntimeError("This script expects WORLD_SIZE=2.")
-    if rank not in (0, 1):
-        raise RuntimeError("This script only supports RANK=0 or RANK=1.")
+    if world_size not in (2, 3):
+        raise RuntimeError("This script expects WORLD_SIZE=2 or WORLD_SIZE=3.")
+    if rank < 0 or rank >= world_size:
+        raise RuntimeError(f"RANK must be between 0 and {world_size - 1}.")
     return rank, world_size
 
 
@@ -216,7 +225,58 @@ def get_total_layers_from_config(model_dir):
     return int(total_layers)
 
 
-def load_model_part_full(model_dir, rank, split_layer, dtype, device):
+def parse_split_layers(value):
+    """Parse --split-layers into a list of integer split points."""
+    if value is None:
+        return None
+    splits = [item.strip() for item in value.split(",") if item.strip()]
+    if not splits:
+        return None
+    return [int(item) for item in splits]
+
+
+def default_boundaries_for_world_size(args, world_size, total_layers):
+    """Build [0, split..., total_layers] for WORLD_SIZE=2 or WORLD_SIZE=3."""
+    explicit_splits = parse_split_layers(args.split_layers)
+
+    if explicit_splits is None:
+        if world_size == 2:
+            explicit_splits = [args.split_layer]
+        else:
+            second_split = DEFAULT_SECOND_SPLIT_LAYER
+            if second_split <= args.split_layer or second_split >= total_layers:
+                second_split = max(args.split_layer + 1, (2 * total_layers) // 3)
+            explicit_splits = [args.split_layer, second_split]
+
+    expected_count = world_size - 1
+    if len(explicit_splits) != expected_count:
+        raise ValueError(
+            f"WORLD_SIZE={world_size} expects {expected_count} split value(s); "
+            f"got {explicit_splits}"
+        )
+
+    boundaries = [0] + explicit_splits + [total_layers]
+    validate_boundaries(boundaries, world_size, total_layers)
+    return boundaries
+
+
+def validate_boundaries(boundaries, world_size, total_layers):
+    """Validate a full pipeline boundary list."""
+    if len(boundaries) != world_size + 1:
+        raise ValueError(f"Expected {world_size + 1} boundaries, got {boundaries}")
+    if boundaries[0] != 0 or boundaries[-1] != total_layers:
+        raise ValueError(f"Boundaries must start at 0 and end at {total_layers}: {boundaries}")
+    for left, right in zip(boundaries, boundaries[1:]):
+        if left >= right:
+            raise ValueError(f"Boundaries must be strictly increasing: {boundaries}")
+
+
+def stage_from_boundaries(boundaries, rank):
+    """Return (layer_start, layer_end) for this rank."""
+    return int(boundaries[rank]), int(boundaries[rank + 1])
+
+
+def load_model_part_full(model_dir, rank, world_size, layer_start, layer_end, dtype, device):
     """Original loading path: load the whole checkpoint, then keep this rank's layers.
 
     This remains useful as a stable fallback because it delegates all checkpoint
@@ -232,15 +292,20 @@ def load_model_part_full(model_dir, rank, split_layer, dtype, device):
     model.eval()
 
     total_layers = len(model.model.layers)
-    validate_split_layer(split_layer, total_layers)
+    validate_layer_range(layer_start, layer_end, total_layers)
 
-    if rank == 0:
-        model.model.layers = nn.ModuleList(list(model.model.layers[:split_layer]))
-    else:
-        model.model.layers = nn.ModuleList(list(model.model.layers[split_layer:]))
+    prune_model_for_rank(model, rank, world_size, layer_start, layer_end)
 
     model.to(device)
     return model, total_layers, "full"
+
+
+def validate_layer_range(layer_start, layer_end, total_layers):
+    """Make sure one rank receives a non-empty decoder layer interval."""
+    if layer_start < 0 or layer_end > total_layers or layer_start >= layer_end:
+        raise ValueError(
+            f"Invalid layer range [{layer_start}, {layer_end}) for total_layers={total_layers}."
+        )
 
 
 def validate_split_layer(split_layer, total_layers):
@@ -270,40 +335,43 @@ def effective_lazy_dtype(dtype, config):
     return torch.float16
 
 
-def prune_model_for_rank(model, rank, split_layer):
+def prune_model_for_rank(model, rank, world_size, layer_start, layer_end):
     """Remove modules this rank will never execute before moving to GPU.
 
-    The pruning step keeps lazy loading economical. Rank 0 does not need final
-    norm or lm_head; Rank 1 does not need token embeddings. Decoder layers are
-    also renumbered locally after pruning, so layer 5 in the original checkpoint
-    becomes model.layers.0 inside Rank 1's Python object.
+    Rank 0 owns token embeddings. The last rank owns final norm and lm_head.
+    Middle ranks own only decoder layers. Decoder layers are renumbered locally
+    after pruning, so checkpoint model.layers.<layer_start> becomes local
+    model.layers.0.
     """
+    model.model.layers = nn.ModuleList(list(model.model.layers[layer_start:layer_end]))
+
     if rank == 0:
-        model.model.layers = nn.ModuleList(list(model.model.layers[:split_layer]))
         model.model.norm = nn.Identity()
         model.lm_head = nn.Identity()
-    else:
+
+    if rank != 0:
         model.model.embed_tokens = nn.Identity()
-        model.model.layers = nn.ModuleList(list(model.model.layers[split_layer:]))
+
+    if rank != world_size - 1:
+        model.model.norm = nn.Identity()
+        model.lm_head = nn.Identity()
 
 
-def original_checkpoint_key(local_key, rank, split_layer, config):
+def original_checkpoint_key(local_key, rank, world_size, layer_start, config):
     """Map a local state_dict key back to its original checkpoint key.
 
-    Rank 0 keeps the original layer numbers, so most keys are unchanged. Rank 1
-    renumbers later layers after pruning: local model.layers.0 corresponds to
-    checkpoint model.layers.<split_layer>. This function reverses that renumbering
-    when deciding which checkpoint tensor to read.
+    Local layer indices are always relative to the pruned stage. For any rank,
+    local model.layers.0 corresponds to checkpoint model.layers.<layer_start>.
     """
-    if rank == 1 and local_key.startswith("model.layers."):
+    if local_key.startswith("model.layers."):
         parts = local_key.split(".", 3)
         local_layer_index = int(parts[2])
-        return f"model.layers.{local_layer_index + split_layer}.{parts[3]}"
+        return f"model.layers.{local_layer_index + layer_start}.{parts[3]}"
 
     # Some tied-embedding checkpoints may not store lm_head.weight separately.
-    # In that case Rank 1 can initialize lm_head.weight from embed_tokens.weight.
+    # In that case the last rank can initialize lm_head.weight from embed_tokens.
     if (
-        rank == 1
+        rank == world_size - 1
         and local_key == "lm_head.weight"
         and getattr(config, "tie_word_embeddings", False)
     ):
@@ -348,7 +416,7 @@ def load_safetensors_weight_map(model_dir):
     return weight_map
 
 
-def build_lazy_load_plan(model, rank, split_layer, config, weight_map):
+def build_lazy_load_plan(model, rank, world_size, layer_start, config, weight_map):
     """Decide exactly which checkpoint tensors this rank needs to read.
 
     The model has already been pruned for this rank, so model.state_dict() only
@@ -360,7 +428,7 @@ def build_lazy_load_plan(model, rank, split_layer, config, weight_map):
     parameter_keys = set(dict(model.named_parameters()).keys())
 
     for local_key in model.state_dict().keys():
-        checkpoint_key = original_checkpoint_key(local_key, rank, split_layer, config)
+        checkpoint_key = original_checkpoint_key(local_key, rank, world_size, layer_start, config)
         shard_path = weight_map.get(checkpoint_key)
 
         if shard_path is None:
@@ -410,7 +478,7 @@ def assert_active_parameters_loaded(model):
         )
 
 
-def load_model_part_lazy(model_dir, rank, split_layer, dtype, device):
+def load_model_part_lazy(model_dir, rank, world_size, layer_start, layer_end, dtype, device):
     """Lazy checkpoint loader: read only the tensors needed by this rank.
 
     Flow:
@@ -440,11 +508,11 @@ def load_model_part_lazy(model_dir, rank, split_layer, dtype, device):
     model.eval()
 
     total_layers = len(model.model.layers)
-    validate_split_layer(split_layer, total_layers)
-    prune_model_for_rank(model, rank, split_layer)
+    validate_layer_range(layer_start, layer_end, total_layers)
+    prune_model_for_rank(model, rank, world_size, layer_start, layer_end)
 
     weight_map = load_safetensors_weight_map(model_dir)
-    plan_by_shard = build_lazy_load_plan(model, rank, split_layer, config, weight_map)
+    plan_by_shard = build_lazy_load_plan(model, rank, world_size, layer_start, config, weight_map)
 
     # Move only the pruned model to GPU. Unused layers and modules were already
     # removed, so they do not consume GPU memory in the lazy path.
@@ -475,7 +543,16 @@ def load_model_part_lazy(model_dir, rank, split_layer, dtype, device):
     return model, total_layers, "lazy"
 
 
-def load_model_part(model_dir, rank, split_layer, dtype, device, lazy_load=False):
+def load_model_part(
+    model_dir,
+    rank,
+    world_size,
+    layer_start,
+    layer_end,
+    dtype,
+    device,
+    lazy_load=False,
+):
     """Load the model stage for this rank.
 
     The default path preserves the previously verified full-load behavior. Passing
@@ -483,8 +560,12 @@ def load_model_part(model_dir, rank, split_layer, dtype, device, lazy_load=False
     its assigned stage's weights.
     """
     if lazy_load:
-        return load_model_part_lazy(model_dir, rank, split_layer, dtype, device)
-    return load_model_part_full(model_dir, rank, split_layer, dtype, device)
+        return load_model_part_lazy(
+            model_dir, rank, world_size, layer_start, layer_end, dtype, device
+        )
+    return load_model_part_full(
+        model_dir, rank, world_size, layer_start, layer_end, dtype, device
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -571,10 +652,20 @@ def rank0_forward(model, input_ids, device):
     return hidden_states.contiguous()
 
 
-def rank1_forward_logits(model, hidden_states, device):
-    """Run Rank 1's part of the model and return logits for the last token.
+def rank_middle_forward(model, hidden_states, device):
+    """Run a middle pipeline rank: hidden_states -> local decoder layers."""
+    batch_size, seq_len, _ = hidden_states.shape
+    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device)
 
-    Rank 1 receives hidden states, not token ids. Therefore it skips embeddings,
+    hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
+    return hidden_states.contiguous()
+
+
+def rank1_forward_logits(model, hidden_states, device):
+    """Run the last pipeline rank and return logits for the last token.
+
+    The last rank receives hidden states, not token ids. Therefore it skips embeddings,
     runs the later decoder layers, applies final norm and lm_head, then returns
     only the last-token logits needed to choose the next generated token.
     """
@@ -592,29 +683,34 @@ def rank1_forward_logits(model, hidden_states, device):
 # NCCL point-to-point message protocol
 # -----------------------------------------------------------------------------
 
-def send_stop(device):
-    """Tell Rank 1 that Rank 0 has no more prompts to process.
+def send_status(status, device, dst):
+    """Send a metadata-only status message to a neighboring pipeline rank."""
+    meta = torch.tensor([status, 0, 0, 0], dtype=torch.long, device=device)
+    dist.send(meta, dst=dst)
+
+
+def send_stop(device, dst=1):
+    """Tell the next pipeline rank that Rank 0 has no more prompts to process.
 
     The first value in meta is a status code:
     - STATUS_HIDDEN means a hidden_states tensor will follow.
     - STATUS_STOP means stop serving and exit the receive loop.
     """
-    meta = torch.tensor([STATUS_STOP, 0, 0, 0], dtype=torch.long, device=device)
-    dist.send(meta, dst=1)
+    send_status(STATUS_STOP, device, dst)
 
 
-def send_batch_done(device):
-    """Tell Rank 1 that the current dynamic-loading batch is complete."""
-    meta = torch.tensor([STATUS_BATCH_DONE, 0, 0, 0], dtype=torch.long, device=device)
-    dist.send(meta, dst=1)
+def send_batch_done(device, dst=1):
+    """Tell the next pipeline rank that the current dynamic-loading batch is complete."""
+    send_status(STATUS_BATCH_DONE, device, dst)
 
 
-def send_hidden_to_rank1(hidden_states):
+def send_hidden(hidden_states, dst):
     """Send tensor metadata first, then the hidden_states tensor itself.
 
     dist.recv() needs the receiver to allocate a correctly shaped tensor before
-    receiving payload data. The small meta tensor carries [status, batch, seq,
-    hidden_size] so Rank 1 knows exactly what buffer to allocate.
+    receiving payload data. The small meta tensor carries
+    [status, batch, seq, hidden_size] so the receiver knows exactly what buffer
+    to allocate.
     """
     batch_size, seq_len, hidden_size = hidden_states.shape
     meta = torch.tensor(
@@ -622,12 +718,17 @@ def send_hidden_to_rank1(hidden_states):
         dtype=torch.long,
         device=hidden_states.device,
     )
-    dist.send(meta, dst=1)
-    dist.send(hidden_states, dst=1)
+    dist.send(meta, dst=dst)
+    dist.send(hidden_states, dst=dst)
 
 
-def recv_hidden_from_rank0(device, dtype):
-    """Receive one message from Rank 0.
+def send_hidden_to_rank1(hidden_states):
+    """Backward-compatible helper for the two-node path."""
+    send_hidden(hidden_states, dst=1)
+
+
+def recv_hidden(src, device, dtype):
+    """Receive one hidden-state or control message from a neighboring rank.
 
     Returns a CUDA hidden_states tensor for normal inference data.
 
@@ -636,7 +737,7 @@ def recv_hidden_from_rank0(device, dtype):
     - STATUS_BATCH_DONE means only the current dynamic-loading batch is complete.
     """
     meta = torch.empty(4, dtype=torch.long, device=device)
-    dist.recv(meta, src=0)
+    dist.recv(meta, src=src)
     status, batch_size, seq_len, hidden_size = meta.tolist()
     if status == STATUS_STOP:
         return None
@@ -648,8 +749,25 @@ def recv_hidden_from_rank0(device, dtype):
     hidden_states = torch.empty(
         (batch_size, seq_len, hidden_size), dtype=dtype, device=device
     )
-    dist.recv(hidden_states, src=0)
+    dist.recv(hidden_states, src=src)
     return hidden_states
+
+
+def recv_hidden_from_rank0(device, dtype):
+    """Backward-compatible helper for the old Rank 1 receive path."""
+    return recv_hidden(src=0, device=device, dtype=dtype)
+
+
+def send_token(next_token, dst):
+    """Send a generated token id to the previous pipeline rank."""
+    dist.send(next_token.contiguous(), dst=dst)
+
+
+def recv_token(src, device):
+    """Receive a generated token id from the next pipeline rank."""
+    next_token = torch.empty((1, 1), dtype=torch.long, device=device)
+    dist.recv(next_token, src=src)
+    return next_token
 
 
 def choose_next_token(logits, temperature):
@@ -746,10 +864,9 @@ def generate_rows_for_prompts(args, model, tokenizer, device, prompts, start_ind
         with torch.inference_mode():
             for _ in range(args.max_new_tokens):
                 hidden_states = rank0_forward(model, input_ids, device)
-                send_hidden_to_rank1(hidden_states)
+                send_hidden(hidden_states, dst=1)
 
-                next_token = torch.empty((1, 1), dtype=torch.long, device=device)
-                dist.recv(next_token, src=1)
+                next_token = recv_token(src=1, device=device)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
                 if eos_token_id is not None and int(next_token.item()) == eos_token_id:
@@ -825,19 +942,27 @@ def rank0_generate(args, model, tokenizer, device):
     send_stop(device)
 
 
-def broadcast_midpoint(midpoint, device, rank):
-    """Broadcast the next dynamic-loading split point from Rank 0 to Rank 1.
+def broadcast_boundaries(boundaries, world_size, device, rank):
+    """Broadcast pipeline boundaries from Rank 0 to all ranks.
 
-    midpoint=0 is reserved as the global stop signal for the dynamic scheduler
-    loop. Valid layer split points are always between 1 and total_layers - 1.
+    A first boundary of -1 is reserved as the dynamic scheduler stop signal.
+    Normal boundaries always start with 0 and end with total_layers.
     """
-    value = int(midpoint) if rank == 0 else 0
-    tensor = torch.tensor([value], dtype=torch.long, device=device)
+    if rank == 0:
+        values = [int(value) for value in boundaries]
+    else:
+        values = [0] * (world_size + 1)
+    tensor = torch.tensor(values, dtype=torch.long, device=device)
     dist.broadcast(tensor, src=0)
-    return int(tensor.item())
+    return [int(value) for value in tensor.tolist()]
 
 
-def rank0_generate_dynamic(args, tokenizer, dtype, device):
+def stop_boundaries(world_size):
+    """Return a broadcast payload that means dynamic inference is complete."""
+    return [-1] + [0] * world_size
+
+
+def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
     """Rank 0 dynamic-loading driver.
 
     Rank 0 reads all prompts, groups them into batches, asks Scheduler which
@@ -848,51 +973,60 @@ def rank0_generate_dynamic(args, tokenizer, dtype, device):
     prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
     if not prompts:
         print(f"[Rank 0] No prompts found in {args.input_csv}")
-        broadcast_midpoint(0, device, rank=0)
+        broadcast_boundaries(stop_boundaries(world_size), world_size, device, rank=0)
         return
 
     total_layers = get_total_layers_from_config(args.model_dir)
-    scheduler = Scheduler(args.allocation_csv, total_layers, args.split_layer)
+    default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
+    scheduler = Scheduler(args.allocation_csv, total_layers, default_boundaries, world_size)
     all_rows = []
     model = None
-    current_midpoint = None
+    current_stage = None
 
     try:
         for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
             allocation = scheduler.get_or_create(batch_number)
-            midpoint = allocation.midpoint
+            boundaries = allocation.boundaries
+            layer_start, layer_end = stage_from_boundaries(boundaries, rank=0)
+            next_stage = (layer_start, layer_end)
+            interval_text = " ".join(
+                f"rank{rank}={allocation.interval_for_rank(rank)}"
+                for rank in range(world_size)
+            )
             print(
-                f"[Rank 0] Batch {batch_number}: rank0={allocation.rank0_interval} "
-                f"rank1={allocation.rank1_interval}; prompts={len(prompt_batch)}"
+                f"[Rank 0] Batch {batch_number}: {interval_text}; "
+                f"prompts={len(prompt_batch)}"
             )
 
-            broadcast_midpoint(midpoint, device, rank=0)
-            if model is None or midpoint != current_midpoint:
+            broadcast_boundaries(boundaries, world_size, device, rank=0)
+            if model is None or next_stage != current_stage:
                 if model is not None:
                     release_model(model)
                     model = None
                     print(
                         f"[Rank 0] Batch {batch_number}: split changed "
-                        f"{current_midpoint}->{midpoint}; old partition released."
+                        f"{current_stage}->{next_stage}; old partition released."
                     )
 
                 model, _, load_mode = load_model_part(
                     args.model_dir,
                     rank=0,
-                    split_layer=midpoint,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
                     dtype=dtype,
                     device=device,
                     lazy_load=True,
                 )
-                current_midpoint = midpoint
+                current_stage = next_stage
                 print(
                     f"[Rank 0] Batch {batch_number} model loaded; "
-                    f"midpoint={midpoint}; load_mode={load_mode}"
+                    f"stage=[{layer_start},{layer_end}); load_mode={load_mode}"
                 )
             else:
                 print(
                     f"[Rank 0] Batch {batch_number}: reuse cached model partition "
-                    f"for midpoint={midpoint}."
+                    f"for stage=[{layer_start},{layer_end})."
                 )
 
             rows = generate_rows_for_prompts(
@@ -910,101 +1044,134 @@ def rank0_generate_dynamic(args, tokenizer, dtype, device):
             print(f"[Rank 0] Batch {batch_number} complete.")
 
         write_output_rows(args.output_csv, all_rows)
-        broadcast_midpoint(0, device, rank=0)
+        broadcast_boundaries(stop_boundaries(world_size), world_size, device, rank=0)
     finally:
         release_model(model)
 
 
-def rank1_serve(args, model, device):
-    """Rank 1 service loop.
+def pipeline_serve_static(args, model, rank, world_size, device):
+    """Serve a non-master pipeline rank in static mode.
 
-    Rank 1 does not read prompts and does not write the output CSV. It waits for
-    hidden states from Rank 0, runs the second half of the model, sends one token
-    id back, and repeats until a stop message arrives.
+    Middle ranks relay hidden states forward and relay next-token ids backward.
+    The last rank computes logits and samples/greedily chooses the next token.
     """
-    print("[Rank 1] Waiting for hidden states from Rank 0...")
+    prev_rank = rank - 1
+    next_rank = rank + 1
+    is_last_rank = rank == world_size - 1
+
+    print(f"[Rank {rank}] Waiting for hidden states from Rank {prev_rank}...")
     with torch.inference_mode():
         while True:
-            hidden_states = recv_hidden_from_rank0(device, model.dtype)
+            hidden_states = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
             if hidden_states is None:
+                if not is_last_rank:
+                    send_stop(device, dst=next_rank)
                 break
             if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+                if not is_last_rank:
+                    send_batch_done(device, dst=next_rank)
                 continue
-            logits = rank1_forward_logits(model, hidden_states, device)
-            next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
-            dist.send(next_token, dst=0)
-    print("[Rank 1] Stop signal received.")
+
+            if is_last_rank:
+                logits = rank1_forward_logits(model, hidden_states, device)
+                next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
+            else:
+                hidden_states = rank_middle_forward(model, hidden_states, device)
+                send_hidden(hidden_states, dst=next_rank)
+                next_token = recv_token(src=next_rank, device=device)
+
+            send_token(next_token, dst=prev_rank)
+    print(f"[Rank {rank}] Stop signal received.")
 
 
-def rank1_serve_dynamic(args, dtype, device):
-    """Rank 1 dynamic-loading service loop.
+def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
+    """Dynamic-loading service loop for non-master pipeline ranks.
 
-    Rank 1 waits for Rank 0 to broadcast a midpoint. For each positive midpoint,
-    it records the allocation locally and compares the new midpoint with the
-    currently loaded partition. It only reloads weights when the midpoint changes.
+    Each non-master rank receives boundaries from Rank 0, records them locally,
+    and compares its own [layer_start, layer_end) with the currently cached model
+    partition. It only reloads weights when that interval changes.
     """
+    prev_rank = rank - 1
+    next_rank = rank + 1
+    is_last_rank = rank == world_size - 1
     total_layers = get_total_layers_from_config(args.model_dir)
-    scheduler = Scheduler(args.allocation_csv, total_layers, args.split_layer)
+    default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
+    scheduler = Scheduler(args.allocation_csv, total_layers, default_boundaries, world_size)
     batch_number = 1
     model = None
-    current_midpoint = None
+    current_stage = None
 
     try:
         while True:
-            midpoint = broadcast_midpoint(0, device, rank=1)
-            if midpoint == 0:
+            boundaries = broadcast_boundaries(None, world_size, device, rank=rank)
+            if boundaries[0] == -1:
                 break
 
-            allocation = scheduler.record_allocation(batch_number, midpoint)
-            print(
-                f"[Rank 1] Batch {batch_number}: rank0={allocation.rank0_interval} "
-                f"rank1={allocation.rank1_interval}"
+            allocation = scheduler.record_allocation(batch_number, boundaries)
+            layer_start, layer_end = stage_from_boundaries(boundaries, rank)
+            next_stage = (layer_start, layer_end)
+            interval_text = " ".join(
+                f"rank{stage_rank}={allocation.interval_for_rank(stage_rank)}"
+                for stage_rank in range(world_size)
             )
+            print(f"[Rank {rank}] Batch {batch_number}: {interval_text}")
 
-            if model is None or midpoint != current_midpoint:
+            if model is None or next_stage != current_stage:
                 if model is not None:
                     release_model(model)
                     model = None
                     print(
-                        f"[Rank 1] Batch {batch_number}: split changed "
-                        f"{current_midpoint}->{midpoint}; old partition released."
+                        f"[Rank {rank}] Batch {batch_number}: split changed "
+                        f"{current_stage}->{next_stage}; old partition released."
                     )
 
                 model, _, load_mode = load_model_part(
                     args.model_dir,
-                    rank=1,
-                    split_layer=midpoint,
+                    rank=rank,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
                     dtype=dtype,
                     device=device,
                     lazy_load=True,
                 )
-                current_midpoint = midpoint
+                current_stage = next_stage
                 print(
-                    f"[Rank 1] Batch {batch_number} model loaded; "
-                    f"midpoint={midpoint}; load_mode={load_mode}"
+                    f"[Rank {rank}] Batch {batch_number} model loaded; "
+                    f"stage=[{layer_start},{layer_end}); load_mode={load_mode}"
                 )
             else:
                 print(
-                    f"[Rank 1] Batch {batch_number}: reuse cached model partition "
-                    f"for midpoint={midpoint}."
+                    f"[Rank {rank}] Batch {batch_number}: reuse cached model partition "
+                    f"for stage=[{layer_start},{layer_end})."
                 )
 
             with torch.inference_mode():
                 while True:
-                    hidden_states = recv_hidden_from_rank0(device, model.dtype)
+                    hidden_states = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
                     if hidden_states is None:
+                        if not is_last_rank:
+                            send_stop(device, dst=next_rank)
                         return
                     if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+                        if not is_last_rank:
+                            send_batch_done(device, dst=next_rank)
                         break
 
-                    logits = rank1_forward_logits(model, hidden_states, device)
-                    next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
-                    dist.send(next_token, dst=0)
+                    if is_last_rank:
+                        logits = rank1_forward_logits(model, hidden_states, device)
+                        next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
+                    else:
+                        hidden_states = rank_middle_forward(model, hidden_states, device)
+                        send_hidden(hidden_states, dst=next_rank)
+                        next_token = recv_token(src=next_rank, device=device)
 
-            print(f"[Rank 1] Batch {batch_number} complete.")
+                    send_token(next_token, dst=prev_rank)
+
+            print(f"[Rank {rank}] Batch {batch_number} complete.")
             batch_number += 1
 
-        print("[Rank 1] Dynamic loading stop signal received.")
+        print(f"[Rank {rank}] Dynamic loading stop signal received.")
     finally:
         release_model(model)
 
@@ -1047,9 +1214,9 @@ def main():
                 tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
                 if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
                     tokenizer.pad_token = tokenizer.eos_token
-                rank0_generate_dynamic(args, tokenizer, dtype, device)
+                rank0_generate_dynamic(args, tokenizer, dtype, world_size, device)
             else:
-                rank1_serve_dynamic(args, dtype, device)
+                pipeline_serve_dynamic(args, rank, world_size, dtype, device)
 
             dist.barrier()
             print(f"[Rank {rank}] SUCCESS")
@@ -1057,17 +1224,23 @@ def main():
         finally:
             dist.destroy_process_group()
 
+    total_layers_for_static = get_total_layers_from_config(args.model_dir)
+    static_boundaries = default_boundaries_for_world_size(args, world_size, total_layers_for_static)
+    layer_start, layer_end = stage_from_boundaries(static_boundaries, rank)
+
     model, total_layers, load_mode = load_model_part(
         args.model_dir,
         rank,
-        args.split_layer,
+        world_size,
+        layer_start,
+        layer_end,
         dtype,
         device,
         lazy_load=args.lazy_load,
     )
     print(
         f"[Rank {rank}] Loaded TinyLlama from {args.model_dir}; "
-        f"total_layers={total_layers}; split_layer={args.split_layer}; "
+        f"total_layers={total_layers}; stage=[{layer_start},{layer_end}); "
         f"load_mode={load_mode}"
     )
 
@@ -1078,7 +1251,7 @@ def main():
                 tokenizer.pad_token = tokenizer.eos_token
             rank0_generate(args, model, tokenizer, device)
         else:
-            rank1_serve(args, model, device)
+            pipeline_serve_static(args, model, rank, world_size, device)
 
         # Synchronize before shutdown so both ranks finish cleanly.
         dist.barrier()

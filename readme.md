@@ -775,3 +775,170 @@ batch,rank0,rank1
 ```bash
 --lazy-load --dynamic-load
 ```
+
+## 13. 2026-05-21 版本更新：支持三节点 Pipeline 推理
+
+本版本在保留两节点推理和动态加载功能的基础上，新增三节点 pipeline 推理。
+
+### 三节点职责
+
+三节点时：
+
+```text
+Rank 0 / master : tokenizer + embed_tokens + 前段 decoder layers
+Rank 1 / node1  : 中段 decoder layers
+Rank 2 / node2  : 后段 decoder layers + model.norm + lm_head + next token
+```
+
+数据流为：
+
+```text
+master <-> node1 <-> node2
+```
+
+单步生成时的实际流向：
+
+```text
+Rank 0 -> Rank 1 -> Rank 2 -> Rank 1 -> Rank 0
+```
+
+Rank 0 不直接向 Rank 2 发送 hidden states，也不直接从 Rank 2 接收 token。Rank 1 是中间 pipeline 节点，负责转发 hidden states 和 next token。
+
+### 两节点启动
+
+两节点方式保持兼容：
+
+```bash
+export WORLD_SIZE=2
+export RANK=0   # master
+python distributed_tinyllama_inference.py ...
+```
+
+```bash
+export WORLD_SIZE=2
+export RANK=1   # slave
+python distributed_tinyllama_inference.py ...
+```
+
+两节点默认仍然使用：
+
+```text
+rank0=[0,5)
+rank1=[5,22)
+```
+
+也可以显式指定：
+
+```bash
+--split-layers 5
+```
+
+### 三节点启动
+
+三节点需要分别启动 Rank 0、Rank 1、Rank 2：
+
+```bash
+export WORLD_SIZE=3
+export RANK=0
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+```bash
+export WORLD_SIZE=3
+export RANK=1
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+```bash
+export WORLD_SIZE=3
+export RANK=2
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+三节点默认切分为：
+
+```text
+rank0=[0,5)
+rank1=[5,15)
+rank2=[15,22)
+```
+
+如果不传 `--split-layers`，脚本也会使用上面的默认切分。对于非 TinyLlama 或总层数不同的模型，如果第二个默认切分点不合法，脚本会自动退回到接近三等分的切法。
+
+### 三节点 allocation.csv
+
+三节点时，`allocation.csv` 使用三列 rank 分配：
+
+```csv
+batch,rank0,rank1,rank2
+1,"[0,5)","[5,15)","[15,22)"
+20,"[0,6)","[6,16)","[16,22)"
+```
+
+没有明确写入的 batch 继续沿用最近一次已有分配。例如 batch `2` 到 `19` 沿用 batch `1`，batch `21` 之后沿用 batch `20`。
+
+### 新增参数
+
+```bash
+--split-layers 5
+```
+
+两节点时使用一个 split。
+
+```bash
+--split-layers 5,15
+```
+
+三节点时使用两个 split。
+
+旧参数仍保留：
+
+```bash
+--split-layer 5
+```
+
+在两节点模式下它等价于 `--split-layers 5`。在三节点模式下，如果没有显式传 `--split-layers`，它会作为第一个 split，第二个 split 默认使用 `15`。
+
+### 动态加载行为
+
+动态加载仍然保留，并升级为按完整 boundaries 判断是否重载。
+
+两节点 boundaries：
+
+```text
+[0,5,22]
+```
+
+三节点 boundaries：
+
+```text
+[0,5,15,22]
+```
+
+每个 rank 只比较自己负责的 `[layer_start, layer_end)` 是否变化：
+
+- 没变：继续复用当前已加载模型分区。
+- 变化：释放旧分区，按新区间懒加载。
