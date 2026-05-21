@@ -635,7 +635,7 @@ batch,rank0,rank1
 开启动态加载后，Rank 0 会：
 
 1. 读取 CSV 中的所有 prompt。
-2. 按 `--batch-size` 分成多个 batch。
+2. 按 `--batch-size` 分成多个真实 prompt tensor batch。
 3. 每个 batch 开始前询问 `Scheduler` 当前 batch 的 layer 分配。
 4. 把当前 batch 的 midpoint 广播给 Rank 1。
 5. Rank 0 和 Rank 1 对比当前已加载模型分区和新的 midpoint。
@@ -737,6 +737,8 @@ batch,rank0,rank1
 ```
 
 每个 batch 包含多少条 prompt。默认值是 `64`。对于 1k 到 100k 级别的输入文件，通常可以按机器吞吐和显存情况选择 `32`、`64` 或 `128`。
+
+当前版本中 `--batch-size` 在普通模式和 `--dynamic-load` 模式下都会生效。Rank 0 会把同一个 batch 内的多条 prompt 一次性 tokenizer padding 成张量批，并沿 pipeline 传递对应的 attention mask。Rank 1 / Rank 2 会按相同 batch 维度处理 hidden states，最后一层节点返回形状为 `[batch_size, 1]` 的 next token。
 
 ```bash
 --allocation-csv allocation.csv

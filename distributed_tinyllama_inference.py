@@ -169,7 +169,7 @@ def parse_args():
         "--batch-size",
         type=int,
         default=64,
-        help="Number of prompts per dynamic-loading batch. Default: 64",
+        help="Number of prompts per tensor batch in both normal and dynamic-loading mode. Default: 64",
     )
     parser.add_argument(
         "--allocation-csv",
@@ -589,16 +589,33 @@ def maybe_rotary_embeddings(model, hidden_states, position_ids):
         return None
 
 
-def make_causal_mask(batch_size, seq_len, dtype, device):
-    """Create a standard causal attention mask.
+def make_causal_mask(batch_size, seq_len, dtype, device, attention_mask_2d=None):
+    """Create a causal attention mask, optionally blocking padding tokens.
 
     Shape is [batch, heads, query_length, key_length]. Values above the diagonal
     are set to a very negative number so a token cannot attend to future tokens.
+    When attention_mask_2d is passed, key positions with value 0 are also masked.
     """
     min_value = torch.finfo(dtype).min
     mask = torch.full((seq_len, seq_len), min_value, dtype=dtype, device=device)
     mask = torch.triu(mask, diagonal=1)
-    return mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+    mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+
+    if attention_mask_2d is not None:
+        padding_mask = attention_mask_2d.to(device=device)
+        padding_mask = padding_mask.view(batch_size, 1, 1, seq_len)
+        mask = mask.masked_fill(padding_mask == 0, min_value)
+
+    return mask
+
+
+def make_position_ids(seq_len, device, attention_mask_2d=None):
+    """Build position ids that work for both single prompts and left-padded batches."""
+    if attention_mask_2d is None:
+        return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+
+    position_ids = attention_mask_2d.to(device=device, dtype=torch.long).cumsum(dim=-1) - 1
+    return position_ids.masked_fill(attention_mask_2d.to(device=device) == 0, 0)
 
 
 def run_decoder_layers(model, hidden_states, position_ids, attention_mask):
@@ -636,7 +653,7 @@ def run_decoder_layers(model, hidden_states, position_ids, attention_mask):
     return hidden_states
 
 
-def rank0_forward(model, input_ids, device):
+def rank0_forward(model, input_ids, device, attention_mask_2d=None):
     """Run Rank 0's part of the model and return hidden states for Rank 1.
 
     Rank 0 starts from token ids, so it must apply token embedding first. It then
@@ -644,25 +661,25 @@ def rank0_forward(model, input_ids, device):
     Rank 1 through NCCL.
     """
     batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device)
+    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
+    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
 
     hidden_states = model.model.embed_tokens(input_ids)
     hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
     return hidden_states.contiguous()
 
 
-def rank_middle_forward(model, hidden_states, device):
+def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None):
     """Run a middle pipeline rank: hidden_states -> local decoder layers."""
     batch_size, seq_len, _ = hidden_states.shape
-    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device)
+    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
+    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
 
     hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
     return hidden_states.contiguous()
 
 
-def rank1_forward_logits(model, hidden_states, device):
+def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None):
     """Run the last pipeline rank and return logits for the last token.
 
     The last rank receives hidden states, not token ids. Therefore it skips embeddings,
@@ -670,8 +687,8 @@ def rank1_forward_logits(model, hidden_states, device):
     only the last-token logits needed to choose the next generated token.
     """
     batch_size, seq_len, _ = hidden_states.shape
-    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device)
+    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
+    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
 
     hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
     hidden_states = model.model.norm(hidden_states)
@@ -685,7 +702,7 @@ def rank1_forward_logits(model, hidden_states, device):
 
 def send_status(status, device, dst):
     """Send a metadata-only status message to a neighboring pipeline rank."""
-    meta = torch.tensor([status, 0, 0, 0], dtype=torch.long, device=device)
+    meta = torch.tensor([status, 0, 0, 0, 0], dtype=torch.long, device=device)
     dist.send(meta, dst=dst)
 
 
@@ -704,22 +721,25 @@ def send_batch_done(device, dst=1):
     send_status(STATUS_BATCH_DONE, device, dst)
 
 
-def send_hidden(hidden_states, dst):
+def send_hidden(hidden_states, dst, attention_mask_2d=None):
     """Send tensor metadata first, then the hidden_states tensor itself.
 
     dist.recv() needs the receiver to allocate a correctly shaped tensor before
     receiving payload data. The small meta tensor carries
-    [status, batch, seq, hidden_size] so the receiver knows exactly what buffer
-    to allocate.
+    [status, batch, seq, hidden_size, has_attention_mask] so the receiver knows
+    exactly what buffers to allocate.
     """
     batch_size, seq_len, hidden_size = hidden_states.shape
+    has_attention_mask = 1 if attention_mask_2d is not None else 0
     meta = torch.tensor(
-        [STATUS_HIDDEN, batch_size, seq_len, hidden_size],
+        [STATUS_HIDDEN, batch_size, seq_len, hidden_size, has_attention_mask],
         dtype=torch.long,
         device=hidden_states.device,
     )
     dist.send(meta, dst=dst)
     dist.send(hidden_states, dst=dst)
+    if attention_mask_2d is not None:
+        dist.send(attention_mask_2d.to(device=hidden_states.device, dtype=torch.long), dst=dst)
 
 
 def send_hidden_to_rank1(hidden_states):
@@ -736,9 +756,9 @@ def recv_hidden(src, device, dtype):
     - None means the whole job is complete.
     - STATUS_BATCH_DONE means only the current dynamic-loading batch is complete.
     """
-    meta = torch.empty(4, dtype=torch.long, device=device)
+    meta = torch.empty(5, dtype=torch.long, device=device)
     dist.recv(meta, src=src)
-    status, batch_size, seq_len, hidden_size = meta.tolist()
+    status, batch_size, seq_len, hidden_size, has_attention_mask = meta.tolist()
     if status == STATUS_STOP:
         return None
     if status == STATUS_BATCH_DONE:
@@ -750,7 +770,11 @@ def recv_hidden(src, device, dtype):
         (batch_size, seq_len, hidden_size), dtype=dtype, device=device
     )
     dist.recv(hidden_states, src=src)
-    return hidden_states
+    attention_mask_2d = None
+    if has_attention_mask:
+        attention_mask_2d = torch.empty((batch_size, seq_len), dtype=torch.long, device=device)
+        dist.recv(attention_mask_2d, src=src)
+    return hidden_states, attention_mask_2d
 
 
 def recv_hidden_from_rank0(device, dtype):
@@ -763,9 +787,9 @@ def send_token(next_token, dst):
     dist.send(next_token.contiguous(), dst=dst)
 
 
-def recv_token(src, device):
+def recv_token(src, device, batch_size=1):
     """Receive a generated token id from the next pipeline rank."""
-    next_token = torch.empty((1, 1), dtype=torch.long, device=device)
+    next_token = torch.empty((batch_size, 1), dtype=torch.long, device=device)
     dist.recv(next_token, src=src)
     return next_token
 
@@ -841,40 +865,77 @@ def generate_rows_for_prompts(args, model, tokenizer, device, prompts, start_ind
     """Generate outputs for an in-memory list of prompts using the active model.
 
     This function is shared by normal mode and dynamic-loading mode. Rank 0 owns
-    tokenization and receives one next-token id from Rank 1 for every generation
-    step.
+    tokenization and receives one next-token id per prompt from Rank 1 for every
+    generation step. The whole prompt list passed here is one tensor batch.
     """
     eos_token_id = tokenizer.eos_token_id
-    rows = []
-    total_count = total_count if total_count is not None else len(prompts)
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+    if pad_token_id is None:
+        raise RuntimeError("Tokenizer must define pad_token_id or eos_token_id for batched inference.")
 
-    for local_index, prompt in enumerate(prompts, start=1):
-        global_index = start_index + local_index
+    total_count = total_count if total_count is not None else len(prompts)
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    try:
         encoded = tokenizer(
-            prompt,
+            prompts,
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=args.max_input_tokens,
         )
         input_ids = encoded["input_ids"].to(device)
-        prompt_len = input_ids.shape[1]
+        attention_mask_2d = encoded["attention_mask"].to(device)
+    finally:
+        tokenizer.padding_side = old_padding_side
 
-        print(f"[Rank 0] Prompt {global_index}/{total_count}: {prompt}")
+    batch_size = input_ids.shape[0]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    generated_tokens = [[] for _ in range(batch_size)]
 
-        with torch.inference_mode():
-            for _ in range(args.max_new_tokens):
-                hidden_states = rank0_forward(model, input_ids, device)
-                send_hidden(hidden_states, dst=1)
+    first_prompt_number = start_index + 1
+    last_prompt_number = start_index + len(prompts)
+    print(
+        f"[Rank 0] Prompt batch {first_prompt_number}-{last_prompt_number}/"
+        f"{total_count}; batch_size={batch_size}"
+    )
 
-                next_token = recv_token(src=1, device=device)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
+    with torch.inference_mode():
+        for _ in range(args.max_new_tokens):
+            hidden_states = rank0_forward(model, input_ids, device, attention_mask_2d)
+            send_hidden(hidden_states, dst=1, attention_mask_2d=attention_mask_2d)
 
-                if eos_token_id is not None and int(next_token.item()) == eos_token_id:
-                    break
+            next_token = recv_token(src=1, device=device, batch_size=batch_size)
+            active = ~finished
+            tokens_to_append = torch.where(
+                active.unsqueeze(1),
+                next_token,
+                torch.full_like(next_token, pad_token_id),
+            )
+            mask_to_append = active.to(dtype=attention_mask_2d.dtype).unsqueeze(1)
 
-        generated_ids = input_ids[0, prompt_len:]
+            for row_index in range(batch_size):
+                if active[row_index]:
+                    token_value = int(next_token[row_index, 0].item())
+                    generated_tokens[row_index].append(token_value)
+                    if eos_token_id is not None and token_value == eos_token_id:
+                        finished[row_index] = True
+
+            input_ids = torch.cat([input_ids, tokens_to_append], dim=1)
+            attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
+
+            if bool(finished.all().item()):
+                break
+
+    rows = []
+    for local_index, prompt in enumerate(prompts, start=1):
+        global_index = start_index + local_index
+        generated_ids = generated_tokens[local_index - 1]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        full_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        full_text = prompt + generated_text
         rows.append(
             {
                 "prompt": prompt,
@@ -929,16 +990,21 @@ def rank0_generate(args, model, tokenizer, device):
         send_stop(device)
         return
 
-    rows = generate_rows_for_prompts(
-        args,
-        model,
-        tokenizer,
-        device,
-        prompts,
-        start_index=0,
-        total_count=len(prompts),
-    )
-    write_output_rows(args.output_csv, rows)
+    all_rows = []
+    for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
+        print(f"[Rank 0] Static batch {batch_number}; prompts={len(prompt_batch)}")
+        rows = generate_rows_for_prompts(
+            args,
+            model,
+            tokenizer,
+            device,
+            prompt_batch,
+            start_index=start_index,
+            total_count=len(prompts),
+        )
+        all_rows.extend(rows)
+
+    write_output_rows(args.output_csv, all_rows)
     send_stop(device)
 
 
@@ -1062,23 +1128,28 @@ def pipeline_serve_static(args, model, rank, world_size, device):
     print(f"[Rank {rank}] Waiting for hidden states from Rank {prev_rank}...")
     with torch.inference_mode():
         while True:
-            hidden_states = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
-            if hidden_states is None:
+            message = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
+            if message is None:
                 if not is_last_rank:
                     send_stop(device, dst=next_rank)
                 break
-            if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+            if isinstance(message, int) and message == STATUS_BATCH_DONE:
                 if not is_last_rank:
                     send_batch_done(device, dst=next_rank)
                 continue
 
+            hidden_states, attention_mask_2d = message
             if is_last_rank:
-                logits = rank1_forward_logits(model, hidden_states, device)
+                logits = rank1_forward_logits(model, hidden_states, device, attention_mask_2d)
                 next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
             else:
-                hidden_states = rank_middle_forward(model, hidden_states, device)
-                send_hidden(hidden_states, dst=next_rank)
-                next_token = recv_token(src=next_rank, device=device)
+                hidden_states = rank_middle_forward(model, hidden_states, device, attention_mask_2d)
+                send_hidden(hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
+                next_token = recv_token(
+                    src=next_rank,
+                    device=device,
+                    batch_size=hidden_states.shape[0],
+                )
 
             send_token(next_token, dst=prev_rank)
     print(f"[Rank {rank}] Stop signal received.")
@@ -1148,23 +1219,28 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
 
             with torch.inference_mode():
                 while True:
-                    hidden_states = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
-                    if hidden_states is None:
+                    message = recv_hidden(src=prev_rank, device=device, dtype=model.dtype)
+                    if message is None:
                         if not is_last_rank:
                             send_stop(device, dst=next_rank)
                         return
-                    if isinstance(hidden_states, int) and hidden_states == STATUS_BATCH_DONE:
+                    if isinstance(message, int) and message == STATUS_BATCH_DONE:
                         if not is_last_rank:
                             send_batch_done(device, dst=next_rank)
                         break
 
+                    hidden_states, attention_mask_2d = message
                     if is_last_rank:
-                        logits = rank1_forward_logits(model, hidden_states, device)
+                        logits = rank1_forward_logits(model, hidden_states, device, attention_mask_2d)
                         next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
                     else:
-                        hidden_states = rank_middle_forward(model, hidden_states, device)
-                        send_hidden(hidden_states, dst=next_rank)
-                        next_token = recv_token(src=next_rank, device=device)
+                        hidden_states = rank_middle_forward(model, hidden_states, device, attention_mask_2d)
+                        send_hidden(hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
+                        next_token = recv_token(
+                            src=next_rank,
+                            device=device,
+                            batch_size=hidden_states.shape[0],
+                        )
 
                     send_token(next_token, dst=prev_rank)
 
