@@ -60,8 +60,8 @@ def parse_args():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=64,
-        help="Maximum generated tokens for each prompt. Default: 64",
+        default=512,
+        help="Maximum generated tokens for each prompt. Default: 512",
     )
     parser.add_argument(
         "--max-input-tokens",
@@ -130,8 +130,11 @@ def parse_args():
     )
     parser.add_argument(
         "--allocation-csv",
-        default="allocation.csv",
-        help="Scheduler allocation CSV path. Default: allocation.csv",
+        default=None,
+        help=(
+            "Optional Scheduler allocation CSV path. If omitted, every batch uses "
+            "--split-layers as a fixed layer partition."
+        ),
     )
     parser.add_argument(
         "--cuda-device",

@@ -1129,3 +1129,228 @@ Rank 0 -> Rank 1 -> Rank 2 -> Rank 1 -> Rank 0
 ```
 
 Rank 0 负责 tokenizer、embedding、前段 decoder layers、读取输入 CSV、写输出 CSV。Rank 1 负责中间 decoder layers 和转发。Rank 2 负责后段 decoder layers、final norm、lm_head 和 next token 选择。
+
+## 15. 2026-05-25 版本更新：默认 KV Cache 推理与 Prefill 实验日志
+
+本版本将主推理流程升级为默认使用 KV cache。不再保留“每一步重新计算完整序列”的无 cache 主路径。
+
+新的生成流程分为两段：
+
+```text
+prefill: 对完整 prompt batch 计算一次，并在每个 rank 本地建立 KV cache
+decode : 每一步只计算最新 token，并复用各 rank 自己保存的 KV cache
+```
+
+停止规则固定为：
+
+```text
+全部 prompt 生成 EOS，或者达到 --max-new-tokens 上限
+```
+
+`--max-new-tokens` 默认值改为：
+
+```bash
+--max-new-tokens 512
+```
+
+### dataset.csv 格式
+
+输入 CSV 格式保持不变。带表头时：
+
+```csv
+prompt
+这里是一条 prompt
+这里是另一条 prompt
+```
+
+启动时使用：
+
+```bash
+--csv-has-header
+--prompt-column prompt
+```
+
+如果没有表头，则默认读取第一列，不需要加 `--csv-has-header`。
+
+长 prompt 实验可以使用：
+
+```bash
+--max-input-tokens 1000
+```
+
+短 prompt 实验可以使用：
+
+```bash
+--max-input-tokens 100
+```
+
+batch 实验建议分别测试：
+
+```bash
+--batch-size 1
+--batch-size 16
+--batch-size 64
+--batch-size 128
+```
+
+### split 与 allocation.csv 规则
+
+如果启动命令没有传：
+
+```bash
+--allocation-csv allocation.csv
+```
+
+则每个 batch 都固定使用 `--split-layers` 指定的层分配。例如三节点：
+
+```bash
+--split-layers 5,15
+```
+
+表示：
+
+```text
+rank0=[0,5)
+rank1=[5,15)
+rank2=[15,22)
+```
+
+只有显式传入：
+
+```bash
+--allocation-csv allocation.csv
+```
+
+才会启用 Scheduler，并按 `allocation.csv` 对每个 batch 读取或记录层分配。
+
+KV cache 的生命周期是 batch 内有效、batch 间清空重建。因此即使以后使用 `allocation.csv`，也不做跨 batch cache 迁移。
+
+### 实验日志
+
+Rank 0 会自动输出一个文本日志：
+
+```text
+log_YYYY-MM-DD-HH-MM.txt
+```
+
+例如：
+
+```text
+log_2026-05-25-20-45.txt
+```
+
+日志文件写在当前运行目录。每个 `--- record ---` 表示一个 batch 内一个 rank 的 prefill 指标。文件格式是一行一个参数，容量单位统一为 MB。
+
+示例：
+
+```text
+--- record ---
+timestamp=2026-05-25 20:45:12
+batch=1
+rank=0
+world_size=3
+layer_start=0
+layer_end=5
+layer_count=5
+batch_size=16
+prompt_count=16
+input_seq_len_max=1000
+input_seq_len_avg=1000.00
+dtype=torch.float16
+prefill_param_count=123456789
+prefill_param_size_mb=235.47
+kv_cache_size_mb_after_prefill=78.13
+hidden_prefill_shape=[16,1000,2048]
+hidden_prefill_size_mb=62.50
+cuda_memory_allocated_before_prefill_mb=300.12
+cuda_memory_allocated_after_prefill_mb=460.28
+cuda_memory_reserved_after_prefill_mb=512.00
+prefill_time_ms=123.45
+```
+
+字段说明：
+
+- `layer_start/layer_end/layer_count`：当前 rank 分到的 decoder layer 范围。
+- `batch_size`：命令行设置的 batch 大小；最后一个 batch 可能更小。
+- `prompt_count`：当前 batch 实际 prompt 数量。
+- `input_seq_len_max`：当前 batch padding 后的最大输入 token 长度。
+- `input_seq_len_avg`：当前 batch 的平均有效输入 token 数。
+- `prefill_param_count`：当前 rank 模型分区的参数个数。
+- `prefill_param_size_mb`：当前 rank 模型分区参数容量，单位 MB。
+- `kv_cache_size_mb_after_prefill`：prefill 完成后当前 rank 的 KV cache 容量，单位 MB。
+- `hidden_prefill_shape`：prefill 阶段当前 rank 输出或处理的 hidden states 形状。
+- `hidden_prefill_size_mb`：prefill 阶段 hidden states tensor 容量，单位 MB。
+- `cuda_memory_allocated_before_prefill_mb`：prefill 前 CUDA allocated memory。
+- `cuda_memory_allocated_after_prefill_mb`：prefill 后 CUDA allocated memory。
+- `cuda_memory_reserved_after_prefill_mb`：prefill 后 CUDA reserved memory。
+- `prefill_time_ms`：当前 rank 本地 prefill forward 计算时间，单位毫秒。
+
+### 三节点固定 split 启动命令
+
+Rank 0：
+
+```bash
+export WORLD_SIZE=3
+export RANK=0
+export NCCL_SOCKET_IFNAME=enp6s18
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 16 \
+  --split-layers 5,15 \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv dataset.csv \
+  --output-csv outputs_kv.csv \
+  --csv-has-header \
+  --prompt-column prompt \
+  --max-input-tokens 1000
+```
+
+Rank 1：
+
+```bash
+export WORLD_SIZE=3
+export RANK=1
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 16 \
+  --split-layers 5,15 \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --max-input-tokens 1000
+```
+
+Rank 2：
+
+```bash
+export WORLD_SIZE=3
+export RANK=2
+export NCCL_SOCKET_IFNAME=ens12f1np1
+export NCCL_DEBUG=INFO
+
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 16 \
+  --split-layers 5,15 \
+  --init-method tcp://10.50.0.57:29500 \
+  --model-dir /data-store/pengying/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt \
+  --max-input-tokens 1000
+```
+
+如果需要按 `allocation.csv` 进行 batch 级动态分层，在三个 rank 的命令中都显式增加：
+
+```bash
+--allocation-csv allocation.csv
+```

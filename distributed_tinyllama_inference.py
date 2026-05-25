@@ -89,9 +89,9 @@ def main():
 
         if rank == 0:
             tokenizer = load_tokenizer(args.model_dir)
-            rank0_generate(args, model, tokenizer, device)
+            rank0_generate(args, model, tokenizer, device, world_size, layer_start, layer_end)
         else:
-            pipeline_serve_static(args, model, rank, world_size, device)
+            pipeline_serve_static(args, model, rank, world_size, device, layer_start, layer_end)
 
         dist.barrier()
         print(f"[Rank {rank}] SUCCESS")

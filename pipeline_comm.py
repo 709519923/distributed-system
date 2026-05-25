@@ -37,13 +37,14 @@ def send_hidden(hidden_states, dst, attention_mask_2d=None):
 
     dist.recv() needs the receiver to allocate a correctly shaped tensor before
     receiving payload data. The small meta tensor carries
-    [status, batch, seq, hidden_size, has_attention_mask] so the receiver knows
-    exactly what buffers to allocate.
+    [status, batch, hidden_seq, hidden_size, mask_seq] so the receiver knows
+    exactly what buffers to allocate. KV-cache decode sends hidden_seq=1 while
+    mask_seq is the full context length.
     """
     batch_size, seq_len, hidden_size = hidden_states.shape
-    has_attention_mask = 1 if attention_mask_2d is not None else 0
+    mask_seq_len = 0 if attention_mask_2d is None else int(attention_mask_2d.shape[1])
     meta = torch.tensor(
-        [STATUS_HIDDEN, batch_size, seq_len, hidden_size, has_attention_mask],
+        [STATUS_HIDDEN, batch_size, seq_len, hidden_size, mask_seq_len],
         dtype=torch.long,
         device=hidden_states.device,
     )
@@ -69,7 +70,7 @@ def recv_hidden(src, device, dtype):
     """
     meta = torch.empty(5, dtype=torch.long, device=device)
     dist.recv(meta, src=src)
-    status, batch_size, seq_len, hidden_size, has_attention_mask = meta.tolist()
+    status, batch_size, seq_len, hidden_size, mask_seq_len = meta.tolist()
     if status == STATUS_STOP:
         return None
     if status == STATUS_BATCH_DONE:
@@ -82,8 +83,8 @@ def recv_hidden(src, device, dtype):
     )
     dist.recv(hidden_states, src=src)
     attention_mask_2d = None
-    if has_attention_mask:
-        attention_mask_2d = torch.empty((batch_size, seq_len), dtype=torch.long, device=device)
+    if mask_seq_len:
+        attention_mask_2d = torch.empty((batch_size, mask_seq_len), dtype=torch.long, device=device)
         dist.recv(attention_mask_2d, src=src)
     return hidden_states, attention_mask_2d
 

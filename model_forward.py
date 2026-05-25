@@ -1,23 +1,23 @@
 """Forward-pass helpers for the pipeline stages.
 
-This module is the right place to inspect when output quality, padding behavior,
-batch inference, attention masks, position ids, or logits selection look wrong.
-It contains no file I/O and no NCCL send/recv calls.
+KV cache is the default path. Prefill calls these helpers with
+past_key_values=None and a full prompt sequence. Decode calls them with the
+rank-local past_key_values and a one-token query. Each rank keeps only the cache
+for the decoder layers it owns.
 """
 
 import inspect
 
 import torch
 
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:
+    DynamicCache = None
+
 
 def maybe_rotary_embeddings(model, hidden_states, position_ids):
-    """Build rotary position embeddings when the installed Transformers needs them.
-
-    Different Transformers versions expose Llama/TinyLlama decoder-layer forward
-    signatures slightly differently. Newer versions may pass precomputed rotary
-    embeddings through position_embeddings; older versions only use position_ids.
-    Returning None is fine for the older path.
-    """
+    """Build rotary position embeddings when this Transformers version expects them."""
     rotary = getattr(model.model, "rotary_emb", None)
     if rotary is None:
         return None
@@ -27,47 +27,101 @@ def maybe_rotary_embeddings(model, hidden_states, position_ids):
         return None
 
 
-def make_causal_mask(batch_size, seq_len, dtype, device, attention_mask_2d=None):
-    """Create a causal attention mask, optionally blocking padding tokens.
+def make_attention_mask(batch_size, query_len, key_value_len, dtype, device, attention_mask_2d=None):
+    """Create a causal mask that supports both prefill and KV-cache decode.
 
-    Shape is [batch, heads, query_length, key_length]. Values above the diagonal
-    are set to a very negative number so a token cannot attend to future tokens.
-    When attention_mask_2d is passed, key positions with value 0 are also masked.
+    Prefill has query_len == key_value_len. Decode usually has query_len == 1
+    while key_value_len is the full context length after appending the new token.
+    Padding keys from left-padded batches are masked with the full 2D attention
+    mask received from Rank 0.
     """
     min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, dtype=dtype, device=device)
-    mask = torch.triu(mask, diagonal=1)
-    mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+    query_positions = torch.arange(
+        key_value_len - query_len,
+        key_value_len,
+        dtype=torch.long,
+        device=device,
+    )
+    key_positions = torch.arange(key_value_len, dtype=torch.long, device=device)
+    causal = key_positions.view(1, key_value_len) > query_positions.view(query_len, 1)
+    mask = torch.zeros((query_len, key_value_len), dtype=dtype, device=device)
+    mask = mask.masked_fill(causal, min_value)
+    mask = mask.view(1, 1, query_len, key_value_len).expand(
+        batch_size, 1, query_len, key_value_len
+    )
 
     if attention_mask_2d is not None:
         padding_mask = attention_mask_2d.to(device=device)
-        padding_mask = padding_mask.view(batch_size, 1, 1, seq_len)
+        padding_mask = padding_mask.view(batch_size, 1, 1, key_value_len)
         mask = mask.masked_fill(padding_mask == 0, min_value)
 
     return mask
 
 
-def make_position_ids(seq_len, device, attention_mask_2d=None):
-    """Build position ids that work for both single prompts and left-padded batches."""
+def make_position_ids(query_len, device, attention_mask_2d=None):
+    """Build position ids for full prefill or one-token decode."""
     if attention_mask_2d is None:
-        return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        return torch.arange(query_len, device=device, dtype=torch.long).unsqueeze(0)
 
     position_ids = attention_mask_2d.to(device=device, dtype=torch.long).cumsum(dim=-1) - 1
-    return position_ids.masked_fill(attention_mask_2d.to(device=device) == 0, 0)
+    position_ids = position_ids.masked_fill(attention_mask_2d.to(device=device) == 0, 0)
+    return position_ids[:, -query_len:]
 
 
-def run_decoder_layers(model, hidden_states, position_ids, attention_mask):
-    """Run whichever decoder layers remain in this rank's model object.
+def cache_position_for(query_len, key_value_len, device):
+    """Return cache positions for the current query window."""
+    return torch.arange(key_value_len - query_len, key_value_len, dtype=torch.long, device=device)
 
-    The same helper is used by both ranks. Rank 0's model contains only early
-    layers; Rank 1's model contains only later layers. The inspect.signature()
-    logic makes this script tolerate small API differences across Transformers
-    versions without changing the core distributed logic.
-    """
+
+def get_layer_past(past_key_values, index):
+    """Return the cache entry for one local layer."""
+    if past_key_values is None:
+        return None
+    if is_transformers_cache(past_key_values):
+        return past_key_values
+    return past_key_values[index]
+
+
+def is_transformers_cache(past_key_values):
+    """Return True for newer Transformers Cache/DynamicCache objects."""
+    return hasattr(past_key_values, "update") and hasattr(past_key_values, "get_seq_length")
+
+
+def supports_dynamic_cache(model):
+    """Detect decoder layers that use the newer cache_position-based cache API."""
+    if DynamicCache is None or len(model.model.layers) == 0:
+        return False
+    signature = inspect.signature(model.model.layers[0].forward)
+    return "cache_position" in signature.parameters
+
+
+def initialize_past_key_values(model, past_key_values):
+    """Create a cache object for newer Transformers versions when needed."""
+    if past_key_values is not None:
+        return past_key_values
+    if supports_dynamic_cache(model):
+        return DynamicCache()
+    return None
+
+
+def extract_present_key_value(layer_outputs):
+    """Extract present_key_value from common Llama decoder-layer return formats."""
+    if not isinstance(layer_outputs, tuple) or len(layer_outputs) < 2:
+        return None
+    return layer_outputs[-1]
+
+
+def run_decoder_layers(model, hidden_states, position_ids, attention_mask, past_key_values=None):
+    """Run this rank's decoder layers and update rank-local KV cache."""
+    query_len = hidden_states.shape[1]
+    key_value_len = attention_mask.shape[-1]
     position_embeddings = maybe_rotary_embeddings(model, hidden_states, position_ids)
-    cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+    cache_position = cache_position_for(query_len, key_value_len, hidden_states.device)
+    past_key_values = initialize_past_key_values(model, past_key_values)
+    using_transformers_cache = is_transformers_cache(past_key_values)
+    new_past_key_values = []
 
-    for layer in model.model.layers:
+    for layer_index, layer in enumerate(model.model.layers):
         signature = inspect.signature(layer.forward)
         kwargs = {}
         if "attention_mask" in signature.parameters:
@@ -75,11 +129,11 @@ def run_decoder_layers(model, hidden_states, position_ids, attention_mask):
         if "position_ids" in signature.parameters:
             kwargs["position_ids"] = position_ids
         if "past_key_value" in signature.parameters:
-            kwargs["past_key_value"] = None
+            kwargs["past_key_value"] = get_layer_past(past_key_values, layer_index)
         if "output_attentions" in signature.parameters:
             kwargs["output_attentions"] = False
         if "use_cache" in signature.parameters:
-            kwargs["use_cache"] = False
+            kwargs["use_cache"] = True
         if "cache_position" in signature.parameters:
             kwargs["cache_position"] = cache_position
         if "position_embeddings" in signature.parameters and position_embeddings is not None:
@@ -87,59 +141,97 @@ def run_decoder_layers(model, hidden_states, position_ids, attention_mask):
 
         layer_outputs = layer(hidden_states, **kwargs)
         hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
+        if not using_transformers_cache:
+            present_key_value = extract_present_key_value(layer_outputs)
+            if present_key_value is not None:
+                new_past_key_values.append(present_key_value)
 
-    return hidden_states
+    if using_transformers_cache:
+        new_past_key_values = past_key_values
+    elif not new_past_key_values:
+        new_past_key_values = past_key_values
+    else:
+        new_past_key_values = tuple(new_past_key_values)
+    return hidden_states, new_past_key_values
 
 
-def rank0_forward(model, input_ids, device, attention_mask_2d=None):
-    """Run Rank 0's part of the model and return hidden states for Rank 1.
-
-    Rank 0 starts from token ids, so it must apply token embedding first. It then
-    runs the early decoder layers and sends the resulting hidden_states tensor to
-    Rank 1 through NCCL.
-    """
-    batch_size, seq_len = input_ids.shape
-    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
+def rank0_forward(model, input_ids, device, attention_mask_2d=None, past_key_values=None):
+    """Run Rank 0's embedding and early decoder layers with KV cache."""
+    batch_size, query_len = input_ids.shape
+    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    position_ids = make_position_ids(query_len, device, attention_mask_2d)
+    attention_mask = make_attention_mask(
+        batch_size,
+        query_len,
+        key_value_len,
+        model.dtype,
+        device,
+        attention_mask_2d,
+    )
 
     hidden_states = model.model.embed_tokens(input_ids)
-    hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
-    return hidden_states.contiguous()
+    hidden_states, past_key_values = run_decoder_layers(
+        model,
+        hidden_states,
+        position_ids,
+        attention_mask,
+        past_key_values=past_key_values,
+    )
+    return hidden_states.contiguous(), past_key_values
 
 
-def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None):
-    """Run a middle pipeline rank: hidden_states -> local decoder layers."""
-    batch_size, seq_len, _ = hidden_states.shape
-    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
+def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
+    """Run a middle pipeline rank with KV cache."""
+    batch_size, query_len, _ = hidden_states.shape
+    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    position_ids = make_position_ids(query_len, device, attention_mask_2d)
+    attention_mask = make_attention_mask(
+        batch_size,
+        query_len,
+        key_value_len,
+        model.dtype,
+        device,
+        attention_mask_2d,
+    )
 
-    hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
-    return hidden_states.contiguous()
+    hidden_states, past_key_values = run_decoder_layers(
+        model,
+        hidden_states,
+        position_ids,
+        attention_mask,
+        past_key_values=past_key_values,
+    )
+    return hidden_states.contiguous(), past_key_values
 
 
-def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None):
-    """Run the last pipeline rank and return logits for the last token.
+def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
+    """Run the last pipeline rank and return last-token logits with KV cache."""
+    batch_size, query_len, _ = hidden_states.shape
+    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    position_ids = make_position_ids(query_len, device, attention_mask_2d)
+    attention_mask = make_attention_mask(
+        batch_size,
+        query_len,
+        key_value_len,
+        model.dtype,
+        device,
+        attention_mask_2d,
+    )
 
-    The last rank receives hidden states, not token ids. Therefore it skips embeddings,
-    runs the later decoder layers, applies final norm and lm_head, then returns
-    only the last-token logits needed to choose the next generated token.
-    """
-    batch_size, seq_len, _ = hidden_states.shape
-    position_ids = make_position_ids(seq_len, device, attention_mask_2d)
-    attention_mask = make_causal_mask(batch_size, seq_len, model.dtype, device, attention_mask_2d)
-
-    hidden_states = run_decoder_layers(model, hidden_states, position_ids, attention_mask)
+    hidden_states, past_key_values = run_decoder_layers(
+        model,
+        hidden_states,
+        position_ids,
+        attention_mask,
+        past_key_values=past_key_values,
+    )
     hidden_states = model.model.norm(hidden_states)
     logits = model.lm_head(hidden_states)
-    return logits[:, -1, :]
+    return logits[:, -1, :], past_key_values
 
 
 def choose_next_token(logits, temperature):
-    """Convert last-token logits into one token id.
-
-    temperature=0 uses greedy decoding. A positive temperature samples from the
-    softmax distribution, which makes output less deterministic.
-    """
+    """Convert last-token logits into one token id."""
     if temperature and temperature > 0:
         probs = torch.softmax(logits / temperature, dim=-1)
         return torch.multinomial(probs, num_samples=1)
