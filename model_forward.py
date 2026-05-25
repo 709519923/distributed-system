@@ -163,85 +163,91 @@ def run_decoder_layers(
 
 
 def rank0_forward(model, input_ids, device, attention_mask_2d=None, past_key_values=None):
-    """Run Rank 0's embedding and early decoder layers with KV cache."""
-    batch_size, query_len = input_ids.shape
-    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
-    mask_key_value_len = query_len if past_key_values is not None else full_context_len
-    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
-    position_ids = make_position_ids(query_len, device, attention_mask_2d)
-    attention_mask = make_attention_mask(
-        batch_size,
-        query_len,
-        mask_key_value_len,
-        model.dtype,
-        device,
-        mask_attention,
-    )
+    """Run Rank 0's embedding and early decoder layers with KV cache.
 
-    hidden_states = model.model.embed_tokens(input_ids)
-    hidden_states, past_key_values = run_decoder_layers(
+    Use the Transformers model-level forward instead of calling decoder layers
+    one by one. Some Transformers versions update DynamicCache inside
+    LlamaModel.forward but do not return per-layer cache objects from an
+    individual LlamaDecoderLayer call. Model-level forward keeps cache, mask, and
+    cache_position handling consistent with the installed library.
+    """
+    batch_size, query_len = input_ids.shape
+    position_ids = make_position_ids(query_len, device, attention_mask_2d)
+    outputs = model_model_forward(
         model,
-        hidden_states,
-        position_ids,
-        attention_mask,
+        input_ids=input_ids,
+        inputs_embeds=None,
+        attention_mask_2d=attention_mask_2d,
+        position_ids=position_ids,
         past_key_values=past_key_values,
-        cache_position_len=full_context_len,
     )
-    return hidden_states.contiguous(), past_key_values
+    return outputs[0].contiguous(), outputs[1]
+
+
+def model_model_forward(
+    model,
+    input_ids,
+    inputs_embeds,
+    attention_mask_2d,
+    position_ids,
+    past_key_values,
+):
+    """Call model.model.forward with only arguments supported by this version."""
+    signature = inspect.signature(model.model.forward)
+    kwargs = {}
+    if input_ids is not None and "input_ids" in signature.parameters:
+        kwargs["input_ids"] = input_ids
+    if inputs_embeds is not None and "inputs_embeds" in signature.parameters:
+        kwargs["inputs_embeds"] = inputs_embeds
+    if "attention_mask" in signature.parameters:
+        kwargs["attention_mask"] = attention_mask_2d
+    if "position_ids" in signature.parameters:
+        kwargs["position_ids"] = position_ids
+    if "past_key_values" in signature.parameters:
+        kwargs["past_key_values"] = past_key_values
+    if "use_cache" in signature.parameters:
+        kwargs["use_cache"] = True
+    if "return_dict" in signature.parameters:
+        kwargs["return_dict"] = True
+
+    outputs = model.model(**kwargs)
+    if isinstance(outputs, tuple):
+        hidden_states = outputs[0]
+        new_past_key_values = outputs[1] if len(outputs) > 1 else past_key_values
+    else:
+        hidden_states = outputs.last_hidden_state
+        new_past_key_values = getattr(outputs, "past_key_values", past_key_values)
+    return hidden_states, new_past_key_values
 
 
 def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
     """Run a middle pipeline rank with KV cache."""
     batch_size, query_len, _ = hidden_states.shape
-    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
-    mask_key_value_len = query_len if past_key_values is not None else full_context_len
-    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
     position_ids = make_position_ids(query_len, device, attention_mask_2d)
-    attention_mask = make_attention_mask(
-        batch_size,
-        query_len,
-        mask_key_value_len,
-        model.dtype,
-        device,
-        mask_attention,
-    )
-
-    hidden_states, past_key_values = run_decoder_layers(
+    outputs = model_model_forward(
         model,
-        hidden_states,
-        position_ids,
-        attention_mask,
+        input_ids=None,
+        inputs_embeds=hidden_states,
+        attention_mask_2d=attention_mask_2d,
+        position_ids=position_ids,
         past_key_values=past_key_values,
-        cache_position_len=full_context_len,
     )
-    return hidden_states.contiguous(), past_key_values
+    return outputs[0].contiguous(), outputs[1]
 
 
 def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
     """Run the last pipeline rank and return last-token logits with KV cache."""
     batch_size, query_len, _ = hidden_states.shape
-    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
-    mask_key_value_len = query_len if past_key_values is not None else full_context_len
-    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
     position_ids = make_position_ids(query_len, device, attention_mask_2d)
-    attention_mask = make_attention_mask(
-        batch_size,
-        query_len,
-        mask_key_value_len,
-        model.dtype,
-        device,
-        mask_attention,
-    )
-
-    hidden_states, past_key_values = run_decoder_layers(
+    outputs = model_model_forward(
         model,
-        hidden_states,
-        position_ids,
-        attention_mask,
+        input_ids=None,
+        inputs_embeds=hidden_states,
+        attention_mask_2d=attention_mask_2d,
+        position_ids=position_ids,
         past_key_values=past_key_values,
-        cache_position_len=full_context_len,
     )
-    hidden_states = model.model.norm(hidden_states)
+    hidden_states, past_key_values = outputs
     logits = model.lm_head(hidden_states)
     return logits[:, -1, :], past_key_values
 
