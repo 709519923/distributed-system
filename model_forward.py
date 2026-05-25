@@ -111,10 +111,17 @@ def extract_present_key_value(layer_outputs):
     return layer_outputs[-1]
 
 
-def run_decoder_layers(model, hidden_states, position_ids, attention_mask, past_key_values=None):
+def run_decoder_layers(
+    model,
+    hidden_states,
+    position_ids,
+    attention_mask,
+    past_key_values=None,
+    cache_position_len=None,
+):
     """Run this rank's decoder layers and update rank-local KV cache."""
     query_len = hidden_states.shape[1]
-    key_value_len = attention_mask.shape[-1]
+    key_value_len = cache_position_len if cache_position_len is not None else attention_mask.shape[-1]
     position_embeddings = maybe_rotary_embeddings(model, hidden_states, position_ids)
     cache_position = cache_position_for(query_len, key_value_len, hidden_states.device)
     past_key_values = initialize_past_key_values(model, past_key_values)
@@ -158,15 +165,17 @@ def run_decoder_layers(model, hidden_states, position_ids, attention_mask, past_
 def rank0_forward(model, input_ids, device, attention_mask_2d=None, past_key_values=None):
     """Run Rank 0's embedding and early decoder layers with KV cache."""
     batch_size, query_len = input_ids.shape
-    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    mask_key_value_len = query_len if past_key_values is not None else full_context_len
+    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
     position_ids = make_position_ids(query_len, device, attention_mask_2d)
     attention_mask = make_attention_mask(
         batch_size,
         query_len,
-        key_value_len,
+        mask_key_value_len,
         model.dtype,
         device,
-        attention_mask_2d,
+        mask_attention,
     )
 
     hidden_states = model.model.embed_tokens(input_ids)
@@ -176,6 +185,7 @@ def rank0_forward(model, input_ids, device, attention_mask_2d=None, past_key_val
         position_ids,
         attention_mask,
         past_key_values=past_key_values,
+        cache_position_len=full_context_len,
     )
     return hidden_states.contiguous(), past_key_values
 
@@ -183,15 +193,17 @@ def rank0_forward(model, input_ids, device, attention_mask_2d=None, past_key_val
 def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
     """Run a middle pipeline rank with KV cache."""
     batch_size, query_len, _ = hidden_states.shape
-    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    mask_key_value_len = query_len if past_key_values is not None else full_context_len
+    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
     position_ids = make_position_ids(query_len, device, attention_mask_2d)
     attention_mask = make_attention_mask(
         batch_size,
         query_len,
-        key_value_len,
+        mask_key_value_len,
         model.dtype,
         device,
-        attention_mask_2d,
+        mask_attention,
     )
 
     hidden_states, past_key_values = run_decoder_layers(
@@ -200,6 +212,7 @@ def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None, pa
         position_ids,
         attention_mask,
         past_key_values=past_key_values,
+        cache_position_len=full_context_len,
     )
     return hidden_states.contiguous(), past_key_values
 
@@ -207,15 +220,17 @@ def rank_middle_forward(model, hidden_states, device, attention_mask_2d=None, pa
 def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None, past_key_values=None):
     """Run the last pipeline rank and return last-token logits with KV cache."""
     batch_size, query_len, _ = hidden_states.shape
-    key_value_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    full_context_len = attention_mask_2d.shape[1] if attention_mask_2d is not None else query_len
+    mask_key_value_len = query_len if past_key_values is not None else full_context_len
+    mask_attention = attention_mask_2d[:, -mask_key_value_len:] if attention_mask_2d is not None else None
     position_ids = make_position_ids(query_len, device, attention_mask_2d)
     attention_mask = make_attention_mask(
         batch_size,
         query_len,
-        key_value_len,
+        mask_key_value_len,
         model.dtype,
         device,
-        attention_mask_2d,
+        mask_attention,
     )
 
     hidden_states, past_key_values = run_decoder_layers(
@@ -224,6 +239,7 @@ def rank1_forward_logits(model, hidden_states, device, attention_mask_2d=None, p
         position_ids,
         attention_mask,
         past_key_values=past_key_values,
+        cache_position_len=full_context_len,
     )
     hidden_states = model.model.norm(hidden_states)
     logits = model.lm_head(hidden_states)
