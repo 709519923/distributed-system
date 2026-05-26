@@ -55,7 +55,7 @@ def make_attention_mask(batch_size, query_len, key_value_len, dtype, device, att
         padding_mask = padding_mask.view(batch_size, 1, 1, key_value_len)
         mask = mask.masked_fill(padding_mask == 0, min_value)
 
-    return mask
+    return mask.contiguous()
 
 
 def make_position_ids(query_len, device, attention_mask_2d=None):
@@ -63,9 +63,10 @@ def make_position_ids(query_len, device, attention_mask_2d=None):
     if attention_mask_2d is None:
         return torch.arange(query_len, device=device, dtype=torch.long).unsqueeze(0)
 
-    position_ids = attention_mask_2d.to(device=device, dtype=torch.long).cumsum(dim=-1) - 1
-    position_ids = position_ids.masked_fill(attention_mask_2d.to(device=device) == 0, 0)
-    return position_ids[:, -query_len:]
+    attention_mask_2d = attention_mask_2d.to(device=device, dtype=torch.long).contiguous()
+    position_ids = attention_mask_2d.cumsum(dim=-1) - 1
+    position_ids = position_ids.masked_fill(attention_mask_2d == 0, 0)
+    return position_ids[:, -query_len:].contiguous()
 
 
 def cache_position_for(query_len, key_value_len, device):
@@ -196,13 +197,15 @@ def model_model_forward(
     signature = inspect.signature(model.model.forward)
     kwargs = {}
     if input_ids is not None and "input_ids" in signature.parameters:
-        kwargs["input_ids"] = input_ids
+        kwargs["input_ids"] = input_ids.contiguous()
     if inputs_embeds is not None and "inputs_embeds" in signature.parameters:
-        kwargs["inputs_embeds"] = inputs_embeds
+        kwargs["inputs_embeds"] = inputs_embeds.contiguous()
     if "attention_mask" in signature.parameters:
-        kwargs["attention_mask"] = attention_mask_2d
+        kwargs["attention_mask"] = (
+            None if attention_mask_2d is None else attention_mask_2d.contiguous()
+        )
     if "position_ids" in signature.parameters:
-        kwargs["position_ids"] = position_ids
+        kwargs["position_ids"] = position_ids.contiguous()
     if "past_key_values" in signature.parameters:
         kwargs["past_key_values"] = past_key_values
     if "use_cache" in signature.parameters:

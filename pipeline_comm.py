@@ -41,6 +41,13 @@ def send_hidden(hidden_states, dst, attention_mask_2d=None):
     exactly what buffers to allocate. KV-cache decode sends hidden_seq=1 while
     mask_seq is the full context length.
     """
+    # NCCL point-to-point payloads and later SDPA kernels both behave best when
+    # tensors use a compact layout. Batch>1 can expose non-contiguous masks that
+    # batch=1 accidentally hides, so normalize layout before crossing ranks.
+    hidden_states = hidden_states.contiguous()
+    if attention_mask_2d is not None:
+        attention_mask_2d = attention_mask_2d.contiguous()
+
     batch_size, seq_len, hidden_size = hidden_states.shape
     mask_seq_len = 0 if attention_mask_2d is None else int(attention_mask_2d.shape[1])
     meta = torch.tensor(
@@ -51,7 +58,10 @@ def send_hidden(hidden_states, dst, attention_mask_2d=None):
     dist.send(meta, dst=dst)
     dist.send(hidden_states, dst=dst)
     if attention_mask_2d is not None:
-        dist.send(attention_mask_2d.to(device=hidden_states.device, dtype=torch.long), dst=dst)
+        dist.send(
+            attention_mask_2d.to(device=hidden_states.device, dtype=torch.long).contiguous(),
+            dst=dst,
+        )
 
 
 def send_hidden_to_rank1(hidden_states):
@@ -82,10 +92,12 @@ def recv_hidden(src, device, dtype):
         (batch_size, seq_len, hidden_size), dtype=dtype, device=device
     )
     dist.recv(hidden_states, src=src)
+    hidden_states = hidden_states.contiguous()
     attention_mask_2d = None
     if mask_seq_len:
         attention_mask_2d = torch.empty((batch_size, mask_seq_len), dtype=torch.long, device=device)
         dist.recv(attention_mask_2d, src=src)
+        attention_mask_2d = attention_mask_2d.contiguous()
     return hidden_states, attention_mask_2d
 
 
