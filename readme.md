@@ -1,5 +1,83 @@
 ﻿# Distributed NCCL Inference 测试说明
 
+## 当前三节点运行方式
+
+当前默认 master rendezvous 地址在 `config.py` 中配置为：
+
+```text
+tcp://10.50.1.228:29500
+```
+
+因此启动命令里通常不需要再传 `--init-method`。如果临时要覆盖，可以设置环境变量：
+
+```bash
+export DIST_INIT_METHOD=tcp://10.50.1.228:29500
+```
+
+### Rank 0，本机 3060
+
+```bash
+export WORLD_SIZE=3
+export RANK=0
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 4 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --input-csv prompts.csv \
+  --output-csv outputs.csv \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### Rank 1，10.50.0.85 / 4090
+
+```bash
+export WORLD_SIZE=3
+export RANK=1
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 4 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### Rank 2，10.50.0.57 / A800
+
+```bash
+export WORLD_SIZE=3
+export RANK=2
+python distributed_tinyllama_inference.py \
+  --lazy-load \
+  --dynamic-load \
+  --batch-size 4 \
+  --split-layers 5,15 \
+  --allocation-csv allocation.csv \
+  --model-dir /home/dingcong/models/TinyLlama \
+  --csv-has-header \
+  --prompt-column prompt
+```
+
+### 启动顺序建议
+
+当前不使用自动 SSH/tmux 启动脚本，直接在三台机器上分别进入项目目录并执行上面的 Rank 0、Rank 1、Rank 2 命令即可。
+
+建议先启动 Rank 0，再启动 Rank 1 和 Rank 2。如果使用 tmux，可以手动在每台机器上创建 session，方便之后回看运行状态。
+
+KV cache / prefill 实验日志会写入：
+
+```text
+logs/log_YYYY-MM-DD-HH-MM.txt
+```
+
+详细版本改动记录从现在开始写入 `log.md`。`readme.md` 只保留运行命令、使用说明和少量当前状态说明。下面较早的章节保留为历史调试记录，里面出现的旧 master 地址仅代表当时环境。
+
 这个目录用于记录两个 PyTorch 分布式推理测试脚本的使用方法：
 
 - `test_dist1.py`：使用 `gloo` 后端，在 CPU 上测试两个进程之间的分布式通信和简单流水线推理。

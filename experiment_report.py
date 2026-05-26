@@ -40,10 +40,12 @@ METRIC_FIELDS = [
 ]
 
 
-def make_log_path(directory="."):
-    """Return log_YYYY-MM-DD-HH-MM.txt in the current run directory."""
+def make_log_path(directory="logs"):
+    """Return logs/log_YYYY-MM-DD-HH-MM.txt and create the log directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    return Path(directory) / f"log_{timestamp}.txt"
+    log_dir = Path(directory)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"log_{timestamp}.txt"
 
 
 def metric_to_tensor(record, device):

@@ -10,20 +10,21 @@ It downloads Aeala/ShareGPT_Vicuna_unfiltered and writes:
     input100.csv
     input1000.csv
 
-Each file contains 512 rows and one column named "prompt". Token length is
-measured with TinyLlama's tokenizer.
+Each file contains 512 rows and one column named "prompt". For this data
+preparation script, token length is measured by simple whitespace tokenization
+so the script does not need to download or load any model tokenizer.
 """
 
 import csv
+import os
 
 from datasets import load_dataset
-from transformers import AutoTokenizer
 
 
 DATASET_NAME = "Aeala/ShareGPT_Vicuna_unfiltered"
-TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TARGET_LENGTHS = (10, 100, 1000)
 ROWS_PER_FILE = 512
+HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 
 
 def first_user_prompt(row):
@@ -39,18 +40,23 @@ def first_user_prompt(row):
     return None
 
 
-def token_length(tokenizer, text):
-    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+def text_tokens(text):
+    """Return simple text tokens without depending on a model tokenizer."""
+    return text.replace("\n", " ").split()
 
 
-def trim_to_token_length(tokenizer, text, target_length):
-    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    if len(token_ids) < target_length:
+def token_length(text):
+    return len(text_tokens(text))
+
+
+def trim_to_token_length(text, target_length):
+    tokens = text_tokens(text)
+    if len(tokens) < target_length:
         return None
-    return tokenizer.decode(token_ids[:target_length], skip_special_tokens=True).strip()
+    return " ".join(tokens[:target_length]).strip()
 
 
-def collect_prompts(dataset, tokenizer):
+def collect_prompts(dataset):
     results = {target_length: [] for target_length in TARGET_LENGTHS}
 
     for row in dataset:
@@ -65,13 +71,11 @@ def collect_prompts(dataset, tokenizer):
             if len(results[target_length]) >= ROWS_PER_FILE:
                 continue
 
-            trimmed = trim_to_token_length(tokenizer, prompt, target_length)
+            trimmed = trim_to_token_length(prompt, target_length)
             if not trimmed:
                 continue
 
-            # Do not over-engineer exact normalization. Keep prompts close to
-            # the requested token length, which is sufficient for benchmark data.
-            if token_length(tokenizer, trimmed) <= target_length:
+            if token_length(trimmed) == target_length:
                 results[target_length].append(trimmed)
 
     for target_length, prompts in results.items():
@@ -92,9 +96,11 @@ def write_csv(filename, prompts):
 
 
 def main():
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    dataset = load_dataset(DATASET_NAME, split="train")
-    results = collect_prompts(dataset, tokenizer)
+    os.environ.setdefault("HF_ENDPOINT", HF_MIRROR_ENDPOINT)
+    hf_token = os.environ.get("HF_TOKEN")
+
+    dataset = load_dataset(DATASET_NAME, split="train", token=hf_token)
+    results = collect_prompts(dataset)
 
     for target_length, prompts in results.items():
         filename = f"input{target_length}.csv"
