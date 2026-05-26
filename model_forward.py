@@ -74,6 +74,58 @@ def cache_position_for(query_len, key_value_len, device):
     return torch.arange(key_value_len - query_len, key_value_len, dtype=torch.long, device=device)
 
 
+def infer_compute_dtype(model, inputs_embeds):
+    """Find the floating dtype used to build attention bias tensors."""
+    if inputs_embeds is not None:
+        return inputs_embeds.dtype
+    model_dtype = getattr(model, "dtype", None)
+    if isinstance(model_dtype, torch.dtype):
+        return model_dtype
+    for parameter in model.parameters():
+        return parameter.dtype
+    return torch.float16
+
+
+def validate_forward_shapes(input_ids, inputs_embeds, attention_mask_2d, position_ids):
+    """Return (batch, query_len, device) and fail early on shape mismatches.
+
+    Pipeline ranks use two sequence lengths:
+    - Q: query length, i.e. hidden_states/input_ids length for this forward.
+    - K: key/value length, i.e. full visible context length in attention_mask.
+    Prefill has Q == K. Decode has Q == 1 and K grows token by token.
+    """
+    if input_ids is not None:
+        batch_size, query_len = input_ids.shape
+        device = input_ids.device
+    elif inputs_embeds is not None:
+        batch_size, query_len, _ = inputs_embeds.shape
+        device = inputs_embeds.device
+    else:
+        raise RuntimeError("model_model_forward requires input_ids or inputs_embeds.")
+
+    if attention_mask_2d is not None:
+        if attention_mask_2d.dim() != 2:
+            raise RuntimeError(f"attention_mask must be 2D [B,K], got {attention_mask_2d.shape}.")
+        if attention_mask_2d.shape[0] != batch_size:
+            raise RuntimeError(
+                "Batch mismatch: "
+                f"input batch={batch_size}, attention_mask batch={attention_mask_2d.shape[0]}."
+            )
+        if attention_mask_2d.shape[1] < query_len:
+            raise RuntimeError(
+                "Sequence mismatch: "
+                f"attention_mask K={attention_mask_2d.shape[1]} is smaller than query Q={query_len}."
+            )
+
+    if position_ids is not None and tuple(position_ids.shape) != (batch_size, query_len):
+        raise RuntimeError(
+            "position_ids must be [B,Q], "
+            f"got {tuple(position_ids.shape)} for B={batch_size}, Q={query_len}."
+        )
+
+    return int(batch_size), int(query_len), device
+
+
 def get_layer_past(past_key_values, index):
     """Return the cache entry for one local layer."""
     if past_key_values is None:
@@ -195,15 +247,28 @@ def model_model_forward(
 ):
     """Call model.model.forward with only arguments supported by this version."""
     signature = inspect.signature(model.model.forward)
+    batch_size, query_len, device = validate_forward_shapes(
+        input_ids, inputs_embeds, attention_mask_2d, position_ids
+    )
+    attention_mask = None
+    if attention_mask_2d is not None:
+        key_value_len = int(attention_mask_2d.shape[1])
+        attention_mask = make_attention_mask(
+            batch_size=batch_size,
+            query_len=query_len,
+            key_value_len=key_value_len,
+            dtype=infer_compute_dtype(model, inputs_embeds),
+            device=device,
+            attention_mask_2d=attention_mask_2d,
+        )
+
     kwargs = {}
     if input_ids is not None and "input_ids" in signature.parameters:
         kwargs["input_ids"] = input_ids.contiguous()
     if inputs_embeds is not None and "inputs_embeds" in signature.parameters:
         kwargs["inputs_embeds"] = inputs_embeds.contiguous()
     if "attention_mask" in signature.parameters:
-        kwargs["attention_mask"] = (
-            None if attention_mask_2d is None else attention_mask_2d.contiguous()
-        )
+        kwargs["attention_mask"] = attention_mask
     if "position_ids" in signature.parameters:
         kwargs["position_ids"] = position_ids.contiguous()
     if "past_key_values" in signature.parameters:

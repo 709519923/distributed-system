@@ -34,8 +34,10 @@ def load_model_part_full(model_dir, rank, world_size, layer_start, layer_end, dt
     details to Transformers. The drawback is that both ranks read the complete
     model weights before unused layers are removed.
     """
+    config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
+        config=config,
         torch_dtype=dtype,
         local_files_only=True,
         low_cpu_mem_usage=True,
