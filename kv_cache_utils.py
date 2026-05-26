@@ -40,6 +40,12 @@ def estimate_past_key_values_bytes(past_key_values):
         return estimate_past_key_values_bytes(past_key_values.key_cache) + estimate_past_key_values_bytes(
             past_key_values.value_cache
         )
+    if hasattr(past_key_values, "layers"):
+        return estimate_past_key_values_bytes(past_key_values.layers)
+    if hasattr(past_key_values, "keys") and hasattr(past_key_values, "values"):
+        return estimate_past_key_values_bytes(past_key_values.keys) + estimate_past_key_values_bytes(
+            past_key_values.values
+        )
     if isinstance(past_key_values, dict):
         return sum(estimate_past_key_values_bytes(value) for value in past_key_values.values())
     if isinstance(past_key_values, (list, tuple)):
