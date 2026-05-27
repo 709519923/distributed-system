@@ -3,6 +3,7 @@
 ## 2026-05-27
 
 - Changed `decode_time_per_token_ms` from end-to-end token latency to per-rank decode-stage processing time. Rank 0 measures from having the returned token available to sending the next hidden state; middle ranks measure from received hidden state to sent hidden state; the last rank measures from received hidden state to generated logits/token.
+- Experiment logs are now flushed and fsynced after every completed batch, and Rank 0 prints the log path after each batch write.
 
 ## 2026-05-26
 

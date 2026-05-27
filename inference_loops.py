@@ -293,6 +293,7 @@ def rank0_generate(args, model, tokenizer, device, world_size, layer_start, laye
         send_batch_done(device)
         records.extend(recv_metric_records(world_size, device, str(model.dtype)))
         append_experiment_log(log_path, records)
+        print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
 
     write_output_rows(args.output_csv, all_rows)
     send_stop(device)
@@ -406,6 +407,7 @@ def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
             send_batch_done(device)
             records.extend(recv_metric_records(world_size, device, str(model.dtype)))
             append_experiment_log(log_path, records)
+            print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
         write_output_rows(args.output_csv, all_rows)

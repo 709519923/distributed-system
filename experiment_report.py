@@ -7,6 +7,7 @@ spreadsheet.
 """
 
 from datetime import datetime
+import os
 from pathlib import Path
 
 import torch
@@ -175,3 +176,5 @@ def append_experiment_log(log_path, records):
                 "decode_time_per_token_ms="
                 f"{float(record['decode_time_per_token_ms']):.2f}\n\n"
             )
+        f.flush()
+        os.fsync(f.fileno())
