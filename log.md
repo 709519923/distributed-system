@@ -1,5 +1,9 @@
 # Version Log
 
+## 2026-05-27
+
+- Changed `decode_time_per_token_ms` from end-to-end token latency to per-rank decode-stage processing time. Rank 0 measures from having the returned token available to sending the next hidden state; middle ranks measure from received hidden state to sent hidden state; the last rank measures from received hidden state to generated logits/token.
+
 ## 2026-05-26
 
 - 默认分布式初始化地址改为 `tcp://10.50.1.228:29500`。

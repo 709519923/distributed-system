@@ -88,6 +88,7 @@ def build_prefill_metric(
         "cuda_memory_allocated_after_prefill": memory_after,
         "cuda_memory_reserved_after_prefill": memory_reserved_after,
         "prefill_time_ms": prefill_time_ms,
+        "decode_time_per_token_ms": 0.0,
     }
 
 
@@ -109,7 +110,9 @@ def generate_rows_for_prompts(
 
     Rank 0 owns tokenization and output text. It does one full-sequence prefill,
     receives the first generated token from the last rank, writes prefill
-    metrics, and then decodes one token per step using the cached state.
+    metrics, and then decodes one token per step using the cached state. The
+    returned metric record is written after workers receive batch_done and send
+    their own decode-stage timing records back to Rank 0.
     """
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.pad_token_id
@@ -188,10 +191,11 @@ def generate_rows_for_prompts(
             prefill_time_ms=prefill_time_ms,
         )
         records = [normalize_record(rank0_metric, str(model.dtype))]
-        records.extend(recv_metric_records(world_size, device, str(model.dtype)))
-        append_experiment_log(log_path, records)
-
+        rank0_decode_time_ms = 0.0
+        rank0_decode_step_count = 0
         for token_index in range(args.max_new_tokens):
+            synchronize_cuda()
+            rank0_decode_start_time = time.perf_counter()
             active = ~finished
             tokens_to_append = torch.where(
                 active.unsqueeze(1),
@@ -220,7 +224,15 @@ def generate_rows_for_prompts(
                 past_key_values=rank0_past_key_values,
             )
             send_hidden(hidden_states, dst=1, attention_mask_2d=attention_mask_2d)
+            synchronize_cuda()
+            rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
+            rank0_decode_step_count += 1
             next_token = recv_token(src=1, device=device, batch_size=batch_size)
+
+        rank0_decode_time_per_token_ms = (
+            rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
+        )
+        records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
 
     rows = []
     for local_index, prompt in enumerate(prompts, start=1):
@@ -237,7 +249,7 @@ def generate_rows_for_prompts(
         )
         print(f"[Rank 0] Output {global_index}: {generated_text}")
 
-    return rows
+    return rows, records
 
 
 def release_model(model):
@@ -263,7 +275,7 @@ def rank0_generate(args, model, tokenizer, device, world_size, layer_start, laye
     all_rows = []
     for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
         print(f"[Rank 0] Static batch {batch_number}; prompts={len(prompt_batch)}")
-        rows = generate_rows_for_prompts(
+        rows, records = generate_rows_for_prompts(
             args,
             model,
             tokenizer,
@@ -279,6 +291,8 @@ def rank0_generate(args, model, tokenizer, device, world_size, layer_start, laye
         )
         all_rows.extend(rows)
         send_batch_done(device)
+        records.extend(recv_metric_records(world_size, device, str(model.dtype)))
+        append_experiment_log(log_path, records)
 
     write_output_rows(args.output_csv, all_rows)
     send_stop(device)
@@ -373,7 +387,7 @@ def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
                     f"for stage=[{layer_start},{layer_end})."
                 )
 
-            rows = generate_rows_for_prompts(
+            rows, records = generate_rows_for_prompts(
                 args,
                 model,
                 tokenizer,
@@ -390,6 +404,8 @@ def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
             all_rows.extend(rows)
 
             send_batch_done(device)
+            records.extend(recv_metric_records(world_size, device, str(model.dtype)))
+            append_experiment_log(log_path, records)
             print(f"[Rank 0] Batch {batch_number} complete.")
 
         write_output_rows(args.output_csv, all_rows)
@@ -413,7 +429,9 @@ def handle_worker_batch(
     next_rank = rank + 1
     is_last_rank = rank == world_size - 1
     past_key_values = None
-    prefill_metric_sent = False
+    metric = None
+    decode_time_ms = 0.0
+    decode_step_count = 0
 
     with torch.inference_mode():
         while True:
@@ -423,8 +441,23 @@ def handle_worker_batch(
                     send_stop(device, dst=next_rank)
                 return False
             if isinstance(message, int) and message == STATUS_BATCH_DONE:
+                downstream_metric_tensors = []
                 if not is_last_rank:
                     send_batch_done(device, dst=next_rank)
+                    downstream_metric_tensors = [
+                        recv_metric_tensor(src=next_rank, device=device)
+                        for _ in range(world_size - rank - 1)
+                    ]
+                if metric is not None:
+                    metric["decode_time_per_token_ms"] = (
+                        decode_time_ms / decode_step_count if decode_step_count else 0.0
+                    )
+                    if is_last_rank:
+                        send_metric_record(metric, device, dst=prev_rank)
+                    else:
+                        send_metric_tensor(metric_to_tensor(metric, device), dst=prev_rank)
+                        for downstream_metric_tensor in downstream_metric_tensors:
+                            send_metric_tensor(downstream_metric_tensor, dst=prev_rank)
                 return True
 
             hidden_states, attention_mask_2d = message
@@ -437,6 +470,9 @@ def handle_worker_batch(
                 synchronize_cuda()
                 memory_before = cuda_memory_allocated(device)
                 start_time = time.perf_counter()
+            else:
+                synchronize_cuda()
+                decode_start_time = time.perf_counter()
 
             if is_last_rank:
                 logits, past_key_values = rank1_forward_logits(
@@ -447,12 +483,16 @@ def handle_worker_batch(
                     past_key_values=past_key_values,
                 )
                 output_hidden_states = hidden_states
-                if is_prefill and not prefill_metric_sent:
+                if is_prefill and metric is None:
                     synchronize_cuda()
                     prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
                     memory_after = cuda_memory_allocated(device)
                     memory_reserved_after = cuda_memory_reserved(device)
                 next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
+                if not is_prefill:
+                    synchronize_cuda()
+                    decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
+                    decode_step_count += 1
             else:
                 output_hidden_states, past_key_values = rank_middle_forward(
                     model,
@@ -461,24 +501,23 @@ def handle_worker_batch(
                     attention_mask_2d,
                     past_key_values=past_key_values,
                 )
-                if is_prefill and not prefill_metric_sent:
+                if is_prefill and metric is None:
                     synchronize_cuda()
                     prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
                     memory_after = cuda_memory_allocated(device)
                     memory_reserved_after = cuda_memory_reserved(device)
                 send_hidden(output_hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
+                if not is_prefill:
+                    synchronize_cuda()
+                    decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
+                    decode_step_count += 1
                 next_token = recv_token(
                     src=next_rank,
                     device=device,
                     batch_size=output_hidden_states.shape[0],
                 )
-                if is_prefill and not prefill_metric_sent:
-                    downstream_metric_tensors = [
-                        recv_metric_tensor(src=next_rank, device=device)
-                        for _ in range(world_size - rank - 1)
-                    ]
 
-            if is_prefill and not prefill_metric_sent:
+            if is_prefill and metric is None:
                 metric = build_prefill_metric(
                     batch_number=batch_number,
                     rank=rank,
@@ -499,14 +538,6 @@ def handle_worker_batch(
                 )
 
             send_token(next_token, dst=prev_rank)
-            if is_prefill and not prefill_metric_sent:
-                if is_last_rank:
-                    send_metric_record(metric, device, dst=prev_rank)
-                else:
-                    send_metric_tensor(metric_to_tensor(metric, device), dst=prev_rank)
-                    for downstream_metric_tensor in downstream_metric_tensors:
-                        send_metric_tensor(downstream_metric_tensor, dst=prev_rank)
-                prefill_metric_sent = True
 
 
 def pipeline_serve_static(args, model, rank, world_size, device, layer_start, layer_end):

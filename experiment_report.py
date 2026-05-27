@@ -37,6 +37,7 @@ METRIC_FIELDS = [
     "cuda_memory_allocated_after_prefill",
     "cuda_memory_reserved_after_prefill",
     "prefill_time_ms",
+    "decode_time_per_token_ms",
 ]
 
 
@@ -169,4 +170,8 @@ def append_experiment_log(log_path, records):
                 "cuda_memory_reserved_after_prefill_mb="
                 f"{_format_mb(record, 'cuda_memory_reserved_after_prefill')}\n"
             )
-            f.write(f"prefill_time_ms={float(record['prefill_time_ms']):.2f}\n\n")
+            f.write(f"prefill_time_ms={float(record['prefill_time_ms']):.2f}\n")
+            f.write(
+                "decode_time_per_token_ms="
+                f"{float(record['decode_time_per_token_ms']):.2f}\n\n"
+            )
