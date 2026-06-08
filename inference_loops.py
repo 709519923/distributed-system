@@ -14,6 +14,8 @@ from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_f
 from csv_io import chunk_items, read_prompts, write_output_rows
 from experiment_report import (
     append_experiment_log,
+    append_summary_log,
+    create_summary,
     make_log_path,
     normalize_record,
     metric_to_tensor,
@@ -21,6 +23,7 @@ from experiment_report import (
     recv_metric_tensor,
     send_metric_record,
     send_metric_tensor,
+    update_summary,
 )
 from kv_cache_utils import (
     count_model_parameters,
@@ -101,7 +104,11 @@ def build_prefill_metric(
         "cuda_memory_allocated_after_prefill": memory_after,
         "cuda_memory_reserved_after_prefill": memory_reserved_after,
         "prefill_time_ms": prefill_time_ms,
+        "prefill_time_total_ms": prefill_time_ms,
+        "decode_step_count": 0,
+        "decode_time_total_ms": 0.0,
         "decode_time_per_token_ms": 0.0,
+        "inference_compute_total_ms": prefill_time_ms,
     }
 
 
@@ -261,7 +268,12 @@ def generate_rows_for_prompts(
         rank0_decode_time_per_token_ms = (
             rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
         )
+        records[0]["decode_step_count"] = rank0_decode_step_count
+        records[0]["decode_time_total_ms"] = rank0_decode_time_ms
         records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
+        records[0]["inference_compute_total_ms"] = (
+            records[0]["prefill_time_total_ms"] + rank0_decode_time_ms
+        )
 
     rows = []
     for local_index, prompt in enumerate(prompts, start=1):
@@ -314,6 +326,7 @@ def rank0_generate(
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
+    summary_by_rank = create_summary(world_size)
     for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
         print(f"[Rank 0] Static batch {batch_number}; prompts={len(prompt_batch)}")
         rows, records = generate_rows_for_prompts(
@@ -336,6 +349,8 @@ def rank0_generate(
         send_batch_done(comm_device)
         records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
         append_experiment_log(log_path, records)
+        update_summary(summary_by_rank, records)
+        append_summary_log(log_path, summary_by_rank, batch_number)
         print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
 
     write_output_rows(args.output_csv, all_rows)
@@ -390,6 +405,7 @@ def rank0_generate_dynamic(
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
+    summary_by_rank = create_summary(world_size)
     model = None
     current_stage = None
 
@@ -462,6 +478,8 @@ def rank0_generate_dynamic(
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
             append_experiment_log(log_path, records)
+            update_summary(summary_by_rank, records)
+            append_summary_log(log_path, summary_by_rank, batch_number)
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
@@ -506,8 +524,13 @@ def handle_worker_batch(
                         for _ in range(world_size - rank - 1)
                     ]
                 if metric is not None:
+                    metric["decode_step_count"] = decode_step_count
+                    metric["decode_time_total_ms"] = decode_time_ms
                     metric["decode_time_per_token_ms"] = (
                         decode_time_ms / decode_step_count if decode_step_count else 0.0
+                    )
+                    metric["inference_compute_total_ms"] = (
+                        metric["prefill_time_total_ms"] + decode_time_ms
                     )
                     if is_last_rank:
                         send_metric_record(metric, device, dst=prev_rank)

@@ -5,6 +5,8 @@
 - Added optional Rank 0 CPU compute mode through `--compute-device cpu`. Rank 0 can run model forward/KV cache on CPU while moving hidden states and tokens across the existing CUDA/NCCL communication path.
 - Updated `run.sh`: `COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}` controls Rank 0 compute mode. Use `COMPUTE_DEVICE=cpu bash run.sh 0` when Rank 0 should compute on CPU; Rank 1 and Rank 2 keep the normal GPU commands.
 - Kept the default behavior unchanged: without `--compute-device cpu`, Rank 0 continues to use GPU compute.
+- Extended experiment logs with per-rank decode totals: `decode_step_count`, `decode_time_total_ms`, `prefill_time_total_ms`, and `inference_compute_total_ms`.
+- Added a cumulative `summary after batch N` block after every completed batch, so partial runs still preserve per-rank total prefill time, total decode time, total compute time, and total decode step count.
 
 ## 2026-05-27
 

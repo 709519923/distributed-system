@@ -38,7 +38,11 @@ METRIC_FIELDS = [
     "cuda_memory_allocated_after_prefill",
     "cuda_memory_reserved_after_prefill",
     "prefill_time_ms",
+    "prefill_time_total_ms",
+    "decode_step_count",
+    "decode_time_total_ms",
     "decode_time_per_token_ms",
+    "inference_compute_total_ms",
 ]
 
 
@@ -85,6 +89,7 @@ def tensor_to_metric(tensor, dtype_name):
         "hidden_prefill_batch",
         "hidden_prefill_seq_len",
         "hidden_prefill_hidden_size",
+        "decode_step_count",
     }
     for field in integer_fields:
         record[field] = int(record[field])
@@ -172,9 +177,85 @@ def append_experiment_log(log_path, records):
                 f"{_format_mb(record, 'cuda_memory_reserved_after_prefill')}\n"
             )
             f.write(f"prefill_time_ms={float(record['prefill_time_ms']):.2f}\n")
+            f.write(f"prefill_time_total_ms={float(record['prefill_time_total_ms']):.2f}\n")
+            f.write(f"decode_step_count={int(record['decode_step_count'])}\n")
+            f.write(f"decode_time_total_ms={float(record['decode_time_total_ms']):.2f}\n")
             f.write(
                 "decode_time_per_token_ms="
-                f"{float(record['decode_time_per_token_ms']):.2f}\n\n"
+                f"{float(record['decode_time_per_token_ms']):.2f}\n"
             )
+            f.write(
+                "inference_compute_total_ms="
+                f"{float(record['inference_compute_total_ms']):.2f}\n\n"
+            )
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def create_summary(world_size):
+    """Create Rank 0's per-rank cumulative timing summary."""
+    return {
+        rank: {
+            "record_count": 0,
+            "total_prefill_time_ms": 0.0,
+            "total_decode_time_ms": 0.0,
+            "total_inference_compute_time_ms": 0.0,
+            "total_decode_step_count": 0,
+        }
+        for rank in range(world_size)
+    }
+
+
+def update_summary(summary_by_rank, records):
+    """Accumulate one completed batch of metric records into summary_by_rank."""
+    for record in records:
+        rank = int(record["rank"])
+        summary = summary_by_rank.setdefault(
+            rank,
+            {
+                "record_count": 0,
+                "total_prefill_time_ms": 0.0,
+                "total_decode_time_ms": 0.0,
+                "total_inference_compute_time_ms": 0.0,
+                "total_decode_step_count": 0,
+            },
+        )
+        summary["record_count"] += 1
+        summary["total_prefill_time_ms"] += float(record["prefill_time_total_ms"])
+        summary["total_decode_time_ms"] += float(record["decode_time_total_ms"])
+        summary["total_inference_compute_time_ms"] += float(record["inference_compute_total_ms"])
+        summary["total_decode_step_count"] += int(record["decode_step_count"])
+
+
+def append_summary_log(log_path, summary_by_rank, batch_number):
+    """Append cumulative per-rank timing totals after a completed batch."""
+    log_path = Path(log_path)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"--- summary after batch {int(batch_number)} ---\n")
+        f.write(f"timestamp={timestamp}\n")
+        for rank in sorted(summary_by_rank):
+            summary = summary_by_rank[rank]
+            total_steps = int(summary["total_decode_step_count"])
+            avg_decode_ms = (
+                summary["total_decode_time_ms"] / total_steps if total_steps else 0.0
+            )
+            f.write(f"rank={int(rank)}\n")
+            f.write(f"summary_record_count={int(summary['record_count'])}\n")
+            f.write(
+                "total_prefill_time_ms="
+                f"{float(summary['total_prefill_time_ms']):.2f}\n"
+            )
+            f.write(
+                "total_decode_time_ms="
+                f"{float(summary['total_decode_time_ms']):.2f}\n"
+            )
+            f.write(
+                "total_inference_compute_time_ms="
+                f"{float(summary['total_inference_compute_time_ms']):.2f}\n"
+            )
+            f.write(f"total_decode_step_count={total_steps}\n")
+            f.write(f"decode_time_per_token_avg_ms={avg_decode_ms:.2f}\n")
+        f.write("\n")
         f.flush()
         os.fsync(f.fileno())
