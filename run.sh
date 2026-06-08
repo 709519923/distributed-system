@@ -3,6 +3,7 @@
 BATCH_SIZE=1
 SPLIT_LAYERS=5,15
 INIT_METHOD=tcp://10.50.1.228:29510
+COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 RANK_ARG=$1
 
 if [ "$RANK_ARG" = "0" ]; then
@@ -16,6 +17,7 @@ if [ "$RANK_ARG" = "0" ]; then
       --dynamic-load \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
+      --compute-device $COMPUTE_DEVICE \
       --init-method $INIT_METHOD \
       --model-dir /home/dingcong/models/TinyLlama \
       --input-csv ./dataset/input10.csv \

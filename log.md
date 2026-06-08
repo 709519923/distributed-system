@@ -1,5 +1,11 @@
 # Version Log
 
+## 2026-06-08
+
+- Added optional Rank 0 CPU compute mode through `--compute-device cpu`. Rank 0 can run model forward/KV cache on CPU while moving hidden states and tokens across the existing CUDA/NCCL communication path.
+- Updated `run.sh`: `COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}` controls Rank 0 compute mode. Use `COMPUTE_DEVICE=cpu bash run.sh 0` when Rank 0 should compute on CPU; Rank 1 and Rank 2 keep the normal GPU commands.
+- Kept the default behavior unchanged: without `--compute-device cpu`, Rank 0 continues to use GPU compute.
+
 ## 2026-05-27
 
 - Changed `decode_time_per_token_ms` from end-to-end token latency to per-rank decode-stage processing time. Rank 0 measures from having the returned token available to sending the next hidden state; middle ranks measure from received hidden state to sent hidden state; the last rank measures from received hidden state to generated logits/token.

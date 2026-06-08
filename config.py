@@ -141,6 +141,15 @@ def parse_args():
         default="0",
         help="CUDA device index used by this process. Default: 0",
     )
+    parser.add_argument(
+        "--compute-device",
+        choices=("cuda", "cpu"),
+        default="cuda",
+        help=(
+            "Rank 0 compute device. Default: cuda. Use cpu to run Rank 0 model "
+            "compute on CPU while keeping CUDA/NCCL tensors for communication."
+        ),
+    )
     return parser.parse_args()
 
 

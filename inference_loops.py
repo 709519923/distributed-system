@@ -46,6 +46,19 @@ from pipeline_comm import (
 from scheduler import Scheduler
 
 
+def send_hidden_from_rank0(hidden_states, dst, attention_mask_2d, comm_device, comm_dtype=None):
+    """Move Rank 0 outputs to CUDA before NCCL send.
+
+    Rank 0 can optionally compute on CPU. NCCL still requires CUDA tensors, so
+    only the boundary tensor and mask are copied to comm_device for transport.
+    """
+    send_hidden(
+        hidden_states.to(device=comm_device, dtype=comm_dtype, non_blocking=True),
+        dst=dst,
+        attention_mask_2d=attention_mask_2d.to(device=comm_device, non_blocking=True),
+    )
+
+
 def build_prefill_metric(
     batch_number,
     rank,
@@ -103,6 +116,8 @@ def generate_rows_for_prompts(
     layer_end,
     batch_number,
     log_path,
+    comm_device=None,
+    comm_dtype=None,
     start_index=0,
     total_count=None,
 ):
@@ -114,6 +129,8 @@ def generate_rows_for_prompts(
     returned metric record is written after workers receive batch_done and send
     their own decode-stage timing records back to Rank 0.
     """
+    comm_device = comm_device or device
+    comm_dtype = comm_dtype or model.dtype
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
@@ -169,8 +186,14 @@ def generate_rows_for_prompts(
         memory_after = cuda_memory_allocated(device)
         memory_reserved_after = cuda_memory_reserved(device)
 
-        send_hidden(hidden_states, dst=1, attention_mask_2d=attention_mask_2d)
-        next_token = recv_token(src=1, device=device, batch_size=batch_size)
+        send_hidden_from_rank0(
+            hidden_states,
+            dst=1,
+            attention_mask_2d=attention_mask_2d,
+            comm_device=comm_device,
+            comm_dtype=comm_dtype,
+        )
+        next_token = recv_token(src=1, device=comm_device, batch_size=batch_size).to(device)
 
         rank0_metric = build_prefill_metric(
             batch_number=batch_number,
@@ -223,11 +246,17 @@ def generate_rows_for_prompts(
                 attention_mask_2d,
                 past_key_values=rank0_past_key_values,
             )
-            send_hidden(hidden_states, dst=1, attention_mask_2d=attention_mask_2d)
+            send_hidden_from_rank0(
+                hidden_states,
+                dst=1,
+                attention_mask_2d=attention_mask_2d,
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
+            )
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
             rank0_decode_step_count += 1
-            next_token = recv_token(src=1, device=device, batch_size=batch_size)
+            next_token = recv_token(src=1, device=comm_device, batch_size=batch_size).to(device)
 
         rank0_decode_time_per_token_ms = (
             rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
@@ -262,12 +291,24 @@ def release_model(model):
         torch.cuda.empty_cache()
 
 
-def rank0_generate(args, model, tokenizer, device, world_size, layer_start, layer_end):
+def rank0_generate(
+    args,
+    model,
+    tokenizer,
+    device,
+    world_size,
+    layer_start,
+    layer_end,
+    comm_device=None,
+    comm_dtype=None,
+):
     """Rank 0 static-split driver loop."""
+    comm_device = comm_device or device
+    comm_dtype = comm_dtype or model.dtype
     prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
     if not prompts:
         print(f"[Rank 0] No prompts found in {args.input_csv}")
-        send_stop(device)
+        send_stop(comm_device)
         return
 
     log_path = make_log_path()
@@ -286,17 +327,19 @@ def rank0_generate(args, model, tokenizer, device, world_size, layer_start, laye
             layer_end=layer_end,
             batch_number=batch_number,
             log_path=log_path,
+            comm_device=comm_device,
+            comm_dtype=comm_dtype,
             start_index=start_index,
             total_count=len(prompts),
         )
         all_rows.extend(rows)
-        send_batch_done(device)
-        records.extend(recv_metric_records(world_size, device, str(model.dtype)))
+        send_batch_done(comm_device)
+        records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
         append_experiment_log(log_path, records)
         print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
 
     write_output_rows(args.output_csv, all_rows)
-    send_stop(device)
+    send_stop(comm_device)
 
 
 def boundaries_for_batch(args, scheduler, default_boundaries, batch_number):
@@ -315,17 +358,27 @@ def interval_text_from_boundaries(boundaries, world_size):
     )
 
 
-def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
+def rank0_generate_dynamic(
+    args,
+    tokenizer,
+    dtype,
+    world_size,
+    device,
+    comm_device=None,
+    comm_dtype=None,
+):
     """Rank 0 dynamic-loading driver.
 
     If --allocation-csv is omitted, every batch uses --split-layers as a fixed
     partition. If --allocation-csv is provided, Scheduler controls each batch's
     partition. KV cache is always per-batch and is rebuilt after every batch.
     """
+    comm_device = comm_device or device
+    comm_dtype = comm_dtype or dtype
     prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
     if not prompts:
         print(f"[Rank 0] No prompts found in {args.input_csv}")
-        broadcast_boundaries(stop_boundaries(world_size), world_size, device, rank=0)
+        broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
         return
 
     total_layers = get_total_layers_from_config(args.model_dir)
@@ -357,7 +410,7 @@ def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
                 f"prompts={len(prompt_batch)}"
             )
 
-            broadcast_boundaries(boundaries, world_size, device, rank=0)
+            broadcast_boundaries(boundaries, world_size, comm_device, rank=0)
             if model is None or next_stage != current_stage:
                 if model is not None:
                     release_model(model)
@@ -401,17 +454,19 @@ def rank0_generate_dynamic(args, tokenizer, dtype, world_size, device):
                 log_path=log_path,
                 start_index=start_index,
                 total_count=len(prompts),
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
             )
             all_rows.extend(rows)
 
-            send_batch_done(device)
-            records.extend(recv_metric_records(world_size, device, str(model.dtype)))
+            send_batch_done(comm_device)
+            records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
             append_experiment_log(log_path, records)
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
         write_output_rows(args.output_csv, all_rows)
-        broadcast_boundaries(stop_boundaries(world_size), world_size, device, rank=0)
+        broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
     finally:
         release_model(model)
 

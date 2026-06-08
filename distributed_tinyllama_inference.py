@@ -17,11 +17,18 @@ Keep launching this file exactly as before: python distributed_tinyllama_inferen
 
 import socket
 
+import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from config import default_boundaries_for_world_size, parse_args, stage_from_boundaries
-from distributed_env import get_rank_world_size, init_process_group, resolve_cuda_device, resolve_dtype
+from distributed_env import (
+    get_rank_world_size,
+    init_process_group,
+    resolve_compute_device,
+    resolve_cuda_device,
+    resolve_dtype,
+)
 from inference_loops import (
     pipeline_serve_dynamic,
     pipeline_serve_static,
@@ -43,25 +50,40 @@ def main():
     """Initialize NCCL, load this rank's model stage, then run the selected loop."""
     args = parse_args()
     rank, world_size = get_rank_world_size()
-    device = resolve_cuda_device(args.cuda_device)
+    comm_device = resolve_cuda_device(args.cuda_device)
+    model_device = resolve_compute_device(args.compute_device, rank, comm_device)
 
     print(f"[Rank {rank}] Starting on host {socket.gethostname()}")
     print(f"[Rank {rank}] init_method={args.init_method}")
-    print(f"[Rank {rank}] cuda_device={device}")
+    print(f"[Rank {rank}] cuda_device={comm_device}")
+    print(f"[Rank {rank}] compute_device={model_device}")
 
     if args.dynamic_load and not args.lazy_load:
         raise RuntimeError("--dynamic-load requires --lazy-load.")
 
     init_process_group(args, rank, world_size)
-    dtype = resolve_dtype(args.dtype)
+    requested_dtype = resolve_dtype(args.dtype)
+    comm_dtype = torch.float16 if requested_dtype == "auto" else requested_dtype
+    dtype = requested_dtype
+    if rank == 0 and model_device.type == "cpu" and dtype in (torch.float16, "auto"):
+        print("[Rank 0] CPU compute uses dtype=float32 for PyTorch CPU compatibility.")
+        dtype = torch.float32
 
     try:
         if args.dynamic_load:
             if rank == 0:
                 tokenizer = load_tokenizer(args.model_dir)
-                rank0_generate_dynamic(args, tokenizer, dtype, world_size, device)
+                rank0_generate_dynamic(
+                    args,
+                    tokenizer,
+                    dtype,
+                    world_size,
+                    model_device,
+                    comm_device,
+                    comm_dtype=comm_dtype,
+                )
             else:
-                pipeline_serve_dynamic(args, rank, world_size, dtype, device)
+                pipeline_serve_dynamic(args, rank, world_size, dtype, comm_device)
 
             dist.barrier()
             print(f"[Rank {rank}] SUCCESS")
@@ -78,7 +100,7 @@ def main():
             layer_start,
             layer_end,
             dtype,
-            device,
+            model_device,
             lazy_load=args.lazy_load,
         )
         print(
@@ -89,9 +111,19 @@ def main():
 
         if rank == 0:
             tokenizer = load_tokenizer(args.model_dir)
-            rank0_generate(args, model, tokenizer, device, world_size, layer_start, layer_end)
+            rank0_generate(
+                args,
+                model,
+                tokenizer,
+                model_device,
+                world_size,
+                layer_start,
+                layer_end,
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
+            )
         else:
-            pipeline_serve_static(args, model, rank, world_size, device, layer_start, layer_end)
+            pipeline_serve_static(args, model, rank, world_size, comm_device, layer_start, layer_end)
 
         dist.barrier()
         print(f"[Rank {rank}] SUCCESS")

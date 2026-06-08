@@ -24,6 +24,7 @@ python distributed_tinyllama_inference.py \
   --dynamic-load \
   --batch-size 4 \
   --split-layers 5,15 \
+  --compute-device cuda \
   --allocation-csv allocation.csv \
   --model-dir /home/dingcong/models/TinyLlama \
   --input-csv prompts.csv \
@@ -31,6 +32,16 @@ python distributed_tinyllama_inference.py \
   --csv-has-header \
   --prompt-column prompt
 ```
+
+`--compute-device cuda` 是默认行为，表示 Rank 0 的模型前向计算和 NCCL 通信都走 GPU。
+
+如果 Rank 0 所在机器有 GPU 可用于 NCCL 通信，但希望模型前向和 KV cache 放在 CPU 上计算，可以只在 Rank 0 命令中改成：
+
+```bash
+--compute-device cpu
+```
+
+注意：CPU compute 模式仍然需要 Rank 0 有可用 CUDA 设备，因为 hidden states 和 token 的跨节点传输仍然通过 CUDA/NCCL 完成。Rank 1 / Rank 2 不需要设置 `--compute-device`，继续使用 GPU compute。
 
 ### Rank 1，10.50.0.85 / 4090
 
@@ -69,6 +80,31 @@ python distributed_tinyllama_inference.py \
 当前不使用自动 SSH/tmux 启动脚本，直接在三台机器上分别进入项目目录并执行上面的 Rank 0、Rank 1、Rank 2 命令即可。
 
 建议先启动 Rank 0，再启动 Rank 1 和 Rank 2。如果使用 tmux，可以手动在每台机器上创建 session，方便之后回看运行状态。
+
+### `run.sh` 快速启动
+
+当前 `run.sh` 已经支持 Rank 0 CPU compute 开关。默认仍然是 GPU compute：
+
+```bash
+bash run.sh 0
+bash run.sh 1
+bash run.sh 2
+```
+
+如果只想让 Rank 0 使用 CPU compute，Rank 0 启动时加环境变量即可：
+
+```bash
+COMPUTE_DEVICE=cpu bash run.sh 0
+```
+
+Rank 1 / Rank 2 仍然按原命令启动：
+
+```bash
+bash run.sh 1
+bash run.sh 2
+```
+
+`run.sh` 里的 `BATCH_SIZE`、`SPLIT_LAYERS`、`INIT_METHOD` 可以按当前实验环境修改。脚本当前使用 `INIT_METHOD=tcp://10.50.1.228:29510`，如果要回到默认端口，可以改成 `tcp://10.50.1.228:29500`。
 
 KV cache / prefill 实验日志会写入：
 

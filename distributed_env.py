@@ -62,6 +62,17 @@ def resolve_cuda_device(cuda_device):
     return device
 
 
+def resolve_compute_device(compute_device, rank, comm_device):
+    """Return the model-compute device for this rank.
+
+    Only Rank 0 supports CPU compute. Worker ranks must keep CUDA compute
+    because they receive CUDA tensors through NCCL and continue the GPU pipeline.
+    """
+    if rank == 0 and compute_device == "cpu":
+        return torch.device("cpu")
+    return comm_device
+
+
 def init_process_group(args, rank, world_size):
     """Initialize the NCCL process group used by the pipeline.
 

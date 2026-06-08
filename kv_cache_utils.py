@@ -55,14 +55,14 @@ def estimate_past_key_values_bytes(past_key_values):
 
 def cuda_memory_allocated(device):
     """Return current CUDA allocated memory in bytes."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         return 0
     return int(torch.cuda.memory_allocated(device))
 
 
 def cuda_memory_reserved(device):
     """Return current CUDA reserved memory in bytes."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         return 0
     return int(torch.cuda.memory_reserved(device))
 
