@@ -200,7 +200,8 @@ def generate_rows_for_prompts(
             comm_device=comm_device,
             comm_dtype=comm_dtype,
         )
-        next_token = recv_token(src=1, device=comm_device, batch_size=batch_size).to(device)
+        last_rank = world_size - 1
+        next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
 
         rank0_metric = build_prefill_metric(
             batch_number=batch_number,
@@ -263,7 +264,7 @@ def generate_rows_for_prompts(
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
             rank0_decode_step_count += 1
-            next_token = recv_token(src=1, device=comm_device, batch_size=batch_size).to(device)
+            next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
 
         rank0_decode_time_per_token_ms = (
             rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
@@ -591,11 +592,9 @@ def handle_worker_batch(
                     synchronize_cuda()
                     decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
                     decode_step_count += 1
-                next_token = recv_token(
-                    src=next_rank,
-                    device=device,
-                    batch_size=output_hidden_states.shape[0],
-                )
+                # Middle ranks only forward hidden states. The final rank now
+                # sends the generated token directly back to Rank 0.
+                next_token = None
 
             if is_prefill and metric is None:
                 metric = build_prefill_metric(
@@ -617,7 +616,8 @@ def handle_worker_batch(
                     prefill_time_ms=prefill_time_ms,
                 )
 
-            send_token(next_token, dst=prev_rank)
+            if is_last_rank:
+                send_token(next_token, dst=0)
 
 
 def pipeline_serve_static(args, model, rank, world_size, device, layer_start, layer_end):

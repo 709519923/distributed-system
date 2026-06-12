@@ -107,8 +107,9 @@ def recv_metric_records(world_size, device, dtype_name):
     """Receive worker metric records through the pipeline.
 
     For WORLD_SIZE=3, Rank 2 sends its metric to Rank 1, and Rank 1 forwards
-    both Rank 1 and Rank 2 records to Rank 0. This keeps side-channel metrics on
-    the same Rank 0 <-> Rank 1 <-> Rank 2 data path as inference.
+    both Rank 1 and Rank 2 records to Rank 0. Metrics intentionally keep this
+    low-frequency chain path, while per-token results are returned directly from
+    the last rank to Rank 0.
     """
     records = []
     for _ in range(1, world_size):

@@ -107,12 +107,12 @@ def recv_hidden_from_rank0(device, dtype):
 
 
 def send_token(next_token, dst):
-    """Send a generated token id to the previous pipeline rank."""
+    """Send a generated token id to the requested destination rank."""
     dist.send(next_token.contiguous(), dst=dst)
 
 
 def recv_token(src, device, batch_size=1):
-    """Receive a generated token id from the next pipeline rank."""
+    """Receive a generated token id from the requested source rank."""
     next_token = torch.empty((batch_size, 1), dtype=torch.long, device=device)
     dist.recv(next_token, src=src)
     return next_token
