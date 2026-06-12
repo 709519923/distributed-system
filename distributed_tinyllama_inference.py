@@ -23,6 +23,7 @@ from transformers import AutoTokenizer
 
 from config import default_boundaries_for_world_size, parse_args, stage_from_boundaries
 from distributed_env import (
+    broadcast_prefill_mode,
     get_rank_world_size,
     init_process_group,
     resolve_compute_device,
@@ -57,23 +58,28 @@ def main():
     print(f"[Rank {rank}] init_method={args.init_method}")
     print(f"[Rank {rank}] cuda_device={comm_device}")
     print(f"[Rank {rank}] compute_device={model_device}")
+    print(f"[Rank {rank}] requested_prefill_mode={args.prefill_mode}")
 
     if args.dynamic_load and not args.lazy_load:
         raise RuntimeError("--dynamic-load requires --lazy-load.")
-    if args.prefill_mode == "cloud-base" and world_size != 3:
-        raise RuntimeError("cloud-base prefill mode currently requires WORLD_SIZE=3.")
-    if args.prefill_mode == "cloud-base" and not args.dynamic_load:
-        raise RuntimeError("cloud-base prefill mode currently requires --dynamic-load.")
 
     init_process_group(args, rank, world_size)
-    requested_dtype = resolve_dtype(args.dtype)
-    comm_dtype = torch.float16 if requested_dtype == "auto" else requested_dtype
-    dtype = requested_dtype
-    if rank == 0 and model_device.type == "cpu" and dtype in (torch.float16, "auto"):
-        print("[Rank 0] CPU compute uses dtype=float32 for PyTorch CPU compatibility.")
-        dtype = torch.float32
 
     try:
+        effective_prefill_mode = broadcast_prefill_mode(args, rank, comm_device)
+        print(f"[Rank {rank}] prefill_mode={effective_prefill_mode} (broadcast from Rank 0)")
+        if args.prefill_mode == "cloud-base" and world_size != 3:
+            raise RuntimeError("cloud-base prefill mode currently requires WORLD_SIZE=3.")
+        if args.prefill_mode == "cloud-base" and not args.dynamic_load:
+            raise RuntimeError("cloud-base prefill mode currently requires --dynamic-load.")
+
+        requested_dtype = resolve_dtype(args.dtype)
+        comm_dtype = torch.float16 if requested_dtype == "auto" else requested_dtype
+        dtype = requested_dtype
+        if rank == 0 and model_device.type == "cpu" and dtype in (torch.float16, "auto"):
+            print("[Rank 0] CPU compute uses dtype=float32 for PyTorch CPU compatibility.")
+            dtype = torch.float32
+
         if args.dynamic_load:
             if rank == 0:
                 tokenizer = load_tokenizer(args.model_dir)

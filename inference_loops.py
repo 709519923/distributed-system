@@ -367,7 +367,12 @@ def generate_rows_for_prompts_cloud_base(
         f"{total_count}; batch_size={batch_size}; kv_cache=cloud-base"
     )
 
+    print(
+        f"[Rank 0] Cloud-base: sending prefill inputs to Rank {last_rank}; "
+        f"input_ids_shape={tuple(input_ids.shape)}"
+    )
     send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
+    print("[Rank 0] Cloud-base: prefill inputs sent; waiting for local KV cache from Rank 2...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
     rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
@@ -381,7 +386,12 @@ def generate_rows_for_prompts_cloud_base(
     synchronize_cuda()
     memory_after = cuda_memory_allocated(device)
     memory_reserved_after = cuda_memory_reserved(device)
+    print(
+        f"[Rank 0] Cloud-base: received local KV cache in "
+        f"{kv_cache_recv_time_ms:.2f} ms; waiting for first token from Rank {last_rank}..."
+    )
     next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
+    print("[Rank 0] Cloud-base: received first token; entering decode loop.")
 
     rank0_metric = build_prefill_metric(
         batch_number=batch_number,
@@ -495,6 +505,7 @@ def receive_cloud_base_cache_metric(
     batch_number,
 ):
     """Receive this worker's cloud-base KV cache from Rank 2 and build metrics."""
+    print(f"[Rank {rank}] Cloud-base: waiting for local KV cache from Rank {world_size - 1}...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
     past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
@@ -508,6 +519,7 @@ def receive_cloud_base_cache_metric(
     synchronize_cuda()
     memory_after = cuda_memory_allocated(device)
     memory_reserved_after = cuda_memory_reserved(device)
+    print(f"[Rank {rank}] Cloud-base: received local KV cache in {kv_cache_recv_time_ms:.2f} ms.")
     batch_size, seq_len = cache_batch_seq_len(past_key_values)
     metric = build_prefill_metric(
         batch_number=batch_number,
@@ -544,14 +556,20 @@ def run_rank2_cloud_base_prefill(
     comm_dtype,
 ):
     """Let Rank 2 full-prefill a batch, distribute KV cache, and return first token."""
+    print("[Rank 2] Cloud-base: waiting for prefill inputs from Rank 0...")
     input_ids, attention_mask_2d = recv_prefill_inputs(src=0, device=device)
     batch_size = int(input_ids.shape[0])
     input_seq_len_max = int(attention_mask_2d.shape[1])
     input_seq_len_avg = float(attention_mask_2d.sum(dim=1).float().mean().item())
+    print(
+        f"[Rank 2] Cloud-base: received prefill inputs; "
+        f"input_ids_shape={tuple(input_ids.shape)}"
+    )
 
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
     prefill_start = time.perf_counter()
+    print("[Rank 2] Cloud-base: running full-model prefill...")
     hidden_states, full_past_key_values = rank0_forward(
         full_prefill_model,
         input_ids,
@@ -563,14 +581,23 @@ def run_rank2_cloud_base_prefill(
     next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
     synchronize_cuda()
     cloud_prefill_rank2_time_ms = (time.perf_counter() - prefill_start) * 1000.0
+    print(
+        f"[Rank 2] Cloud-base: full-model prefill finished in "
+        f"{cloud_prefill_rank2_time_ms:.2f} ms; splitting KV cache..."
+    )
 
     cache_by_rank = split_kv_cache_by_boundaries(full_past_key_values, boundaries, world_size)
     rank2_past_key_values = cache_by_rank[world_size - 1]
     transfer_targets = {0: cache_by_rank[0], 1: cache_by_rank[1]}
+    print("[Rank 2] Cloud-base: sending KV cache partitions to Rank 0 and Rank 1...")
     kv_cache_send_time_ms = send_kv_caches_parallel(
         transfer_targets,
         comm_device=device,
         comm_dtype=comm_dtype,
+    )
+    print(
+        f"[Rank 2] Cloud-base: KV cache partitions sent in "
+        f"{kv_cache_send_time_ms:.2f} ms; sending first token to Rank 0."
     )
     send_token(next_token, dst=0)
     synchronize_cuda()
@@ -742,6 +769,10 @@ def rank0_generate_dynamic(
                 f"prompts={len(prompt_batch)}"
             )
 
+            print(
+                f"[Rank 0] Batch {batch_number}: broadcasting boundaries "
+                f"{boundaries}; prefill_mode={args.prefill_mode}"
+            )
             broadcast_boundaries(boundaries, world_size, comm_device, rank=0)
             if model is None or next_stage != current_stage:
                 if model is not None:
@@ -973,6 +1004,7 @@ def pipeline_serve_static(
     batch_number = 1
     full_prefill_model = None
     if args.prefill_mode == "cloud-base" and rank == world_size - 1:
+        print(f"[Rank {rank}] Loading full model for cloud-base KV prefill...")
         full_prefill_model = load_full_model_for_prefill(args.model_dir, dtype, device)
         print(f"[Rank {rank}] Loaded full model for cloud-base KV prefill.")
 
@@ -1041,6 +1073,10 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
             boundaries = broadcast_boundaries(None, world_size, device, rank=rank)
             if boundaries[0] == -1:
                 break
+            print(
+                f"[Rank {rank}] Batch {batch_number}: received boundaries "
+                f"{boundaries}; prefill_mode={args.prefill_mode}"
+            )
 
             if scheduler is None:
                 allocation = None
@@ -1092,6 +1128,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
             if args.prefill_mode == "cloud-base":
                 if rank == world_size - 1:
                     if full_prefill_model is None:
+                        print(f"[Rank {rank}] Loading full model for cloud-base KV prefill...")
                         full_prefill_model = load_full_model_for_prefill(
                             args.model_dir,
                             dtype,

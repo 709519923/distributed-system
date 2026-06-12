@@ -20,6 +20,19 @@ if [ -z "$RANK_ARG" ]; then
     exit 1
 fi
 
+if [ "$RANK_ARG" != "0" ] && [ "$RANK_ARG" != "1" ] && [ "$RANK_ARG" != "2" ]; then
+    echo "Usage: ./run.sh 0|1|2"
+    exit 1
+fi
+
+if [ "$RANK_ARG" = "0" ]; then
+    PREFILL_MODE_TEXT="$PREFILL_MODE(rank0-broadcast)"
+else
+    PREFILL_MODE_TEXT="receive-from-rank0"
+fi
+
+echo "[run.sh] RANK=$RANK_ARG WORLD_SIZE=$WORLD_SIZE_VALUE PREFILL_MODE=$PREFILL_MODE_TEXT BATCH_SIZE=$BATCH_SIZE SPLIT_LAYERS=$SPLIT_LAYERS INIT_METHOD=$INIT_METHOD COMPUTE_DEVICE=$COMPUTE_DEVICE"
+
 if [ "$RANK_ARG" = "0" ]; then
     export WORLD_SIZE=$WORLD_SIZE_VALUE
     export RANK=0
@@ -51,7 +64,6 @@ if [ "$RANK_ARG" = "1" ]; then
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
-      --prefill-mode $PREFILL_MODE \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --init-method $INIT_METHOD \
@@ -70,7 +82,6 @@ if [ "$RANK_ARG" = "2" ]; then
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
-      --prefill-mode $PREFILL_MODE \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --init-method $INIT_METHOD \

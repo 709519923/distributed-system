@@ -11,6 +11,14 @@ import os
 import torch
 import torch.distributed as dist
 
+PREFILL_MODE_TO_CODE = {
+    "distributed": 0,
+    "cloud-base": 1,
+}
+PREFILL_CODE_TO_MODE = {
+    value: key for key, value in PREFILL_MODE_TO_CODE.items()
+}
+
 
 def get_rank_world_size():
     """Read and validate the distributed identity of this process.
@@ -86,3 +94,30 @@ def init_process_group(args, rank, world_size):
         world_size=world_size,
         timeout=timedelta(seconds=args.timeout_seconds),
     )
+
+
+def broadcast_prefill_mode(args, rank, device):
+    """Broadcast Rank 0's KV-cache prefill mode to every worker rank.
+
+    Only Rank 0 should decide whether a run uses normal distributed prefill or
+    cloud-base prefill. Rank 1/2 may have their local CLI default, but this
+    broadcast overwrites it before any batch loop starts.
+    """
+    if rank == 0:
+        try:
+            mode_code = PREFILL_MODE_TO_CODE[args.prefill_mode]
+        except KeyError as exc:
+            raise RuntimeError(f"Unsupported prefill mode: {args.prefill_mode}") from exc
+    else:
+        mode_code = PREFILL_MODE_TO_CODE["distributed"]
+
+    tensor = torch.tensor([mode_code], dtype=torch.long, device=device)
+    dist.broadcast(tensor, src=0)
+    received_code = int(tensor.item())
+    try:
+        mode = PREFILL_CODE_TO_MODE[received_code]
+    except KeyError as exc:
+        raise RuntimeError(f"Received invalid prefill mode code: {received_code}") from exc
+
+    args.prefill_mode = mode
+    return mode
