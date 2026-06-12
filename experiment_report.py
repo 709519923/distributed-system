@@ -43,6 +43,9 @@ METRIC_FIELDS = [
     "decode_time_total_ms",
     "decode_time_per_token_ms",
     "inference_compute_total_ms",
+    "cloud_prefill_rank2_time_ms",
+    "kv_cache_send_time_ms",
+    "kv_cache_recv_time_ms",
 ]
 
 
@@ -187,8 +190,14 @@ def append_experiment_log(log_path, records):
             )
             f.write(
                 "inference_compute_total_ms="
-                f"{float(record['inference_compute_total_ms']):.2f}\n\n"
+                f"{float(record['inference_compute_total_ms']):.2f}\n"
             )
+            f.write(
+                "cloud_prefill_rank2_time_ms="
+                f"{float(record['cloud_prefill_rank2_time_ms']):.2f}\n"
+            )
+            f.write(f"kv_cache_send_time_ms={float(record['kv_cache_send_time_ms']):.2f}\n")
+            f.write(f"kv_cache_recv_time_ms={float(record['kv_cache_recv_time_ms']):.2f}\n\n")
         f.flush()
         os.fsync(f.fileno())
 
@@ -202,6 +211,9 @@ def create_summary(world_size):
             "total_decode_time_ms": 0.0,
             "total_inference_compute_time_ms": 0.0,
             "total_decode_step_count": 0,
+            "total_cloud_prefill_rank2_time_ms": 0.0,
+            "total_kv_cache_send_time_ms": 0.0,
+            "total_kv_cache_recv_time_ms": 0.0,
         }
         for rank in range(world_size)
     }
@@ -219,6 +231,9 @@ def update_summary(summary_by_rank, records):
                 "total_decode_time_ms": 0.0,
                 "total_inference_compute_time_ms": 0.0,
                 "total_decode_step_count": 0,
+                "total_cloud_prefill_rank2_time_ms": 0.0,
+                "total_kv_cache_send_time_ms": 0.0,
+                "total_kv_cache_recv_time_ms": 0.0,
             },
         )
         summary["record_count"] += 1
@@ -226,6 +241,11 @@ def update_summary(summary_by_rank, records):
         summary["total_decode_time_ms"] += float(record["decode_time_total_ms"])
         summary["total_inference_compute_time_ms"] += float(record["inference_compute_total_ms"])
         summary["total_decode_step_count"] += int(record["decode_step_count"])
+        summary["total_cloud_prefill_rank2_time_ms"] += float(
+            record["cloud_prefill_rank2_time_ms"]
+        )
+        summary["total_kv_cache_send_time_ms"] += float(record["kv_cache_send_time_ms"])
+        summary["total_kv_cache_recv_time_ms"] += float(record["kv_cache_recv_time_ms"])
 
 
 def append_summary_log(log_path, summary_by_rank, batch_number):
@@ -257,6 +277,18 @@ def append_summary_log(log_path, summary_by_rank, batch_number):
             )
             f.write(f"total_decode_step_count={total_steps}\n")
             f.write(f"decode_time_per_token_avg_ms={avg_decode_ms:.2f}\n")
+            f.write(
+                "total_cloud_prefill_rank2_time_ms="
+                f"{float(summary['total_cloud_prefill_rank2_time_ms']):.2f}\n"
+            )
+            f.write(
+                "total_kv_cache_send_time_ms="
+                f"{float(summary['total_kv_cache_send_time_ms']):.2f}\n"
+            )
+            f.write(
+                "total_kv_cache_recv_time_ms="
+                f"{float(summary['total_kv_cache_recv_time_ms']):.2f}\n"
+            )
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())

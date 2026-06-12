@@ -60,6 +60,10 @@ def main():
 
     if args.dynamic_load and not args.lazy_load:
         raise RuntimeError("--dynamic-load requires --lazy-load.")
+    if args.prefill_mode == "cloud-base" and world_size != 3:
+        raise RuntimeError("cloud-base prefill mode currently requires WORLD_SIZE=3.")
+    if args.prefill_mode == "cloud-base" and not args.dynamic_load:
+        raise RuntimeError("cloud-base prefill mode currently requires --dynamic-load.")
 
     init_process_group(args, rank, world_size)
     requested_dtype = resolve_dtype(args.dtype)
@@ -119,6 +123,7 @@ def main():
                 world_size,
                 layer_start,
                 layer_end,
+                boundaries=boundaries,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
             )

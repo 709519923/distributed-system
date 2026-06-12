@@ -25,6 +25,14 @@ from experiment_report import (
     send_metric_tensor,
     update_summary,
 )
+from kv_cache_transfer import (
+    cache_batch_seq_len,
+    recv_kv_cache,
+    recv_prefill_inputs,
+    send_kv_caches_parallel,
+    send_prefill_inputs,
+    split_kv_cache_by_boundaries,
+)
 from kv_cache_utils import (
     count_model_parameters,
     cuda_memory_allocated,
@@ -35,7 +43,7 @@ from kv_cache_utils import (
     tensor_bytes,
 )
 from model_forward import choose_next_token, rank0_forward, rank1_forward_logits, rank_middle_forward
-from model_loader import get_total_layers_from_config, load_model_part
+from model_loader import get_total_layers_from_config, load_full_model_for_prefill, load_model_part
 from pipeline_comm import (
     broadcast_boundaries,
     recv_hidden,
@@ -79,9 +87,17 @@ def build_prefill_metric(
     memory_after,
     memory_reserved_after,
     prefill_time_ms,
+    cloud_prefill_rank2_time_ms=0.0,
+    kv_cache_send_time_ms=0.0,
+    kv_cache_recv_time_ms=0.0,
 ):
     """Build one record for the text experiment log."""
-    hidden_shape = list(hidden_states.shape)
+    if hidden_states is None:
+        hidden_shape = [0, 0, 0]
+        hidden_prefill_bytes = 0
+    else:
+        hidden_shape = list(hidden_states.shape)
+        hidden_prefill_bytes = tensor_bytes(hidden_states)
     return {
         "batch": batch_number,
         "rank": rank,
@@ -99,7 +115,7 @@ def build_prefill_metric(
         "hidden_prefill_batch": hidden_shape[0],
         "hidden_prefill_seq_len": hidden_shape[1],
         "hidden_prefill_hidden_size": hidden_shape[2],
-        "hidden_prefill_bytes": tensor_bytes(hidden_states),
+        "hidden_prefill_bytes": hidden_prefill_bytes,
         "cuda_memory_allocated_before_prefill": memory_before,
         "cuda_memory_allocated_after_prefill": memory_after,
         "cuda_memory_reserved_after_prefill": memory_reserved_after,
@@ -109,6 +125,9 @@ def build_prefill_metric(
         "decode_time_total_ms": 0.0,
         "decode_time_per_token_ms": 0.0,
         "inference_compute_total_ms": prefill_time_ms,
+        "cloud_prefill_rank2_time_ms": cloud_prefill_rank2_time_ms,
+        "kv_cache_send_time_ms": kv_cache_send_time_ms,
+        "kv_cache_recv_time_ms": kv_cache_recv_time_ms,
     }
 
 
@@ -273,7 +292,9 @@ def generate_rows_for_prompts(
         records[0]["decode_time_total_ms"] = rank0_decode_time_ms
         records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
         records[0]["inference_compute_total_ms"] = (
-            records[0]["prefill_time_total_ms"] + rank0_decode_time_ms
+            records[0]["prefill_time_total_ms"]
+            + records[0]["cloud_prefill_rank2_time_ms"]
+            + rank0_decode_time_ms
         )
 
     rows = []
@@ -294,6 +315,166 @@ def generate_rows_for_prompts(
     return rows, records
 
 
+def generate_rows_for_prompts_cloud_base(
+    args,
+    model,
+    tokenizer,
+    device,
+    prompts,
+    world_size,
+    layer_start,
+    layer_end,
+    batch_number,
+    boundaries,
+    comm_device,
+    comm_dtype,
+    start_index=0,
+    total_count=None,
+):
+    """Generate one prompt batch after Rank 2 builds and transfers KV cache."""
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+    if pad_token_id is None:
+        raise RuntimeError("Tokenizer must define pad_token_id or eos_token_id for batched inference.")
+
+    total_count = total_count if total_count is not None else len(prompts)
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.max_input_tokens,
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask_2d = encoded["attention_mask"].to(device)
+    finally:
+        tokenizer.padding_side = old_padding_side
+
+    batch_size = input_ids.shape[0]
+    prompt_count = len(prompts)
+    input_seq_len_max = int(attention_mask_2d.shape[1])
+    input_seq_len_avg = float(attention_mask_2d.sum(dim=1).float().mean().item())
+    first_prompt_number = start_index + 1
+    last_prompt_number = start_index + len(prompts)
+    last_rank = world_size - 1
+    print(
+        f"[Rank 0] Prompt batch {first_prompt_number}-{last_prompt_number}/"
+        f"{total_count}; batch_size={batch_size}; kv_cache=cloud-base"
+    )
+
+    send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
+    synchronize_cuda()
+    memory_before = cuda_memory_allocated(device)
+    rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
+        src=last_rank,
+        expected_layer_count=layer_end - layer_start,
+        comm_device=comm_device,
+        compute_device=device,
+        transfer_dtype=comm_dtype,
+        compute_dtype=getattr(model, "dtype", comm_dtype),
+    )
+    synchronize_cuda()
+    memory_after = cuda_memory_allocated(device)
+    memory_reserved_after = cuda_memory_reserved(device)
+    next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
+
+    rank0_metric = build_prefill_metric(
+        batch_number=batch_number,
+        rank=0,
+        world_size=world_size,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        batch_size=batch_size,
+        prompt_count=prompt_count,
+        input_seq_len_max=input_seq_len_max,
+        input_seq_len_avg=input_seq_len_avg,
+        model=model,
+        past_key_values=rank0_past_key_values,
+        hidden_states=None,
+        memory_before=memory_before,
+        memory_after=memory_after,
+        memory_reserved_after=memory_reserved_after,
+        prefill_time_ms=0.0,
+        kv_cache_recv_time_ms=kv_cache_recv_time_ms,
+    )
+    records = [normalize_record(rank0_metric, str(model.dtype))]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    generated_tokens = [[] for _ in range(batch_size)]
+    rank0_decode_time_ms = 0.0
+    rank0_decode_step_count = 0
+
+    with torch.inference_mode():
+        for token_index in range(args.max_new_tokens):
+            synchronize_cuda()
+            rank0_decode_start_time = time.perf_counter()
+            active = ~finished
+            tokens_to_append = torch.where(
+                active.unsqueeze(1),
+                next_token,
+                torch.full_like(next_token, pad_token_id),
+            )
+            mask_to_append = active.to(dtype=attention_mask_2d.dtype).unsqueeze(1)
+
+            for row_index in range(batch_size):
+                if active[row_index]:
+                    token_value = int(next_token[row_index, 0].item())
+                    generated_tokens[row_index].append(token_value)
+                    if eos_token_id is not None and token_value == eos_token_id:
+                        finished[row_index] = True
+
+            attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
+            if bool(finished.all().item()) or token_index == args.max_new_tokens - 1:
+                break
+
+            hidden_states, rank0_past_key_values = rank0_forward(
+                model,
+                tokens_to_append,
+                device,
+                attention_mask_2d,
+                past_key_values=rank0_past_key_values,
+            )
+            send_hidden_from_rank0(
+                hidden_states,
+                dst=1,
+                attention_mask_2d=attention_mask_2d,
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
+            )
+            synchronize_cuda()
+            rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
+            rank0_decode_step_count += 1
+            next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
+
+    rank0_decode_time_per_token_ms = (
+        rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
+    )
+    records[0]["decode_step_count"] = rank0_decode_step_count
+    records[0]["decode_time_total_ms"] = rank0_decode_time_ms
+    records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
+    records[0]["inference_compute_total_ms"] = rank0_decode_time_ms
+
+    rows = []
+    for local_index, prompt in enumerate(prompts, start=1):
+        global_index = start_index + local_index
+        generated_ids = generated_tokens[local_index - 1]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        rows.append(
+            {
+                "prompt": prompt,
+                "generated_text": generated_text,
+                "full_text": prompt + generated_text,
+            }
+        )
+        print(f"[Rank 0] Output {global_index}: {generated_text}")
+
+    return rows, records
+
+
 def release_model(model):
     """Release the current model partition before loading a different one."""
     if model is None:
@@ -304,6 +485,121 @@ def release_model(model):
         torch.cuda.empty_cache()
 
 
+def receive_cloud_base_cache_metric(
+    model,
+    rank,
+    world_size,
+    device,
+    layer_start,
+    layer_end,
+    batch_number,
+):
+    """Receive this worker's cloud-base KV cache from Rank 2 and build metrics."""
+    synchronize_cuda()
+    memory_before = cuda_memory_allocated(device)
+    past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
+        src=world_size - 1,
+        expected_layer_count=layer_end - layer_start,
+        comm_device=device,
+        compute_device=device,
+        transfer_dtype=getattr(model, "dtype", torch.float16),
+        compute_dtype=getattr(model, "dtype", torch.float16),
+    )
+    synchronize_cuda()
+    memory_after = cuda_memory_allocated(device)
+    memory_reserved_after = cuda_memory_reserved(device)
+    batch_size, seq_len = cache_batch_seq_len(past_key_values)
+    metric = build_prefill_metric(
+        batch_number=batch_number,
+        rank=rank,
+        world_size=world_size,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        batch_size=batch_size,
+        prompt_count=batch_size,
+        input_seq_len_max=seq_len,
+        input_seq_len_avg=float(seq_len),
+        model=model,
+        past_key_values=past_key_values,
+        hidden_states=None,
+        memory_before=memory_before,
+        memory_after=memory_after,
+        memory_reserved_after=memory_reserved_after,
+        prefill_time_ms=0.0,
+        kv_cache_recv_time_ms=kv_cache_recv_time_ms,
+    )
+    return past_key_values, metric
+
+
+def run_rank2_cloud_base_prefill(
+    args,
+    decode_model,
+    full_prefill_model,
+    world_size,
+    device,
+    layer_start,
+    layer_end,
+    batch_number,
+    boundaries,
+    comm_dtype,
+):
+    """Let Rank 2 full-prefill a batch, distribute KV cache, and return first token."""
+    input_ids, attention_mask_2d = recv_prefill_inputs(src=0, device=device)
+    batch_size = int(input_ids.shape[0])
+    input_seq_len_max = int(attention_mask_2d.shape[1])
+    input_seq_len_avg = float(attention_mask_2d.sum(dim=1).float().mean().item())
+
+    synchronize_cuda()
+    memory_before = cuda_memory_allocated(device)
+    prefill_start = time.perf_counter()
+    hidden_states, full_past_key_values = rank0_forward(
+        full_prefill_model,
+        input_ids,
+        device,
+        attention_mask_2d,
+        past_key_values=None,
+    )
+    logits = full_prefill_model.lm_head(hidden_states)[:, -1, :]
+    next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
+    synchronize_cuda()
+    cloud_prefill_rank2_time_ms = (time.perf_counter() - prefill_start) * 1000.0
+
+    cache_by_rank = split_kv_cache_by_boundaries(full_past_key_values, boundaries, world_size)
+    rank2_past_key_values = cache_by_rank[world_size - 1]
+    transfer_targets = {0: cache_by_rank[0], 1: cache_by_rank[1]}
+    kv_cache_send_time_ms = send_kv_caches_parallel(
+        transfer_targets,
+        comm_device=device,
+        comm_dtype=comm_dtype,
+    )
+    send_token(next_token, dst=0)
+    synchronize_cuda()
+    memory_after = cuda_memory_allocated(device)
+    memory_reserved_after = cuda_memory_reserved(device)
+
+    metric = build_prefill_metric(
+        batch_number=batch_number,
+        rank=world_size - 1,
+        world_size=world_size,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        batch_size=batch_size,
+        prompt_count=batch_size,
+        input_seq_len_max=input_seq_len_max,
+        input_seq_len_avg=input_seq_len_avg,
+        model=decode_model,
+        past_key_values=rank2_past_key_values,
+        hidden_states=hidden_states,
+        memory_before=memory_before,
+        memory_after=memory_after,
+        memory_reserved_after=memory_reserved_after,
+        prefill_time_ms=0.0,
+        cloud_prefill_rank2_time_ms=cloud_prefill_rank2_time_ms,
+        kv_cache_send_time_ms=kv_cache_send_time_ms,
+    )
+    return rank2_past_key_values, metric
+
+
 def rank0_generate(
     args,
     model,
@@ -312,6 +608,7 @@ def rank0_generate(
     world_size,
     layer_start,
     layer_end,
+    boundaries=None,
     comm_device=None,
     comm_dtype=None,
 ):
@@ -330,22 +627,40 @@ def rank0_generate(
     summary_by_rank = create_summary(world_size)
     for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
         print(f"[Rank 0] Static batch {batch_number}; prompts={len(prompt_batch)}")
-        rows, records = generate_rows_for_prompts(
-            args,
-            model,
-            tokenizer,
-            device,
-            prompt_batch,
-            world_size=world_size,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            batch_number=batch_number,
-            log_path=log_path,
-            comm_device=comm_device,
-            comm_dtype=comm_dtype,
-            start_index=start_index,
-            total_count=len(prompts),
-        )
+        if args.prefill_mode == "cloud-base":
+            rows, records = generate_rows_for_prompts_cloud_base(
+                args,
+                model,
+                tokenizer,
+                device,
+                prompt_batch,
+                world_size=world_size,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                batch_number=batch_number,
+                boundaries=boundaries,
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
+                start_index=start_index,
+                total_count=len(prompts),
+            )
+        else:
+            rows, records = generate_rows_for_prompts(
+                args,
+                model,
+                tokenizer,
+                device,
+                prompt_batch,
+                world_size=world_size,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                batch_number=batch_number,
+                log_path=log_path,
+                comm_device=comm_device,
+                comm_dtype=comm_dtype,
+                start_index=start_index,
+                total_count=len(prompts),
+            )
         all_rows.extend(rows)
         send_batch_done(comm_device)
         records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
@@ -458,22 +773,40 @@ def rank0_generate_dynamic(
                     f"for stage=[{layer_start},{layer_end})."
                 )
 
-            rows, records = generate_rows_for_prompts(
-                args,
-                model,
-                tokenizer,
-                device,
-                prompt_batch,
-                world_size=world_size,
-                layer_start=layer_start,
-                layer_end=layer_end,
-                batch_number=batch_number,
-                log_path=log_path,
-                start_index=start_index,
-                total_count=len(prompts),
-                comm_device=comm_device,
-                comm_dtype=comm_dtype,
-            )
+            if args.prefill_mode == "cloud-base":
+                rows, records = generate_rows_for_prompts_cloud_base(
+                    args,
+                    model,
+                    tokenizer,
+                    device,
+                    prompt_batch,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    batch_number=batch_number,
+                    boundaries=boundaries,
+                    start_index=start_index,
+                    total_count=len(prompts),
+                    comm_device=comm_device,
+                    comm_dtype=comm_dtype,
+                )
+            else:
+                rows, records = generate_rows_for_prompts(
+                    args,
+                    model,
+                    tokenizer,
+                    device,
+                    prompt_batch,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    batch_number=batch_number,
+                    log_path=log_path,
+                    start_index=start_index,
+                    total_count=len(prompts),
+                    comm_device=comm_device,
+                    comm_dtype=comm_dtype,
+                )
             all_rows.extend(rows)
 
             send_batch_done(comm_device)
@@ -499,13 +832,15 @@ def handle_worker_batch(
     layer_start,
     layer_end,
     batch_number,
+    initial_past_key_values=None,
+    initial_metric=None,
 ):
     """Serve one worker batch and keep rank-local KV cache until batch_done."""
     prev_rank = rank - 1
     next_rank = rank + 1
     is_last_rank = rank == world_size - 1
-    past_key_values = None
-    metric = None
+    past_key_values = initial_past_key_values
+    metric = initial_metric
     decode_time_ms = 0.0
     decode_step_count = 0
 
@@ -531,7 +866,9 @@ def handle_worker_batch(
                         decode_time_ms / decode_step_count if decode_step_count else 0.0
                     )
                     metric["inference_compute_total_ms"] = (
-                        metric["prefill_time_total_ms"] + decode_time_ms
+                        metric["prefill_time_total_ms"]
+                        + metric["cloud_prefill_rank2_time_ms"]
+                        + decode_time_ms
                     )
                     if is_last_rank:
                         send_metric_record(metric, device, dst=prev_rank)
@@ -620,11 +957,54 @@ def handle_worker_batch(
                 send_token(next_token, dst=0)
 
 
-def pipeline_serve_static(args, model, rank, world_size, device, layer_start, layer_end):
+def pipeline_serve_static(
+    args,
+    model,
+    rank,
+    world_size,
+    device,
+    layer_start,
+    layer_end,
+    boundaries=None,
+    dtype=None,
+    comm_dtype=None,
+):
     """Serve a non-master pipeline rank in static mode."""
     batch_number = 1
+    full_prefill_model = None
+    if args.prefill_mode == "cloud-base" and rank == world_size - 1:
+        full_prefill_model = load_full_model_for_prefill(args.model_dir, dtype, device)
+        print(f"[Rank {rank}] Loaded full model for cloud-base KV prefill.")
+
     print(f"[Rank {rank}] Waiting for hidden states from Rank {rank - 1}...")
     while True:
+        initial_past_key_values = None
+        initial_metric = None
+        if args.prefill_mode == "cloud-base":
+            if rank == world_size - 1:
+                initial_past_key_values, initial_metric = run_rank2_cloud_base_prefill(
+                    args,
+                    model,
+                    full_prefill_model,
+                    world_size,
+                    device,
+                    layer_start,
+                    layer_end,
+                    batch_number,
+                    boundaries,
+                    comm_dtype or getattr(model, "dtype", torch.float16),
+                )
+            else:
+                initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    layer_start,
+                    layer_end,
+                    batch_number,
+                )
+
         should_continue = handle_worker_batch(
             args,
             model,
@@ -634,6 +1014,8 @@ def pipeline_serve_static(args, model, rank, world_size, device, layer_start, la
             layer_start,
             layer_end,
             batch_number,
+            initial_past_key_values=initial_past_key_values,
+            initial_metric=initial_metric,
         )
         if not should_continue:
             break
@@ -651,6 +1033,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
         scheduler = Scheduler(args.allocation_csv, total_layers, default_boundaries, world_size)
     batch_number = 1
     model = None
+    full_prefill_model = None
     current_stage = None
 
     try:
@@ -704,6 +1087,40 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                     f"for stage=[{layer_start},{layer_end})."
                 )
 
+            initial_past_key_values = None
+            initial_metric = None
+            if args.prefill_mode == "cloud-base":
+                if rank == world_size - 1:
+                    if full_prefill_model is None:
+                        full_prefill_model = load_full_model_for_prefill(
+                            args.model_dir,
+                            dtype,
+                            device,
+                        )
+                        print(f"[Rank {rank}] Loaded full model for cloud-base KV prefill.")
+                    initial_past_key_values, initial_metric = run_rank2_cloud_base_prefill(
+                        args,
+                        model,
+                        full_prefill_model,
+                        world_size,
+                        device,
+                        layer_start,
+                        layer_end,
+                        batch_number,
+                        boundaries,
+                        getattr(model, "dtype", torch.float16),
+                    )
+                else:
+                    initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
+                        model,
+                        rank,
+                        world_size,
+                        device,
+                        layer_start,
+                        layer_end,
+                        batch_number,
+                    )
+
             should_continue = handle_worker_batch(
                 args,
                 model,
@@ -713,6 +1130,8 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                 layer_start,
                 layer_end,
                 batch_number,
+                initial_past_key_values=initial_past_key_values,
+                initial_metric=initial_metric,
             )
             if not should_continue:
                 return
@@ -723,3 +1142,4 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
         print(f"[Rank {rank}] Dynamic loading stop signal received.")
     finally:
         release_model(model)
+        release_model(full_prefill_model)

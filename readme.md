@@ -34,6 +34,7 @@ metrics/log  : Rank 2 -> Rank 1 -> Rank 0
 
 ```bash
 WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
+PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
@@ -48,6 +49,7 @@ MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
 
 ```text
 BATCH_SIZE       每个 batch 的 prompt 数量
+PREFILL_MODE     KV cache prefill 模式：distributed 或 cloud-base
 SPLIT_LAYERS     三节点 layer 切分点
 INIT_METHOD      master rendezvous 地址和端口
 COMPUTE_DEVICE   仅 Rank 0 使用，cuda 表示 GPU compute，cpu 表示 CPU compute + CUDA/NCCL communication
@@ -74,6 +76,54 @@ MAX_INPUT_TOKENS 输入 prompt 最大 token 长度
 ```
 
 建议先启动 Rank 0，再启动 Rank 1 和 Rank 2。每台机器可以放在自己的 `tmux` 窗口中运行，方便回看日志。
+
+## KV Cache Prefill 模式
+
+当前支持两种 `PREFILL_MODE`：
+
+```text
+distributed
+cloud-base
+```
+
+`distributed` 是默认模式，也是当前稳定模式：
+
+```text
+Rank 0 计算自己的前段 KV cache
+Rank 1 计算自己的中段 KV cache
+Rank 2 计算自己的后段 KV cache
+```
+
+`cloud-base` 是新增实验模式：
+
+```text
+Rank 0 -> Rank 2: input_ids + attention_mask
+Rank 2: 使用完整模型计算整模型 KV cache
+Rank 2 -> Rank 0: layer [0, split0) KV cache
+Rank 2 -> Rank 1: layer [split0, split1) KV cache
+Rank 2: 保留 layer [split1, end) KV cache
+```
+
+`cloud-base` 下后续 decode 仍然保持：
+
+```text
+hidden states: Rank 0 -> Rank 1 -> Rank 2
+next token   : Rank 2 -> Rank 0
+```
+
+启用方式是在 Rank 0 / Rank 1 / Rank 2 的 `run.sh` 顶部都设置：
+
+```bash
+PREFILL_MODE=${PREFILL_MODE:-cloud-base}
+```
+
+第一版 `cloud-base` 仅支持：
+
+```text
+WORLD_SIZE_VALUE=3
+--dynamic-load
+Rank 2 能加载完整 TinyLlama
+```
 
 ## Rank 0 CPU Compute
 
@@ -140,6 +190,9 @@ decode_step_count               decode 自回归 forward 次数
 decode_time_total_ms            当前 rank decode 总时间
 decode_time_per_token_ms        当前 rank 平均每次 decode forward 时间
 inference_compute_total_ms      prefill + decode 的本地计算总时间
+cloud_prefill_rank2_time_ms     cloud-base 下 Rank 2 完整模型 prefill 时间
+kv_cache_send_time_ms           cloud-base 下 Rank 2 并行发送 KV cache 的墙钟时间
+kv_cache_recv_time_ms           cloud-base 下 Rank 0 / Rank 1 接收 KV cache 的时间
 total_prefill_time_ms           已完成 batch 的累计 prefill 时间
 total_decode_time_ms            已完成 batch 的累计 decode 时间
 total_inference_compute_time_ms 已完成 batch 的累计计算时间
@@ -153,3 +206,4 @@ total_decode_step_count         已完成 batch 的累计 decode 次数
 3. Rank 0 需要能直接接收 Rank 2 的 NCCL token 返回连接。
 4. 如果修改 `INIT_METHOD` 端口，三台机器必须同时修改。
 5. 如果 NCCL 报网络错误，优先检查 `NCCL_SOCKET_IFNAME` 是否是互通网卡。
+6. `cloud-base` 会让 Rank 2 同时持有完整 prefill model 和自己的 decode 分区，显存压力会明显高于 `distributed`。

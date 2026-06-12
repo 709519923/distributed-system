@@ -3,6 +3,7 @@
 # Edit this block for each experiment. Rank 0 is the only rank that uses
 # COMPUTE_DEVICE; set it to "cpu" for CPU compute + CUDA/NCCL communication.
 WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
+PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
@@ -28,6 +29,7 @@ if [ "$RANK_ARG" = "0" ]; then
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
+      --prefill-mode $PREFILL_MODE \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --compute-device $COMPUTE_DEVICE \
@@ -49,6 +51,7 @@ if [ "$RANK_ARG" = "1" ]; then
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
+      --prefill-mode $PREFILL_MODE \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --init-method $INIT_METHOD \
@@ -67,6 +70,7 @@ if [ "$RANK_ARG" = "2" ]; then
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
+      --prefill-mode $PREFILL_MODE \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --init-method $INIT_METHOD \

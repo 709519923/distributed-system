@@ -6,6 +6,11 @@
 - Rank 1 no longer receives or forwards generated tokens; it only forwards hidden states and keeps the existing metric forwarding path.
 - Reworked `run.sh` as the main experiment entry point. Batch size, split layers, init method, model path, dataset path, and Rank 0 CPU/GPU compute mode are now configured at the top of the script.
 - Replaced `readme.md` with a concise current-run guide focused on `run.sh`, direct token return, CPU compute, input/output files, logs, and operational notes.
+- Added the first cloud-base KV-cache prefill design. `PREFILL_MODE` is kept as the keyword, but its values are now `distributed` and `cloud-base`; the old `pipeline` value is avoided because it conflicts with pipeline parallelism terminology.
+- `distributed` keeps the current behavior: each rank computes the KV cache for its own layer partition. `cloud-base` sends tokenized prompts from Rank 0 to Rank 2, lets Rank 2 compute full-model KV cache, then transfers rank-local KV-cache partitions to Rank 0 and Rank 1.
+- Added `kv_cache_transfer.py` to isolate cloud-base cache transfer logic from normal pipeline communication. `pipeline_comm.py` continues to own simple hidden/token/status/boundary messages; `kv_cache_transfer.py` owns DynamicCache layer extraction, layer-range splitting, metadata transfer, key/value payload transfer, cache reconstruction, and transfer timing.
+- Cloud-base KV-cache transfer uses parallel metadata sends followed by parallel payload sends: metadata is sent with `isend()` to Rank 0 and Rank 1, waited on, then all per-layer key/value tensors are sent with `isend()` and waited on together.
+- Extended experiment logs with only the requested cloud-base timing fields: `cloud_prefill_rank2_time_ms`, `kv_cache_send_time_ms`, and `kv_cache_recv_time_ms`. In `cloud-base`, Rank 0/1 prefill time is written as 0 and their cache receive time is recorded separately; Rank 2 records full-model prefill time and parallel cache-send wall-clock time.
 
 ## 2026-06-08
 

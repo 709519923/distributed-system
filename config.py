@@ -150,6 +150,17 @@ def parse_args():
             "compute on CPU while keeping CUDA/NCCL tensors for communication."
         ),
     )
+    parser.add_argument(
+        "--prefill-mode",
+        choices=("distributed", "cloud-base"),
+        default="distributed",
+        help=(
+            "KV-cache prefill strategy. distributed keeps the current behavior "
+            "where each rank prefill-computes its own layer partition. cloud-base "
+            "lets Rank 2 compute the full KV cache and transfer layer partitions "
+            "to Rank 0 and Rank 1."
+        ),
+    )
     return parser.parse_args()
 
 

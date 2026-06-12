@@ -319,3 +319,18 @@ def load_model_part(
     return load_model_part_full(
         model_dir, rank, world_size, layer_start, layer_end, dtype, device
     )
+
+
+def load_full_model_for_prefill(model_dir, dtype, device):
+    """Load the complete model used by Rank 2 in cloud-base prefill mode."""
+    config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        config=config,
+        torch_dtype=dtype,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+    )
+    model.eval()
+    model.to(device)
+    return model
