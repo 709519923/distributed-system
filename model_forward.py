@@ -251,6 +251,7 @@ def model_model_forward(
         input_ids, inputs_embeds, attention_mask_2d, position_ids
     )
     attention_mask = None
+    key_value_len = query_len
     if attention_mask_2d is not None:
         key_value_len = int(attention_mask_2d.shape[1])
         attention_mask = make_attention_mask(
@@ -271,6 +272,15 @@ def model_model_forward(
         kwargs["attention_mask"] = attention_mask
     if "position_ids" in signature.parameters:
         kwargs["position_ids"] = position_ids.contiguous()
+    if "cache_position" in signature.parameters:
+        # Cloud-base prefill rebuilds a DynamicCache outside this model object.
+        # Passing cache_position explicitly keeps Transformers from inferring a
+        # stale KV length from that external cache during one-token decode.
+        kwargs["cache_position"] = cache_position_for(
+            query_len,
+            key_value_len,
+            device,
+        ).contiguous()
     if "past_key_values" in signature.parameters:
         kwargs["past_key_values"] = past_key_values
     if "use_cache" in signature.parameters:
