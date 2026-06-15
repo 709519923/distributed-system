@@ -16,6 +16,7 @@ Keep launching this file exactly as before: python distributed_tinyllama_inferen
 """
 
 import socket
+import faulthandler
 
 import torch
 import torch.distributed as dist
@@ -49,6 +50,7 @@ def load_tokenizer(model_dir):
 
 def main():
     """Initialize NCCL, load this rank's model stage, then run the selected loop."""
+    faulthandler.enable(all_threads=True)
     args = parse_args()
     rank, world_size = get_rank_world_size()
     comm_device = resolve_cuda_device(args.cuda_device)

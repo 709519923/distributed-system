@@ -97,6 +97,7 @@ def prune_model_for_rank(model, rank, world_size, layer_start, layer_end):
     model.layers.0.
     """
     model.model.layers = nn.ModuleList(list(model.model.layers[layer_start:layer_end]))
+    renumber_local_layer_indices(model)
 
     if rank == 0:
         model.model.norm = nn.Identity()
@@ -108,6 +109,23 @@ def prune_model_for_rank(model, rank, world_size, layer_start, layer_end):
     if rank != world_size - 1:
         model.model.norm = nn.Identity()
         model.lm_head = nn.Identity()
+
+
+def renumber_local_layer_indices(model):
+    """Make pruned decoder layers use rank-local cache indices.
+
+    Hugging Face Llama layers can keep their original global layer_idx after we
+    slice model.model.layers. That is harmless when a rank creates its own cache
+    from scratch, but cloud-base receives a compact rank-local KV cache whose
+    layers are indexed [0, local_layer_count). Renumbering keeps transferred KV
+    caches, DynamicCache.update(), and the pruned ModuleList aligned.
+    """
+    for local_index, layer in enumerate(model.model.layers):
+        if hasattr(layer, "layer_idx"):
+            layer.layer_idx = local_index
+        self_attn = getattr(layer, "self_attn", None)
+        if self_attn is not None and hasattr(self_attn, "layer_idx"):
+            self_attn.layer_idx = local_index
 
 
 def original_checkpoint_key(local_key, rank, world_size, layer_start, config):
