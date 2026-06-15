@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+KV_CACHE_READY = 1
+
 
 def _cache_layers(past_key_values):
     """Return the layer list from a Transformers DynamicCache-like object."""
@@ -135,6 +137,24 @@ def _send_metadata_parallel(cache_by_rank, comm_device):
     return payloads
 
 
+def _send_ready_parallel(cache_by_rank, comm_device):
+    """Tell receivers that KV-cache payload transfer is about to begin.
+
+    Receiver-side timing waits for this tiny ready message first, then starts
+    the recv timer. That keeps model loading, full prefill, and cache splitting
+    time out of kv_cache_recv_time_ms.
+    """
+    works = []
+    payloads = []
+    for dst in sorted(cache_by_rank):
+        ready = torch.tensor([KV_CACHE_READY], dtype=torch.long, device=comm_device)
+        payloads.append(ready)
+        works.append(dist.isend(ready, dst=dst))
+    for work in works:
+        work.wait()
+    return payloads
+
+
 def _send_payload_parallel(cache_by_rank, comm_device, comm_dtype=None):
     """Send all key/value tensors with nonblocking sends and one final wait."""
     works = []
@@ -164,13 +184,23 @@ def send_kv_caches_parallel(cache_by_rank, comm_device, comm_dtype=None):
     time should be closer to the slower receiver than to the sum of both
     receiver times.
     """
+    ready_payloads = _send_ready_parallel(cache_by_rank, comm_device)
     start = time.perf_counter()
     metadata_payloads = _send_metadata_parallel(cache_by_rank, comm_device)
     tensor_payloads = _send_payload_parallel(cache_by_rank, comm_device, comm_dtype)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     # Keep tensors alive until all async work has completed.
-    _ = metadata_payloads, tensor_payloads
+    _ = ready_payloads, metadata_payloads, tensor_payloads
     return elapsed_ms
+
+
+def _recv_ready(src, comm_device):
+    """Wait until the sender announces that KV-cache transfer is ready."""
+    ready = torch.empty(1, dtype=torch.long, device=comm_device)
+    dist.recv(ready, src=src)
+    value = int(ready.item())
+    if value != KV_CACHE_READY:
+        raise RuntimeError(f"Expected KV cache ready signal {KV_CACHE_READY}, got {value}.")
 
 
 def recv_kv_cache(
@@ -181,7 +211,14 @@ def recv_kv_cache(
     transfer_dtype,
     compute_dtype,
 ):
-    """Receive one rank-local KV cache and rebuild it on compute_device."""
+    """Receive one rank-local KV cache and rebuild it on compute_device.
+
+    Waiting for the sender to finish full prefill is intentionally excluded from
+    kv_cache_recv_time_ms. The timer starts only after the ready signal arrives,
+    so it covers metadata receive, key/value receive, device/dtype conversion,
+    contiguous layout normalization, and DynamicCache reconstruction.
+    """
+    _recv_ready(src, comm_device)
     start = time.perf_counter()
     meta_len = 1 + int(expected_layer_count) * 8
     meta = torch.empty(meta_len, dtype=torch.long, device=comm_device)

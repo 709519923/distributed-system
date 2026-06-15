@@ -1,5 +1,10 @@
 # Version Log
 
+## 2026-06-15
+
+- Changed cloud-base `kv_cache_recv_time_ms` timing semantics. Rank 2 now sends a small ready signal to Rank 0 and Rank 1 immediately before KV-cache metadata/payload transfer. Receivers wait for that ready signal outside the timer, then measure only metadata receive, key/value tensor receive, device/dtype conversion, contiguous normalization, and DynamicCache rebuild.
+- Because the KV-cache transfer protocol now includes a ready signal, `kv_cache_transfer.py` must be synchronized to all ranks before running cloud-base mode.
+
 ## 2026-06-12
 
 - Changed `PREFILL_MODE` ownership: Rank 0 is now the only rank that decides `distributed` vs `cloud-base`. After NCCL initialization, Rank 0 broadcasts the effective mode to Rank 1 and Rank 2, and worker ranks overwrite their local default before entering any batch loop.
