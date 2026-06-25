@@ -161,7 +161,20 @@ def parse_args():
             "to Rank 0 and Rank 1."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--bandwidth",
+        type=float,
+        default=None,
+        help=(
+            "Optional simulated communication bandwidth cap in MB/s. "
+            "Only Rank 0 needs to set it; workers receive the value from Rank 0. "
+            "Omit this option to use the original communication path with no limit."
+        ),
+    )
+    args = parser.parse_args()
+    if args.bandwidth is not None and args.bandwidth <= 0:
+        parser.error("--bandwidth must be positive when provided.")
+    return args
 
 
 def parse_split_layers(value):

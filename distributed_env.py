@@ -121,3 +121,28 @@ def broadcast_prefill_mode(args, rank, device):
 
     args.prefill_mode = mode
     return mode
+
+
+def broadcast_bandwidth(args, rank, device):
+    """Broadcast Rank 0's optional bandwidth cap to every worker rank.
+
+    Rank 0 is the only source of truth for experiment-wide communication
+    throttling. A negative value means unlimited bandwidth and keeps the old
+    communication path. Worker CLI values are intentionally ignored so stale
+    scripts on Rank 1/2 cannot accidentally use a different bandwidth setting.
+    """
+    if rank == 0:
+        bandwidth_value = -1.0 if args.bandwidth is None else float(args.bandwidth)
+    else:
+        bandwidth_value = -1.0
+
+    tensor = torch.tensor([bandwidth_value], dtype=torch.float64, device=device)
+    dist.broadcast(tensor, src=0)
+    received = float(tensor.item())
+    if received < 0:
+        args.bandwidth = None
+        return None
+    if received <= 0:
+        raise RuntimeError(f"Received invalid bandwidth value: {received}")
+    args.bandwidth = received
+    return received

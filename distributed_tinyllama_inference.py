@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from config import default_boundaries_for_world_size, parse_args, stage_from_boundaries
 from distributed_env import (
+    broadcast_bandwidth,
     broadcast_prefill_mode,
     get_rank_world_size,
     init_process_group,
@@ -70,6 +71,11 @@ def main():
     try:
         effective_prefill_mode = broadcast_prefill_mode(args, rank, comm_device)
         print(f"[Rank {rank}] prefill_mode={effective_prefill_mode} (broadcast from Rank 0)")
+        effective_bandwidth = broadcast_bandwidth(args, rank, comm_device)
+        if effective_bandwidth is None:
+            print(f"[Rank {rank}] bandwidth=unlimited (broadcast from Rank 0)")
+        else:
+            print(f"[Rank {rank}] bandwidth={effective_bandwidth:.2f} MB/s (broadcast from Rank 0)")
         if args.prefill_mode == "cloud-base" and world_size != 3:
             raise RuntimeError("cloud-base prefill mode currently requires WORLD_SIZE=3.")
         if args.prefill_mode == "cloud-base" and not args.dynamic_load:

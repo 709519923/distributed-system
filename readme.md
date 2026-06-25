@@ -35,6 +35,7 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+BANDWIDTH=${BANDWIDTH:-}
 ```
 
 常用含义：
@@ -49,6 +50,7 @@ MODEL_DIR        TinyLlama 模型目录
 INPUT_CSV        Rank 0 读取的输入 CSV
 OUTPUT_CSV       Rank 0 写出的结果 CSV
 MAX_INPUT_TOKENS 输入 prompt 最大 token 长度
+BANDWIDTH        可选通信带宽上限，单位 MB/s；留空表示不限速
 ```
 
 ## Layer 分配
@@ -83,18 +85,22 @@ Rank 1 只处理中间层 hidden states，不再转发 Rank 2 生成的 token。
 
 `PREFILL_MODE` 只由 Rank 0 设置并主导。Rank 1 / Rank 2 不需要在命令行里传 `--prefill-mode`，程序启动后会通过 NCCL 从 Rank 0 接收最终模式。
 
-默认模式：
+默认模式在 `run.sh` 顶部设置：
 
 ```bash
-PREFILL_MODE=distributed ./run.sh 0
-./run.sh 1
-./run.sh 2
+PREFILL_MODE=${PREFILL_MODE:-distributed}
 ```
 
-cloud-base 模式：
+cloud-base 模式也在 `run.sh` 顶部修改：
 
 ```bash
-PREFILL_MODE=cloud-base ./run.sh 0
+PREFILL_MODE=${PREFILL_MODE:-cloud-base}
+```
+
+修改完成后，三台机器仍然只执行固定启动命令：
+
+```bash
+./run.sh 0
 ./run.sh 1
 ./run.sh 2
 ```
@@ -128,15 +134,41 @@ Rank 2 能加载完整 TinyLlama
 [Rank 2] Cloud-base: waiting for prefill inputs from Rank 0...
 ```
 
+## Bandwidth Simulation
+
+`BANDWIDTH` 是可选参数，只需要 Rank 0 设置。Rank 1 / Rank 2 不需要在命令行里传带宽参数，程序启动后会通过 NCCL 从 Rank 0 接收最终带宽配置。
+
+不限制带宽时，在 `run.sh` 顶部留空：
+
+```bash
+BANDWIDTH=${BANDWIDTH:-}
+```
+
+模拟 100 MB/s 带宽时，在 `run.sh` 顶部改为：
+
+```bash
+BANDWIDTH=${BANDWIDTH:-100}
+```
+
+修改完成后，三台机器仍然只执行固定启动命令：
+
+```bash
+./run.sh 0
+./run.sh 1
+./run.sh 2
+```
+
+`BANDWIDTH` 留空时，程序直接调用原来的通信函数，不进入带宽模拟协议。`BANDWIDTH` 为正数时，较大的 tensor payload 会改用 `bandwidth_transfer.py` 中的限速包装函数。这里的 MB 按 `1 MB = 1024 * 1024 bytes` 计算。
+
 ## Rank 0 CPU Compute
 
 如果希望 Rank 0 使用 CPU 计算前段模型，同时继续用 CUDA/NCCL 通信：
 
 ```bash
-COMPUTE_DEVICE=cpu ./run.sh 0
+COMPUTE_DEVICE=${COMPUTE_DEVICE:-cpu}
 ```
 
-Rank 1 和 Rank 2 不需要设置 `COMPUTE_DEVICE`，仍然使用 GPU。
+这个参数也在 `run.sh` 顶部修改，启动命令不变。Rank 1 和 Rank 2 不需要设置 `COMPUTE_DEVICE`，仍然使用 GPU。
 
 CPU compute 模式仍要求 Rank 0 有可用 CUDA 设备，因为跨节点通信仍走 NCCL。
 
@@ -180,8 +212,8 @@ kv_cache_recv_time_ms           cloud-base 下 Rank 0 / Rank 1 接收 KV cache �
 
 ## 排查建议
 
-1. 三台机器的代码必须完全一致，尤其是 `config.py`、`distributed_env.py`、`inference_loops.py`、`kv_cache_transfer.py`、`experiment_report.py`。
+1. 三台机器的代码必须完全一致，尤其是 `config.py`、`distributed_env.py`、`inference_loops.py`、`kv_cache_transfer.py`、`bandwidth_transfer.py`、`experiment_report.py`。
 2. 三台机器的 `WORLD_SIZE_VALUE`、`SPLIT_LAYERS`、`INIT_METHOD` 必须一致。
-3. 只有 Rank 0 需要设置 `PREFILL_MODE`；Rank 1 / Rank 2 应以广播结果为准。
+3. 只有 Rank 0 需要设置 `PREFILL_MODE` 和 `BANDWIDTH`；Rank 1 / Rank 2 应以广播结果为准。
 4. 如果 NCCL 报网络错误，优先检查 `NCCL_SOCKET_IFNAME` 是否是互通网卡。
 5. `cloud-base` 会让 Rank 2 同时持有完整 prefill model 和自己的 decode 分区，显存压力会高于 `distributed`。

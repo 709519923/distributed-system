@@ -57,17 +57,40 @@ from pipeline_comm import (
 from scheduler import Scheduler
 
 
-def send_hidden_from_rank0(hidden_states, dst, attention_mask_2d, comm_device, comm_dtype=None):
+def send_hidden_from_rank0(
+    hidden_states,
+    dst,
+    attention_mask_2d,
+    comm_device,
+    comm_dtype=None,
+    bandwidth_mbps=None,
+):
     """Move Rank 0 outputs to CUDA before NCCL send.
 
     Rank 0 can optionally compute on CPU. NCCL still requires CUDA tensors, so
     only the boundary tensor and mask are copied to comm_device for transport.
     """
-    send_hidden(
-        hidden_states.to(device=comm_device, dtype=comm_dtype, non_blocking=True),
-        dst=dst,
-        attention_mask_2d=attention_mask_2d.to(device=comm_device, non_blocking=True),
+    transfer_hidden_states = hidden_states.to(
+        device=comm_device,
+        dtype=comm_dtype,
+        non_blocking=True,
     )
+    transfer_attention_mask = attention_mask_2d.to(device=comm_device, non_blocking=True)
+    if bandwidth_mbps is None:
+        send_hidden(
+            transfer_hidden_states,
+            dst=dst,
+            attention_mask_2d=transfer_attention_mask,
+        )
+    else:
+        from bandwidth_transfer import send_hidden_limited
+
+        send_hidden_limited(
+            transfer_hidden_states,
+            dst=dst,
+            attention_mask_2d=transfer_attention_mask,
+            bandwidth_mbps=bandwidth_mbps,
+        )
 
 
 def build_prefill_metric(
@@ -218,6 +241,7 @@ def generate_rows_for_prompts(
             attention_mask_2d=attention_mask_2d,
             comm_device=comm_device,
             comm_dtype=comm_dtype,
+            bandwidth_mbps=args.bandwidth,
         )
         last_rank = world_size - 1
         next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
@@ -279,6 +303,7 @@ def generate_rows_for_prompts(
                 attention_mask_2d=attention_mask_2d,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
+                bandwidth_mbps=args.bandwidth,
             )
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
@@ -371,18 +396,41 @@ def generate_rows_for_prompts_cloud_base(
         f"[Rank 0] Cloud-base: sending prefill inputs to Rank {last_rank}; "
         f"input_ids_shape={tuple(input_ids.shape)}"
     )
-    send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
+    if args.bandwidth is None:
+        send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
+    else:
+        from bandwidth_transfer import send_prefill_inputs_limited
+
+        send_prefill_inputs_limited(
+            input_ids,
+            attention_mask_2d,
+            dst=last_rank,
+            comm_device=comm_device,
+            bandwidth_mbps=args.bandwidth,
+        )
     print("[Rank 0] Cloud-base: prefill inputs sent; waiting for local KV cache from Rank 2...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
-    rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
-        src=last_rank,
-        expected_layer_count=layer_end - layer_start,
-        comm_device=comm_device,
-        compute_device=device,
-        transfer_dtype=comm_dtype,
-        compute_dtype=getattr(model, "dtype", comm_dtype),
-    )
+    if args.bandwidth is None:
+        rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
+            src=last_rank,
+            expected_layer_count=layer_end - layer_start,
+            comm_device=comm_device,
+            compute_device=device,
+            transfer_dtype=comm_dtype,
+            compute_dtype=getattr(model, "dtype", comm_dtype),
+        )
+    else:
+        from bandwidth_transfer import recv_kv_cache_limited
+
+        rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache_limited(
+            src=last_rank,
+            expected_layer_count=layer_end - layer_start,
+            comm_device=comm_device,
+            compute_device=device,
+            transfer_dtype=comm_dtype,
+            compute_dtype=getattr(model, "dtype", comm_dtype),
+        )
     synchronize_cuda()
     memory_after = cuda_memory_allocated(device)
     memory_reserved_after = cuda_memory_reserved(device)
@@ -454,6 +502,7 @@ def generate_rows_for_prompts_cloud_base(
                 attention_mask_2d=attention_mask_2d,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
+                bandwidth_mbps=args.bandwidth,
             )
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
@@ -496,6 +545,7 @@ def release_model(model):
 
 
 def receive_cloud_base_cache_metric(
+    args,
     model,
     rank,
     world_size,
@@ -508,14 +558,26 @@ def receive_cloud_base_cache_metric(
     print(f"[Rank {rank}] Cloud-base: waiting for local KV cache from Rank {world_size - 1}...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
-    past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
-        src=world_size - 1,
-        expected_layer_count=layer_end - layer_start,
-        comm_device=device,
-        compute_device=device,
-        transfer_dtype=getattr(model, "dtype", torch.float16),
-        compute_dtype=getattr(model, "dtype", torch.float16),
-    )
+    if args.bandwidth is None:
+        past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
+            src=world_size - 1,
+            expected_layer_count=layer_end - layer_start,
+            comm_device=device,
+            compute_device=device,
+            transfer_dtype=getattr(model, "dtype", torch.float16),
+            compute_dtype=getattr(model, "dtype", torch.float16),
+        )
+    else:
+        from bandwidth_transfer import recv_kv_cache_limited
+
+        past_key_values, kv_cache_recv_time_ms = recv_kv_cache_limited(
+            src=world_size - 1,
+            expected_layer_count=layer_end - layer_start,
+            comm_device=device,
+            compute_device=device,
+            transfer_dtype=getattr(model, "dtype", torch.float16),
+            compute_dtype=getattr(model, "dtype", torch.float16),
+        )
     synchronize_cuda()
     memory_after = cuda_memory_allocated(device)
     memory_reserved_after = cuda_memory_reserved(device)
@@ -557,7 +619,12 @@ def run_rank2_cloud_base_prefill(
 ):
     """Let Rank 2 full-prefill a batch, distribute KV cache, and return first token."""
     print("[Rank 2] Cloud-base: waiting for prefill inputs from Rank 0...")
-    input_ids, attention_mask_2d = recv_prefill_inputs(src=0, device=device)
+    if args.bandwidth is None:
+        input_ids, attention_mask_2d = recv_prefill_inputs(src=0, device=device)
+    else:
+        from bandwidth_transfer import recv_prefill_inputs_limited
+
+        input_ids, attention_mask_2d = recv_prefill_inputs_limited(src=0, device=device)
     batch_size = int(input_ids.shape[0])
     input_seq_len_max = int(attention_mask_2d.shape[1])
     input_seq_len_avg = float(attention_mask_2d.sum(dim=1).float().mean().item())
@@ -590,11 +657,21 @@ def run_rank2_cloud_base_prefill(
     rank2_past_key_values = cache_by_rank[world_size - 1]
     transfer_targets = {0: cache_by_rank[0], 1: cache_by_rank[1]}
     print("[Rank 2] Cloud-base: sending KV cache partitions to Rank 0 and Rank 1...")
-    kv_cache_send_time_ms = send_kv_caches_parallel(
-        transfer_targets,
-        comm_device=device,
-        comm_dtype=comm_dtype,
-    )
+    if args.bandwidth is None:
+        kv_cache_send_time_ms = send_kv_caches_parallel(
+            transfer_targets,
+            comm_device=device,
+            comm_dtype=comm_dtype,
+        )
+    else:
+        from bandwidth_transfer import send_kv_caches_parallel_limited
+
+        kv_cache_send_time_ms = send_kv_caches_parallel_limited(
+            transfer_targets,
+            comm_device=device,
+            bandwidth_mbps=args.bandwidth,
+            comm_dtype=comm_dtype,
+        )
     print(
         f"[Rank 2] Cloud-base: KV cache partitions sent in "
         f"{kv_cache_send_time_ms:.2f} ms; sending first token to Rank 0."
@@ -955,7 +1032,17 @@ def handle_worker_batch(
                     prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
                     memory_after = cuda_memory_allocated(device)
                     memory_reserved_after = cuda_memory_reserved(device)
-                send_hidden(output_hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
+                if args.bandwidth is None:
+                    send_hidden(output_hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
+                else:
+                    from bandwidth_transfer import send_hidden_limited
+
+                    send_hidden_limited(
+                        output_hidden_states,
+                        dst=next_rank,
+                        attention_mask_2d=attention_mask_2d,
+                        bandwidth_mbps=args.bandwidth,
+                    )
                 if not is_prefill:
                     synchronize_cuda()
                     decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
@@ -1028,6 +1115,7 @@ def pipeline_serve_static(
                 )
             else:
                 initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
+                    args,
                     model,
                     rank,
                     world_size,
@@ -1149,6 +1237,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                     )
                 else:
                     initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
+                        args,
                         model,
                         rank,
                         world_size,

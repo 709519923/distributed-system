@@ -12,6 +12,7 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+BANDWIDTH=${BANDWIDTH:-}
 
 RANK_ARG=$1
 
@@ -31,7 +32,13 @@ else
     PREFILL_MODE_TEXT="receive-from-rank0"
 fi
 
-echo "[run.sh] RANK=$RANK_ARG WORLD_SIZE=$WORLD_SIZE_VALUE PREFILL_MODE=$PREFILL_MODE_TEXT BATCH_SIZE=$BATCH_SIZE SPLIT_LAYERS=$SPLIT_LAYERS INIT_METHOD=$INIT_METHOD COMPUTE_DEVICE=$COMPUTE_DEVICE"
+if [ -n "$BANDWIDTH" ]; then
+    BANDWIDTH_TEXT="${BANDWIDTH}MBps(rank0-broadcast)"
+else
+    BANDWIDTH_TEXT="unlimited"
+fi
+
+echo "[run.sh] RANK=$RANK_ARG WORLD_SIZE=$WORLD_SIZE_VALUE PREFILL_MODE=$PREFILL_MODE_TEXT BANDWIDTH=$BANDWIDTH_TEXT BATCH_SIZE=$BATCH_SIZE SPLIT_LAYERS=$SPLIT_LAYERS INIT_METHOD=$INIT_METHOD COMPUTE_DEVICE=$COMPUTE_DEVICE"
 
 if [ "$RANK_ARG" = "0" ]; then
     export WORLD_SIZE=$WORLD_SIZE_VALUE
@@ -39,10 +46,16 @@ if [ "$RANK_ARG" = "0" ]; then
     export NCCL_SOCKET_IFNAME=eth0
     export NCCL_DEBUG=INFO
 
+    BANDWIDTH_ARGS=()
+    if [ -n "$BANDWIDTH" ]; then
+        BANDWIDTH_ARGS=(--bandwidth "$BANDWIDTH")
+    fi
+
     python distributed_tinyllama_inference.py \
       --lazy-load \
       --dynamic-load \
       --prefill-mode $PREFILL_MODE \
+      "${BANDWIDTH_ARGS[@]}" \
       --batch-size $BATCH_SIZE \
       --split-layers $SPLIT_LAYERS \
       --compute-device $COMPUTE_DEVICE \
