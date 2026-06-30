@@ -778,7 +778,7 @@ def rank0_generate(
 
 
 def boundaries_for_batch(args, scheduler, default_boundaries, batch_number):
-    """Return fixed split boundaries unless --allocation-csv was explicitly set."""
+    """Return Scheduler boundaries when configured, otherwise fixed boundaries."""
     if args.allocation_csv:
         allocation = scheduler.get_or_create(batch_number)
         return allocation.boundaries, allocation
@@ -804,9 +804,11 @@ def rank0_generate_dynamic(
 ):
     """Rank 0 dynamic-loading driver.
 
-    If --allocation-csv is omitted, every batch uses --split-layers as a fixed
-    partition. If --allocation-csv is provided, Scheduler controls each batch's
-    partition. KV cache is always per-batch and is rebuilt after every batch.
+    With the standard run.sh entry point, Rank 0 always provides scheduler.csv
+    and the Scheduler controls each batch's partition. If the script is started
+    manually without --allocation-csv, every batch uses --split-layers as a
+    fixed partition. KV cache is always per-batch and is rebuilt after every
+    batch.
     """
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
@@ -919,6 +921,9 @@ def rank0_generate_dynamic(
 
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
+            if scheduler is not None:
+                scheduler.update_rank_metrics_from_records(records, batch=batch_number)
+                scheduler.reallocate_layer(batch=batch_number + 1)
             append_experiment_log(log_path, records)
             update_summary(summary_by_rank, records)
             append_summary_log(log_path, summary_by_rank, batch_number)

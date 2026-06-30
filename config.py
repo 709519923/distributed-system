@@ -132,8 +132,8 @@ def parse_args():
         "--allocation-csv",
         default=None,
         help=(
-            "Optional Scheduler allocation CSV path. If omitted, every batch uses "
-            "--split-layers as a fixed layer partition."
+            "Rank 0 Scheduler CSV path. When provided, missing batches are created "
+            "from the latest allocation, starting with --split-layers."
         ),
     )
     parser.add_argument(

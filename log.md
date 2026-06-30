@@ -1,5 +1,26 @@
 # Version Log
 
+## 2026-06-30
+
+### Scheduler is now mandatory on Rank 0
+
+- Re-enabled the scheduler as the default Rank 0 layer-allocation mechanism. `run.sh` now defines `SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}` and passes `--allocation-csv $SCHEDULER_CSV` only in the Rank 0 command.
+- No extra enable or rebuild switch was added. The scheduler is now expected to exist as part of normal execution. If `scheduler.csv` does not exist, Rank 0 creates it automatically from the current `SPLIT_LAYERS` / `--split-layers` default partition.
+- Rank 0 remains the single source of truth for layer boundaries. Rank 1 and Rank 2 do not pass `--allocation-csv`; they receive boundaries through `broadcast_boundaries()` at the start of every batch. This avoids stale local scheduler files causing workers to choose a different split.
+- Missing batches inherit the latest known scheduler allocation. For example, if `scheduler.csv` only contains batch 1, then batch 2 and later continue using the batch 1 split until a later batch row is explicitly recorded.
+- Extended `scheduler.py` with rank metric storage fields: `rank_metrics`, `rank0_data`, `rank1_data`, and `rank2_data`. Rank 0 updates these fields after receiving all per-rank metric records for a completed batch.
+- Added `update_rank_metrics()` and `update_rank_metrics_from_records()` to keep the latest per-rank data inside the scheduler. These methods are intentionally light-weight and do not change the CSV by themselves.
+- Added the reserved method `reallocate_layer()`. In this version it is a no-op policy hook: it returns the latest known allocation for the requested next batch and does not mutate `scheduler.csv`. Future adaptive scheduling can implement real rules here, using `rank0_data`, `rank1_data`, and `rank2_data` as inputs.
+- The current batch loop calls the scheduler hook after batch metrics have been collected and before writing the batch log. This gives future reallocation logic a stable place to run: "batch finished -> metrics collected -> scheduler may decide next allocation".
+
+### Files changed
+
+- `run.sh`: added `SCHEDULER_CSV`, included it in the startup echo, and passed `--allocation-csv` only to Rank 0.
+- `scheduler.py`: renamed the documentation language from `allocation.csv` ownership to Rank 0 `scheduler.csv` ownership, added rank metric storage, and added the reserved `reallocate_layer()` hook.
+- `inference_loops.py`: Rank 0 now forwards completed-batch metric records into the scheduler and calls the reserved reallocation hook for the next batch.
+- `config.py`: updated `--allocation-csv` help text to match the Rank 0 scheduler behavior.
+- `readme.md`: rewritten as the current run guide and documented the mandatory scheduler behavior.
+
 ## 2026-06-17
 
 ### Bandwidth simulation design

@@ -1,8 +1,9 @@
 """
 Batch allocation scheduler for two-rank and three-rank TinyLlama inference.
 
-The scheduler owns allocation.csv. Each row records which decoder-layer interval
-belongs to each rank for a given batch.
+The scheduler owns scheduler.csv. Each row records which decoder-layer interval
+belongs to each rank for a given batch. Rank 0 is the scheduler owner; worker
+ranks use the boundaries broadcast by Rank 0.
 
 Two-node example:
 
@@ -14,7 +15,7 @@ Three-node example:
     batch,rank0,rank1,rank2
     1,"[0,5)","[5,15)","[15,22)"
 
-If allocation.csv already contains a row for a batch, that row wins. Otherwise
+If scheduler.csv already contains a row for a batch, that row wins. Otherwise
 the scheduler inherits the latest earlier allocation and continues inference
 with that split. The default boundaries are only used when there is no earlier
 allocation at all.
@@ -71,7 +72,7 @@ class Allocation:
 
 
 def format_interval(start, end):
-    """Return the allocation.csv interval representation."""
+    """Return the scheduler.csv interval representation."""
     return f"[{start},{end})"
 
 
@@ -92,12 +93,11 @@ def boundaries_to_intervals(boundaries):
 
 
 class Scheduler:
-    """Maintain per-batch layer allocations in allocation.csv.
+    """Maintain per-batch layer allocations in scheduler.csv.
 
     Rank 0 calls get_or_create() to choose a batch allocation, then broadcasts
-    allocation.boundaries to the other ranks. Non-master ranks call
-    record_allocation() with the received boundaries so each node keeps a local
-    allocation.csv for debugging.
+    allocation.boundaries to the other ranks. Worker ranks do not need a local
+    scheduler file; the Rank 0 scheduler file is the single source of truth.
     """
 
     def __init__(self, allocation_csv, total_layers, default_boundaries, world_size):
@@ -107,6 +107,14 @@ class Scheduler:
         self.default_boundaries = [int(value) for value in default_boundaries]
         self.fieldnames = ["batch"] + [f"rank{rank}" for rank in range(self.world_size)]
         self.allocations = {}
+        # These fields are reserved for future adaptive scheduling. Today the
+        # scheduler records the latest per-rank metrics but does not change the
+        # layer split automatically.
+        self.rank_metrics = {rank: None for rank in range(self.world_size)}
+        self.rank0_data = None
+        self.rank1_data = None
+        self.rank2_data = None
+        self.latest_rank_metrics_batch = None
 
         self._validate_boundaries(self.default_boundaries)
         self._load_existing_file()
@@ -114,7 +122,7 @@ class Scheduler:
     def get_or_create(self, batch):
         """Return the allocation for batch, inheriting the latest split if needed.
 
-        Example: if allocation.csv only defines batch 1 and batch 20, then batch
+        Example: if scheduler.csv only defines batch 1 and batch 20, then batch
         2-19 inherit batch 1, and batch 21+ inherit batch 20.
         """
         batch = int(batch)
@@ -134,8 +142,55 @@ class Scheduler:
         self.save()
         return allocation
 
+    def update_rank_metrics(self, rank, metrics, batch=None):
+        """Store the latest metrics reported by one rank.
+
+        The current project logs metrics after every batch. Future scheduling
+        policies can read rank0_data/rank1_data/rank2_data or rank_metrics to
+        decide whether the next batch should move layers between ranks.
+        """
+        rank = int(rank)
+        if rank < 0 or rank >= self.world_size:
+            raise ValueError(f"rank {rank} is outside WORLD_SIZE={self.world_size}")
+
+        snapshot = dict(metrics) if metrics is not None else None
+        self.rank_metrics[rank] = snapshot
+        if rank == 0:
+            self.rank0_data = snapshot
+        elif rank == 1:
+            self.rank1_data = snapshot
+        elif rank == 2:
+            self.rank2_data = snapshot
+
+        if batch is not None:
+            self.latest_rank_metrics_batch = int(batch)
+
+    def update_rank_metrics_from_records(self, records, batch=None):
+        """Store all per-rank metric records received after one batch."""
+        for record in records:
+            if not isinstance(record, dict) or "rank" not in record:
+                continue
+            record_batch = batch if batch is not None else record.get("batch")
+            self.update_rank_metrics(record["rank"], record, batch=record_batch)
+
+    def reallocate_layer(self, batch=None, rank_metrics=None):
+        """Reserved hook for future adaptive layer reallocation.
+
+        For now this method intentionally keeps the latest known allocation.
+        It returns the boundaries that would be used for batch without mutating
+        scheduler.csv. When the adaptive policy is designed, this is the method
+        to extend with rules based on rank0/rank1/rank2 metrics.
+        """
+        _ = rank_metrics if rank_metrics is not None else self.rank_metrics
+        if batch is None:
+            if self.allocations:
+                batch = max(self.allocations) + 1
+            else:
+                return list(self.default_boundaries)
+        return list(self._latest_boundaries_before(int(batch)))
+
     def save(self):
-        """Write all known allocations to allocation.csv in batch order."""
+        """Write all known allocations to scheduler.csv in batch order."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
@@ -148,7 +203,7 @@ class Scheduler:
                 writer.writerow(row)
 
     def _load_existing_file(self):
-        """Load allocation.csv if it already exists."""
+        """Load scheduler.csv if it already exists."""
         if not self.path.exists():
             return
 
