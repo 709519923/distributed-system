@@ -11,6 +11,8 @@ import os
 import torch
 import torch.distributed as dist
 
+from environment import Environment
+
 PREFILL_MODE_TO_CODE = {
     "distributed": 0,
     "cloud-base": 1,
@@ -123,26 +125,15 @@ def broadcast_prefill_mode(args, rank, device):
     return mode
 
 
-def broadcast_bandwidth(args, rank, device):
-    """Broadcast Rank 0's optional bandwidth cap to every worker rank.
-
-    Rank 0 is the only source of truth for experiment-wide communication
-    throttling. A negative value means unlimited bandwidth and keeps the old
-    communication path. Worker CLI values are intentionally ignored so stale
-    scripts on Rank 1/2 cannot accidentally use a different bandwidth setting.
-    """
+def broadcast_environment(environment, rank, device):
+    """Broadcast the active Environment snapshot from Rank 0 to all workers."""
     if rank == 0:
-        bandwidth_value = -1.0 if args.bandwidth is None else float(args.bandwidth)
+        values = environment.to_broadcast_values()
     else:
-        bandwidth_value = -1.0
+        values = [0.0] * (Environment.LINK_COUNT * 2)
 
-    tensor = torch.tensor([bandwidth_value], dtype=torch.float64, device=device)
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
     dist.broadcast(tensor, src=0)
-    received = float(tensor.item())
-    if received < 0:
-        args.bandwidth = None
-        return None
-    if received <= 0:
-        raise RuntimeError(f"Received invalid bandwidth value: {received}")
-    args.bandwidth = received
-    return received
+    if rank == 0:
+        return environment
+    return Environment.from_broadcast_values(tensor.tolist())

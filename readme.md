@@ -36,7 +36,6 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
-BANDWIDTH=${BANDWIDTH:-}
 ```
 
 常用含义：
@@ -52,7 +51,6 @@ MODEL_DIR        TinyLlama 模型目录
 INPUT_CSV        Rank 0 读取的输入 CSV
 OUTPUT_CSV       Rank 0 写出的结果 CSV
 MAX_INPUT_TOKENS 输入 prompt 最大 token 长度
-BANDWIDTH        可选通信带宽上限，单位 MB/s；留空表示不限速
 ```
 
 修改参数时，直接改 `run.sh` 顶部配置块。三台机器的启动命令仍然固定为 `./run.sh 0`、`./run.sh 1`、`./run.sh 2`。
@@ -126,18 +124,58 @@ WORLD_SIZE_VALUE=3
 Rank 2 能加载完整 TinyLlama
 ```
 
-## Bandwidth Simulation
+## Environment Simulation
 
-`BANDWIDTH` 是可选参数，只需要 Rank 0 设置。Rank 1 / Rank 2 不需要在命令行里传带宽参数，程序启动后会通过 NCCL 从 Rank 0 接收最终带宽配置。
+通信环境不再通过 `run.sh` 设置。现在统一在 `environment.py` 中配置，并由 Rank 0 广播给 Rank 1 / Rank 2。
 
-`BANDWIDTH` 留空时，程序直接调用原来的通信函数，不进入带宽模拟协议。
-
-`BANDWIDTH` 为正数时，较大的 tensor payload 会改用 `bandwidth_transfer.py` 中的限速包装函数。这里的 MB 按 `1 MB = 1024 * 1024 bytes` 计算。限速逻辑会先测真实传输时间，再只补足到目标传输时间：
+`environment.py` 维护 5 条真实通信链路：
 
 ```text
-target_seconds = payload_bytes / (bandwidth_MBps * 1024 * 1024)
-extra_sleep = max(0, target_seconds - real_elapsed_seconds)
+Bandwidth[0], time_comm_delay[0] = Rank 0 -> Rank 1
+Bandwidth[1], time_comm_delay[1] = Rank 1 -> Rank 2
+Bandwidth[2], time_comm_delay[2] = Rank 2 -> Rank 0
+Bandwidth[3], time_comm_delay[3] = Rank 0 -> Rank 2
+Bandwidth[4], time_comm_delay[4] = Rank 2 -> Rank 1
 ```
+
+默认配置：
+
+```python
+DEFAULT_BANDWIDTH = [None, None, None, None, None]
+DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
+DEFAULT_SCHEDULE = {}
+```
+
+含义：
+
+```text
+Bandwidth: MB/s；None 表示该链路不限速
+time_comm_delay: ms；表示固定单向通信时延
+```
+
+模拟公式：
+
+```text
+target_seconds = payload_bytes / (Bandwidth[i] * 1024 * 1024)
+delay_seconds = time_comm_delay[i] / 1000
+expected_seconds = target_seconds + delay_seconds
+extra_sleep = max(0, expected_seconds - real_elapsed_seconds)
+```
+
+实际代码只补足真实 NCCL 通信没有覆盖的部分，避免真实通信已经很慢时被重复惩罚。
+
+预留 batch 后变化：
+
+```python
+DEFAULT_SCHEDULE = {
+    10: {
+        "Bandwidth": [100, 80, 120, 60, 70],
+        "time_comm_delay": [1.0, 1.5, 2.0, 5.0, 4.0],
+    }
+}
+```
+
+表示从 batch 10 开始切换到新的网络环境。动态模式中，每个 batch 开始时 Rank 0 会应用当前 batch 的环境配置并广播。
 
 ## Rank 0 CPU Compute
 
@@ -189,9 +227,9 @@ kv_cache_recv_time_ms           cloud-base 中 Rank 0 / Rank 1 接收并重建 K
 
 ## 排查建议
 
-1. 三台机器的代码必须完全一致，尤其是 `config.py`、`distributed_env.py`、`inference_loops.py`、`pipeline_comm.py`、`kv_cache_transfer.py`、`bandwidth_transfer.py`、`scheduler.py`、`experiment_report.py`。
+1. 三台机器的代码必须完全一致，尤其是 `config.py`、`distributed_env.py`、`environment.py`、`inference_loops.py`、`pipeline_comm.py`、`kv_cache_transfer.py`、`bandwidth_transfer.py`、`scheduler.py`、`experiment_report.py`。
 2. 三台机器的 `WORLD_SIZE_VALUE`、`SPLIT_LAYERS`、`INIT_METHOD` 必须一致。
-3. 只有 Rank 0 需要设置 `PREFILL_MODE`、`BANDWIDTH`、`SCHEDULER_CSV`；Rank 1 / Rank 2 应以广播结果为准。
+3. 只有 Rank 0 需要设置 `PREFILL_MODE`、`SCHEDULER_CSV` 和 `environment.py` 中的环境参数；Rank 1 / Rank 2 应以广播结果为准。
 4. 如果 NCCL 报网络错误，优先检查 `NCCL_SOCKET_IFNAME` 是否是互通网卡。
 5. 如果 scheduler 行为不符合预期，先检查 Rank 0 本地的 `scheduler.csv` 是否存在、表头是否为 `batch,rank0,rank1,rank2`、对应 batch 是否有明确分配。
 6. `cloud-base` 会让 Rank 2 同时持有完整 prefill model 和自己的 decode 分区，显存压力会高于 `distributed`。

@@ -1,5 +1,105 @@
 # Version Log
 
+## 2026-07-06
+
+### Environment-based per-link bandwidth and delay simulation
+
+- Replaced the old single `--bandwidth` / `BANDWIDTH` experiment interface with a Rank-0-owned `Environment` class in `environment.py`. Network simulation is no longer configured from `run.sh`; it is configured by editing `environment.py` on Rank 0 and then broadcasting the active snapshot to worker ranks.
+- `Environment` now models five real directed links. The index order is fixed because later multi-arm-bandit code will need a stable state vector:
+
+  ```text
+                 [3] 0 -> 2
+              +--------------+
+              |              v
+  Rank 0 --[0]--> Rank 1 --[1]--> Rank 2
+     ^                              |
+     |                              |
+     +----------- [2] 2 -> 0 <------+
+
+  Extra cloud-base KV link:
+
+  Rank 2 --[4]--> Rank 1
+  ```
+
+  The corresponding arrays are:
+
+  ```text
+  Bandwidth[0],       time_comm_delay[0] = Rank 0 -> Rank 1
+  Bandwidth[1],       time_comm_delay[1] = Rank 1 -> Rank 2
+  Bandwidth[2],       time_comm_delay[2] = Rank 2 -> Rank 0
+  Bandwidth[3],       time_comm_delay[3] = Rank 0 -> Rank 2
+  Bandwidth[4],       time_comm_delay[4] = Rank 2 -> Rank 1
+  ```
+
+- `Bandwidth` uses MB/s, where `1 MB = 1024 * 1024 bytes`. A value of `None` means unlimited bandwidth on that specific link. `time_comm_delay` uses milliseconds and represents fixed one-way communication delay on that specific link.
+- Default values are defined at the top of `environment.py`:
+
+  ```python
+  DEFAULT_BANDWIDTH = [None, None, None, None, None]
+  DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
+  DEFAULT_SCHEDULE = {}
+  ```
+
+- The simulated target time for a payload on link `i` is:
+
+  ```text
+  bandwidth_seconds = payload_bytes / (Bandwidth[i] * 1024 * 1024)
+  delay_seconds = time_comm_delay[i] / 1000
+  expected_seconds = bandwidth_seconds + delay_seconds
+  extra_sleep = max(0, expected_seconds - real_nccl_elapsed_seconds)
+  ```
+
+  This keeps the old "do not punish slow real communication twice" rule. If real NCCL transfer is already slower than the configured target, no extra sleep is added.
+- Batch-level environment changes are reserved through `DEFAULT_SCHEDULE`. A key means "from this batch onward":
+
+  ```python
+  DEFAULT_SCHEDULE = {
+      10: {
+          "Bandwidth": [100, 80, 120, 60, 70],
+          "time_comm_delay": [1.0, 1.5, 2.0, 5.0, 4.0],
+      }
+  }
+  ```
+
+  In dynamic mode, Rank 0 calls `environment.apply_batch(batch_number)` at the start of each batch, then broadcasts the active environment to Rank 1 and Rank 2. Worker ranks do not apply their local schedule; they trust Rank 0's broadcast snapshot.
+- Communication mapping:
+
+  ```text
+  distributed / decode:
+    Rank 0 -> Rank 1 hidden states use link [0]
+    Rank 1 -> Rank 2 hidden states use link [1]
+    Rank 2 -> Rank 0 next token uses link [2]
+
+  cloud-base prefill:
+    Rank 0 -> Rank 2 input_ids + attention_mask use link [3]
+    Rank 2 -> Rank 0 KV cache partition uses link [2]
+    Rank 2 -> Rank 1 KV cache partition uses link [4]
+  ```
+
+- `bandwidth_transfer.py` remains the wrapper module name, but its behavior is now Environment-based. It checks per-link bandwidth and per-link delay instead of reading one global bandwidth scalar.
+- Cloud-base KV cache still uses a `ready -> metadata -> payload -> done` protocol when either `2 -> 0` or `2 -> 1` has simulation enabled. Both receivers use the same limited receive protocol in that case, so the extra `done` message is consumed consistently.
+- Token return `Rank 2 -> Rank 0` now also uses Environment delay when link `[2]` is configured. Because token return has no explicit `done` handshake, the delay is applied before sending the token so Rank 0's `recv_token()` actually waits for the simulated one-way delay.
+- `Scheduler` now stores the active environment snapshot after each completed batch through `update_environment_data()`. The data is kept in:
+
+  ```text
+  scheduler.environment_data
+  scheduler.environment_history[batch_number]
+  ```
+
+  Each snapshot contains `Bandwidth[0..4]`, `time_comm_delay[0..4]`, the active batch number, and link names. The current `reallocate_layer()` policy still does not change layer allocation; this environment history is reserved as future multi-arm-bandit input.
+
+### Files changed
+
+- `environment.py`: added the new Environment class, five-link index convention, default bandwidth/delay arrays, batch schedule, broadcast serialization, and timing helpers.
+- `distributed_env.py`: replaced the old single-value `broadcast_bandwidth()` with `broadcast_environment()`.
+- `distributed_tinyllama_inference.py`: initializes Environment, broadcasts the initial snapshot, prints the active environment, and passes it into inference loops.
+- `inference_loops.py`: applies and broadcasts Environment per dynamic batch, routes each communication path to the correct link, and forwards environment snapshots to Scheduler.
+- `bandwidth_transfer.py`: changed wrappers from global-bandwidth simulation to Environment-based per-link simulation.
+- `scheduler.py`: added `environment_data` and `environment_history` for future bandit decisions.
+- `config.py`: removed `--bandwidth`.
+- `run.sh`: removed `BANDWIDTH`; startup commands are unchanged.
+- `readme.md`: replaced the Bandwidth section with Environment usage and the five-link index table.
+
 ## 2026-06-30
 
 ### Scheduler is now mandatory on Rank 0

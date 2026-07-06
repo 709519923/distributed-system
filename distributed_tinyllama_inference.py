@@ -8,9 +8,10 @@ relevant module:
 - model_loader.py: full loading, lazy loading, layer pruning.
 - model_forward.py: attention mask, position ids, per-rank forward pass.
 - pipeline_comm.py: NCCL send/recv protocol and dynamic boundary broadcast.
+- environment.py: per-link bandwidth and communication-delay simulation.
 - csv_io.py: prompt CSV input and output CSV writing.
 - inference_loops.py: Rank 0 generation and worker service loops.
-- scheduler.py: dynamic allocation.csv management.
+- scheduler.py: dynamic scheduler.csv management.
 
 Keep launching this file exactly as before: python distributed_tinyllama_inference.py ...
 """
@@ -24,7 +25,7 @@ from transformers import AutoTokenizer
 
 from config import default_boundaries_for_world_size, parse_args, stage_from_boundaries
 from distributed_env import (
-    broadcast_bandwidth,
+    broadcast_environment,
     broadcast_prefill_mode,
     get_rank_world_size,
     init_process_group,
@@ -32,6 +33,7 @@ from distributed_env import (
     resolve_cuda_device,
     resolve_dtype,
 )
+from environment import Environment
 from inference_loops import (
     pipeline_serve_dynamic,
     pipeline_serve_static,
@@ -53,6 +55,8 @@ def main():
     """Initialize NCCL, load this rank's model stage, then run the selected loop."""
     faulthandler.enable(all_threads=True)
     args = parse_args()
+    environment = Environment()
+    environment.apply_batch(1)
     rank, world_size = get_rank_world_size()
     comm_device = resolve_cuda_device(args.cuda_device)
     model_device = resolve_compute_device(args.compute_device, rank, comm_device)
@@ -71,11 +75,8 @@ def main():
     try:
         effective_prefill_mode = broadcast_prefill_mode(args, rank, comm_device)
         print(f"[Rank {rank}] prefill_mode={effective_prefill_mode} (broadcast from Rank 0)")
-        effective_bandwidth = broadcast_bandwidth(args, rank, comm_device)
-        if effective_bandwidth is None:
-            print(f"[Rank {rank}] bandwidth=unlimited (broadcast from Rank 0)")
-        else:
-            print(f"[Rank {rank}] bandwidth={effective_bandwidth:.2f} MB/s (broadcast from Rank 0)")
+        environment = broadcast_environment(environment, rank, comm_device)
+        print(f"[Rank {rank}] environment={environment.describe()} (broadcast from Rank 0)")
         if args.prefill_mode == "cloud-base" and world_size != 3:
             raise RuntimeError("cloud-base prefill mode currently requires WORLD_SIZE=3.")
         if args.prefill_mode == "cloud-base" and not args.dynamic_load:
@@ -99,9 +100,10 @@ def main():
                     model_device,
                     comm_device,
                     comm_dtype=comm_dtype,
+                    environment=environment,
                 )
             else:
-                pipeline_serve_dynamic(args, rank, world_size, dtype, comm_device)
+                pipeline_serve_dynamic(args, rank, world_size, dtype, comm_device, environment=environment)
 
             dist.barrier()
             print(f"[Rank {rank}] SUCCESS")
@@ -140,9 +142,19 @@ def main():
                 boundaries=boundaries,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
+                environment=environment,
             )
         else:
-            pipeline_serve_static(args, model, rank, world_size, comm_device, layer_start, layer_end)
+            pipeline_serve_static(
+                args,
+                model,
+                rank,
+                world_size,
+                comm_device,
+                layer_start,
+                layer_end,
+                environment=environment,
+            )
 
         dist.barrier()
         print(f"[Rank {rank}] SUCCESS")

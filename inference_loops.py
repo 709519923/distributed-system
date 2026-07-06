@@ -12,6 +12,7 @@ import torch
 
 from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_from_boundaries
 from csv_io import chunk_items, read_prompts, write_output_rows
+from distributed_env import broadcast_environment
 from experiment_report import (
     append_experiment_log,
     append_summary_log,
@@ -57,13 +58,30 @@ from pipeline_comm import (
 from scheduler import Scheduler
 
 
+def cloud_base_kv_transfer_has_effect(environment, src_rank, world_size):
+    """Return True when any cloud-base KV target link uses Environment simulation."""
+    if environment is None:
+        return False
+    return any(environment_link_has_effect(environment, src_rank, dst) for dst in range(world_size - 1))
+
+
+def environment_link_has_effect(environment, src_rank, dst_rank):
+    """Undefined links are treated as unlimited/no-delay for compatibility."""
+    if environment is None:
+        return False
+    try:
+        return environment.has_effect(src_rank, dst_rank)
+    except ValueError:
+        return False
+
+
 def send_hidden_from_rank0(
     hidden_states,
     dst,
     attention_mask_2d,
     comm_device,
     comm_dtype=None,
-    bandwidth_mbps=None,
+    environment=None,
 ):
     """Move Rank 0 outputs to CUDA before NCCL send.
 
@@ -76,7 +94,7 @@ def send_hidden_from_rank0(
         non_blocking=True,
     )
     transfer_attention_mask = attention_mask_2d.to(device=comm_device, non_blocking=True)
-    if bandwidth_mbps is None:
+    if not environment_link_has_effect(environment, 0, dst):
         send_hidden(
             transfer_hidden_states,
             dst=dst,
@@ -89,7 +107,8 @@ def send_hidden_from_rank0(
             transfer_hidden_states,
             dst=dst,
             attention_mask_2d=transfer_attention_mask,
-            bandwidth_mbps=bandwidth_mbps,
+            environment=environment,
+            src=0,
         )
 
 
@@ -167,6 +186,7 @@ def generate_rows_for_prompts(
     log_path,
     comm_device=None,
     comm_dtype=None,
+    environment=None,
     start_index=0,
     total_count=None,
 ):
@@ -241,7 +261,7 @@ def generate_rows_for_prompts(
             attention_mask_2d=attention_mask_2d,
             comm_device=comm_device,
             comm_dtype=comm_dtype,
-            bandwidth_mbps=args.bandwidth,
+            environment=environment,
         )
         last_rank = world_size - 1
         next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
@@ -303,7 +323,7 @@ def generate_rows_for_prompts(
                 attention_mask_2d=attention_mask_2d,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
-                bandwidth_mbps=args.bandwidth,
+                environment=environment,
             )
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
@@ -353,6 +373,7 @@ def generate_rows_for_prompts_cloud_base(
     boundaries,
     comm_device,
     comm_dtype,
+    environment=None,
     start_index=0,
     total_count=None,
 ):
@@ -396,7 +417,7 @@ def generate_rows_for_prompts_cloud_base(
         f"[Rank 0] Cloud-base: sending prefill inputs to Rank {last_rank}; "
         f"input_ids_shape={tuple(input_ids.shape)}"
     )
-    if args.bandwidth is None:
+    if not environment_link_has_effect(environment, 0, last_rank):
         send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
     else:
         from bandwidth_transfer import send_prefill_inputs_limited
@@ -406,12 +427,13 @@ def generate_rows_for_prompts_cloud_base(
             attention_mask_2d,
             dst=last_rank,
             comm_device=comm_device,
-            bandwidth_mbps=args.bandwidth,
+            environment=environment,
+            src=0,
         )
     print("[Rank 0] Cloud-base: prefill inputs sent; waiting for local KV cache from Rank 2...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
-    if args.bandwidth is None:
+    if not cloud_base_kv_transfer_has_effect(environment, last_rank, world_size):
         rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
             src=last_rank,
             expected_layer_count=layer_end - layer_start,
@@ -502,7 +524,7 @@ def generate_rows_for_prompts_cloud_base(
                 attention_mask_2d=attention_mask_2d,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
-                bandwidth_mbps=args.bandwidth,
+                environment=environment,
             )
             synchronize_cuda()
             rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
@@ -553,12 +575,13 @@ def receive_cloud_base_cache_metric(
     layer_start,
     layer_end,
     batch_number,
+    environment=None,
 ):
     """Receive this worker's cloud-base KV cache from Rank 2 and build metrics."""
     print(f"[Rank {rank}] Cloud-base: waiting for local KV cache from Rank {world_size - 1}...")
     synchronize_cuda()
     memory_before = cuda_memory_allocated(device)
-    if args.bandwidth is None:
+    if not cloud_base_kv_transfer_has_effect(environment, world_size - 1, world_size):
         past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
             src=world_size - 1,
             expected_layer_count=layer_end - layer_start,
@@ -616,10 +639,11 @@ def run_rank2_cloud_base_prefill(
     batch_number,
     boundaries,
     comm_dtype,
+    environment=None,
 ):
     """Let Rank 2 full-prefill a batch, distribute KV cache, and return first token."""
     print("[Rank 2] Cloud-base: waiting for prefill inputs from Rank 0...")
-    if args.bandwidth is None:
+    if not environment_link_has_effect(environment, 0, world_size - 1):
         input_ids, attention_mask_2d = recv_prefill_inputs(src=0, device=device)
     else:
         from bandwidth_transfer import recv_prefill_inputs_limited
@@ -657,7 +681,7 @@ def run_rank2_cloud_base_prefill(
     rank2_past_key_values = cache_by_rank[world_size - 1]
     transfer_targets = {0: cache_by_rank[0], 1: cache_by_rank[1]}
     print("[Rank 2] Cloud-base: sending KV cache partitions to Rank 0 and Rank 1...")
-    if args.bandwidth is None:
+    if not cloud_base_kv_transfer_has_effect(environment, world_size - 1, world_size):
         kv_cache_send_time_ms = send_kv_caches_parallel(
             transfer_targets,
             comm_device=device,
@@ -669,14 +693,20 @@ def run_rank2_cloud_base_prefill(
         kv_cache_send_time_ms = send_kv_caches_parallel_limited(
             transfer_targets,
             comm_device=device,
-            bandwidth_mbps=args.bandwidth,
+            environment=environment,
+            src=world_size - 1,
             comm_dtype=comm_dtype,
         )
     print(
         f"[Rank 2] Cloud-base: KV cache partitions sent in "
         f"{kv_cache_send_time_ms:.2f} ms; sending first token to Rank 0."
     )
-    send_token(next_token, dst=0)
+    if environment_link_has_effect(environment, world_size - 1, 0):
+        from bandwidth_transfer import send_token_limited
+
+        send_token_limited(next_token, dst=0, environment=environment, src=world_size - 1)
+    else:
+        send_token(next_token, dst=0)
     synchronize_cuda()
     memory_after = cuda_memory_allocated(device)
     memory_reserved_after = cuda_memory_reserved(device)
@@ -715,6 +745,7 @@ def rank0_generate(
     boundaries=None,
     comm_device=None,
     comm_dtype=None,
+    environment=None,
 ):
     """Rank 0 static-split driver loop."""
     comm_device = comm_device or device
@@ -745,6 +776,7 @@ def rank0_generate(
                 boundaries=boundaries,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
+                environment=environment,
                 start_index=start_index,
                 total_count=len(prompts),
             )
@@ -762,6 +794,7 @@ def rank0_generate(
                 log_path=log_path,
                 comm_device=comm_device,
                 comm_dtype=comm_dtype,
+                environment=environment,
                 start_index=start_index,
                 total_count=len(prompts),
             )
@@ -801,6 +834,7 @@ def rank0_generate_dynamic(
     device,
     comm_device=None,
     comm_dtype=None,
+    environment=None,
 ):
     """Rank 0 dynamic-loading driver.
 
@@ -853,6 +887,10 @@ def rank0_generate_dynamic(
                 f"{boundaries}; prefill_mode={args.prefill_mode}"
             )
             broadcast_boundaries(boundaries, world_size, comm_device, rank=0)
+            if environment is not None:
+                environment.apply_batch(batch_number)
+                environment = broadcast_environment(environment, rank=0, device=comm_device)
+                print(f"[Rank 0] Batch {batch_number}: environment={environment.describe()}")
             if model is None or next_stage != current_stage:
                 if model is not None:
                     release_model(model)
@@ -899,6 +937,7 @@ def rank0_generate_dynamic(
                     total_count=len(prompts),
                     comm_device=comm_device,
                     comm_dtype=comm_dtype,
+                    environment=environment,
                 )
             else:
                 rows, records = generate_rows_for_prompts(
@@ -916,6 +955,7 @@ def rank0_generate_dynamic(
                     total_count=len(prompts),
                     comm_device=comm_device,
                     comm_dtype=comm_dtype,
+                    environment=environment,
                 )
             all_rows.extend(rows)
 
@@ -923,6 +963,8 @@ def rank0_generate_dynamic(
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
             if scheduler is not None:
                 scheduler.update_rank_metrics_from_records(records, batch=batch_number)
+                if environment is not None:
+                    scheduler.update_environment_data(batch_number, environment.snapshot())
                 scheduler.reallocate_layer(batch=batch_number + 1)
             append_experiment_log(log_path, records)
             update_summary(summary_by_rank, records)
@@ -947,6 +989,7 @@ def handle_worker_batch(
     batch_number,
     initial_past_key_values=None,
     initial_metric=None,
+    environment=None,
 ):
     """Serve one worker batch and keep rank-local KV cache until batch_done."""
     prev_rank = rank - 1
@@ -1037,7 +1080,7 @@ def handle_worker_batch(
                     prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
                     memory_after = cuda_memory_allocated(device)
                     memory_reserved_after = cuda_memory_reserved(device)
-                if args.bandwidth is None:
+                if not environment_link_has_effect(environment, rank, next_rank):
                     send_hidden(output_hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
                 else:
                     from bandwidth_transfer import send_hidden_limited
@@ -1046,7 +1089,8 @@ def handle_worker_batch(
                         output_hidden_states,
                         dst=next_rank,
                         attention_mask_2d=attention_mask_2d,
-                        bandwidth_mbps=args.bandwidth,
+                        environment=environment,
+                        src=rank,
                     )
                 if not is_prefill:
                     synchronize_cuda()
@@ -1077,7 +1121,12 @@ def handle_worker_batch(
                 )
 
             if is_last_rank:
-                send_token(next_token, dst=0)
+                if environment_link_has_effect(environment, rank, 0):
+                    from bandwidth_transfer import send_token_limited
+
+                    send_token_limited(next_token, dst=0, environment=environment, src=rank)
+                else:
+                    send_token(next_token, dst=0)
 
 
 def pipeline_serve_static(
@@ -1091,6 +1140,7 @@ def pipeline_serve_static(
     boundaries=None,
     dtype=None,
     comm_dtype=None,
+    environment=None,
 ):
     """Serve a non-master pipeline rank in static mode."""
     batch_number = 1
@@ -1117,6 +1167,7 @@ def pipeline_serve_static(
                     batch_number,
                     boundaries,
                     comm_dtype or getattr(model, "dtype", torch.float16),
+                    environment=environment,
                 )
             else:
                 initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
@@ -1128,6 +1179,7 @@ def pipeline_serve_static(
                     layer_start,
                     layer_end,
                     batch_number,
+                    environment=environment,
                 )
 
         should_continue = handle_worker_batch(
@@ -1141,6 +1193,7 @@ def pipeline_serve_static(
             batch_number,
             initial_past_key_values=initial_past_key_values,
             initial_metric=initial_metric,
+            environment=environment,
         )
         if not should_continue:
             break
@@ -1149,7 +1202,7 @@ def pipeline_serve_static(
     print(f"[Rank {rank}] Stop signal received.")
 
 
-def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
+def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=None):
     """Dynamic-loading service loop for non-master pipeline ranks."""
     total_layers = get_total_layers_from_config(args.model_dir)
     default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
@@ -1170,6 +1223,9 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                 f"[Rank {rank}] Batch {batch_number}: received boundaries "
                 f"{boundaries}; prefill_mode={args.prefill_mode}"
             )
+            if environment is not None:
+                environment = broadcast_environment(environment, rank=rank, device=device)
+                print(f"[Rank {rank}] Batch {batch_number}: environment={environment.describe()}")
 
             if scheduler is None:
                 allocation = None
@@ -1239,6 +1295,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                         batch_number,
                         boundaries,
                         getattr(model, "dtype", torch.float16),
+                        environment=environment,
                     )
                 else:
                     initial_past_key_values, initial_metric = receive_cloud_base_cache_metric(
@@ -1250,6 +1307,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                         layer_start,
                         layer_end,
                         batch_number,
+                        environment=environment,
                     )
 
             should_continue = handle_worker_batch(
@@ -1263,6 +1321,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device):
                 batch_number,
                 initial_past_key_values=initial_past_key_values,
                 initial_metric=initial_metric,
+                environment=environment,
             )
             if not should_continue:
                 return

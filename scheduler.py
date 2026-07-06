@@ -115,6 +115,8 @@ class Scheduler:
         self.rank1_data = None
         self.rank2_data = None
         self.latest_rank_metrics_batch = None
+        self.environment_data = None
+        self.environment_history = {}
 
         self._validate_boundaries(self.default_boundaries)
         self._load_existing_file()
@@ -173,13 +175,25 @@ class Scheduler:
             record_batch = batch if batch is not None else record.get("batch")
             self.update_rank_metrics(record["rank"], record, batch=record_batch)
 
+    def update_environment_data(self, batch, environment_snapshot):
+        """Store the active network environment used by a completed batch."""
+        batch = int(batch)
+        snapshot = dict(environment_snapshot)
+        if "Bandwidth" in snapshot:
+            snapshot["Bandwidth"] = list(snapshot["Bandwidth"])
+        if "time_comm_delay" in snapshot:
+            snapshot["time_comm_delay"] = list(snapshot["time_comm_delay"])
+        self.environment_data = snapshot
+        self.environment_history[batch] = snapshot
+
     def reallocate_layer(self, batch=None, rank_metrics=None):
         """Reserved hook for future adaptive layer reallocation.
 
         For now this method intentionally keeps the latest known allocation.
         It returns the boundaries that would be used for batch without mutating
         scheduler.csv. When the adaptive policy is designed, this is the method
-        to extend with rules based on rank0/rank1/rank2 metrics.
+        to extend with rules based on rank0/rank1/rank2 metrics and the latest
+        environment_data snapshot.
         """
         _ = rank_metrics if rank_metrics is not None else self.rank_metrics
         if batch is None:

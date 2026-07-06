@@ -1,10 +1,9 @@
-"""Bandwidth-limited communication wrappers.
+"""Environment-limited communication wrappers.
 
 The normal project communication path lives in pipeline_comm.py and
-kv_cache_transfer.py. This module is used only when --bandwidth is provided.
-Keeping the simulated-bandwidth protocol here makes the default run path stay
-as close as possible to the original code: without --bandwidth, callers should
-continue to call the original send/recv helpers directly.
+kv_cache_transfer.py. This module is used only when Environment says a link has
+simulated bandwidth or fixed delay. Keeping the simulation protocol here makes
+the default run path stay as close as possible to the original code.
 """
 
 import time
@@ -22,10 +21,10 @@ from kv_cache_transfer import (
     build_dynamic_cache,
 )
 from pipeline_comm import send_hidden as original_send_hidden
+from pipeline_comm import send_token as original_send_token
 
 
 TRANSFER_DONE = 2
-BYTES_PER_MB = 1024 * 1024
 
 
 def _dtype_element_size(dtype):
@@ -49,25 +48,15 @@ def _cache_payload_bytes(cache, transfer_dtype=None):
     return int(total)
 
 
-def _sleep_until_bandwidth_target(payload_bytes, real_start_time, bandwidth_mbps):
-    """Sleep only for the part of target transfer time not spent in real NCCL.
-
-    The simulated target time is payload_bytes / bandwidth. Real NCCL transfer
-    time is already paid before this helper is called, so we add only the
-    remaining time. If the real transfer is slower than the target, no extra
-    sleep is added.
-    """
-    if bandwidth_mbps is None:
+def _sleep_until_environment_target(payload_bytes, real_start_time, environment, src, dst):
+    """Sleep for the link target not already paid by real NCCL transfer time."""
+    if environment is None:
         return
-    target_seconds = float(payload_bytes) / (float(bandwidth_mbps) * BYTES_PER_MB)
-    real_elapsed = time.perf_counter() - real_start_time
-    extra_sleep = max(0.0, target_seconds - real_elapsed)
-    if extra_sleep > 0:
-        time.sleep(extra_sleep)
+    environment.sleep_after_real_transfer(src, dst, payload_bytes, real_start_time)
 
 
 def _send_done_parallel(cache_by_rank, comm_device):
-    """Tell receivers the bandwidth-limited transfer window has ended."""
+    """Tell receivers the Environment-limited transfer window has ended."""
     works = []
     payloads = []
     for dst in sorted(cache_by_rank):
@@ -80,13 +69,13 @@ def _send_done_parallel(cache_by_rank, comm_device):
 
 
 def _send_done(dst, comm_device):
-    """Tell one receiver the bandwidth-limited transfer window has ended."""
+    """Tell one receiver the Environment-limited transfer window has ended."""
     done = torch.tensor([TRANSFER_DONE], dtype=torch.long, device=comm_device)
     dist.send(done, dst=dst)
 
 
 def _recv_done(src, comm_device):
-    """Wait for the sender-side bandwidth window to finish."""
+    """Wait for the sender-side Environment window to finish."""
     done = torch.empty(1, dtype=torch.long, device=comm_device)
     dist.recv(done, src=src)
     value = int(done.item())
@@ -94,18 +83,28 @@ def _recv_done(src, comm_device):
         raise RuntimeError(f"Expected transfer done signal {TRANSFER_DONE}, got {value}.")
 
 
-def send_hidden_limited(hidden_states, dst, attention_mask_2d=None, bandwidth_mbps=None):
-    """Send hidden states through the original protocol, then simulate bandwidth.
-
-    This wrapper is intentionally used only when --bandwidth is set. It keeps
-    pipeline_comm.send_hidden untouched for unlimited runs.
-    """
+def send_hidden_limited(hidden_states, dst, attention_mask_2d=None, environment=None, src=None):
+    """Send hidden states through the original protocol, then simulate Environment."""
     payload_bytes = _tensor_nbytes(hidden_states)
     if attention_mask_2d is not None:
         payload_bytes += int(attention_mask_2d.numel() * _dtype_element_size(torch.long))
     start = time.perf_counter()
     original_send_hidden(hidden_states, dst=dst, attention_mask_2d=attention_mask_2d)
-    _sleep_until_bandwidth_target(payload_bytes, start, bandwidth_mbps)
+    if src is not None:
+        _sleep_until_environment_target(payload_bytes, start, environment, src, dst)
+
+
+def send_token_limited(next_token, dst, environment=None, src=None):
+    """Send generated token with Environment delay on the Rank 2 -> Rank 0 link.
+
+    The token path has no explicit done handshake, so fixed link latency is
+    applied before the send. That makes Rank 0's recv_token block for the
+    simulated one-way delay.
+    """
+    if src is not None and environment is not None:
+        payload_bytes = _tensor_nbytes(next_token)
+        environment.sleep_before_small_transfer(src, dst, payload_bytes)
+    original_send_token(next_token, dst=dst)
 
 
 def send_prefill_inputs_limited(
@@ -113,9 +112,10 @@ def send_prefill_inputs_limited(
     attention_mask_2d,
     dst,
     comm_device,
-    bandwidth_mbps=None,
+    environment=None,
+    src=0,
 ):
-    """Send Rank 0 tokenized prompt tensors with optional bandwidth simulation."""
+    """Send Rank 0 tokenized prompt tensors with Environment simulation."""
     input_ids = input_ids.to(device=comm_device, dtype=torch.long).contiguous()
     attention_mask_2d = attention_mask_2d.to(device=comm_device, dtype=torch.long).contiguous()
     payload_bytes = _tensor_nbytes(input_ids) + _tensor_nbytes(attention_mask_2d)
@@ -126,12 +126,12 @@ def send_prefill_inputs_limited(
     dist.send(meta, dst=dst)
     dist.send(input_ids, dst=dst)
     dist.send(attention_mask_2d, dst=dst)
-    _sleep_until_bandwidth_target(payload_bytes, start, bandwidth_mbps)
+    _sleep_until_environment_target(payload_bytes, start, environment, src, dst)
     _send_done(dst, comm_device)
 
 
 def recv_prefill_inputs_limited(src, device):
-    """Receive tokenized prompts and wait for the sender bandwidth window."""
+    """Receive tokenized prompts and wait for the sender Environment window."""
     meta = torch.empty(2, dtype=torch.long, device=device)
     dist.recv(meta, src=src)
     batch_size, seq_len = [int(value) for value in meta.tolist()]
@@ -146,26 +146,31 @@ def recv_prefill_inputs_limited(src, device):
 def send_kv_caches_parallel_limited(
     cache_by_rank,
     comm_device,
-    bandwidth_mbps,
+    environment,
+    src=2,
     comm_dtype=None,
 ):
-    """Send cloud-base KV-cache partitions with simulated bandwidth.
+    """Send cloud-base KV-cache partitions with simulated Environment links.
 
-    Rank 2 sends Rank 0 and Rank 1 cache partitions concurrently. The simulated
-    target wall time follows the slower branch, so the payload size is the
-    largest per-destination cache size rather than the sum of both branches.
+    Rank 2 sends Rank 0 and Rank 1 cache partitions concurrently. The target
+    wall time follows the slower configured branch among 2->0 and 2->1.
     Receivers wait for an additional done signal, which makes their
-    kv_cache_recv_time_ms include the sender's extra bandwidth sleep.
+    kv_cache_recv_time_ms include the sender's extra environment sleep.
     """
-    max_dst_payload_bytes = max(
-        _cache_payload_bytes(cache, comm_dtype) for cache in cache_by_rank.values()
-    )
+    target_seconds = 0.0
+    for dst, cache in cache_by_rank.items():
+        payload_bytes = _cache_payload_bytes(cache, comm_dtype)
+        if environment is not None:
+            target_seconds = max(target_seconds, environment.target_seconds(src, dst, payload_bytes))
 
     ready_payloads = _send_ready_parallel(cache_by_rank, comm_device)
     start = time.perf_counter()
     metadata_payloads = _send_metadata_parallel(cache_by_rank, comm_device)
     tensor_payloads = _send_payload_parallel(cache_by_rank, comm_device, comm_dtype)
-    _sleep_until_bandwidth_target(max_dst_payload_bytes, start, bandwidth_mbps)
+    real_elapsed = time.perf_counter() - start
+    extra_sleep = max(0.0, target_seconds - real_elapsed)
+    if extra_sleep > 0:
+        time.sleep(extra_sleep)
     done_payloads = _send_done_parallel(cache_by_rank, comm_device)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
@@ -182,7 +187,7 @@ def recv_kv_cache_limited(
     transfer_dtype,
     compute_dtype,
 ):
-    """Receive a KV cache and wait for the sender's bandwidth done signal."""
+    """Receive a KV cache and wait for the sender's Environment done signal."""
     _recv_ready(src, comm_device)
     start = time.perf_counter()
     meta_len = 1 + int(expected_layer_count) * 8
