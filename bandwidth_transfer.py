@@ -92,6 +92,7 @@ def send_hidden_limited(hidden_states, dst, attention_mask_2d=None, environment=
     original_send_hidden(hidden_states, dst=dst, attention_mask_2d=attention_mask_2d)
     if src is not None:
         _sleep_until_environment_target(payload_bytes, start, environment, src, dst)
+    return (time.perf_counter() - start) * 1000.0
 
 
 def send_token_limited(next_token, dst, environment=None, src=None):
@@ -101,10 +102,12 @@ def send_token_limited(next_token, dst, environment=None, src=None):
     applied before the send. That makes Rank 0's recv_token block for the
     simulated one-way delay.
     """
+    start = time.perf_counter()
     if src is not None and environment is not None:
         payload_bytes = _tensor_nbytes(next_token)
         environment.sleep_before_small_transfer(src, dst, payload_bytes)
     original_send_token(next_token, dst=dst)
+    return (time.perf_counter() - start) * 1000.0
 
 
 def send_prefill_inputs_limited(
@@ -128,6 +131,7 @@ def send_prefill_inputs_limited(
     dist.send(attention_mask_2d, dst=dst)
     _sleep_until_environment_target(payload_bytes, start, environment, src, dst)
     _send_done(dst, comm_device)
+    return (time.perf_counter() - start) * 1000.0
 
 
 def recv_prefill_inputs_limited(src, device):

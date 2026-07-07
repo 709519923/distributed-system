@@ -2,6 +2,86 @@
 
 ## 2026-07-06
 
+### Experiment log timing rework
+
+- Rebuilt the experiment timing records around the new compute/transfer split. The previous timing fields mixed different meanings: some measured only local forward, while others measured forward plus outgoing send, and the summary accumulated values across batches. That made later Scheduler and multi-arm-bandit work hard to audit.
+- Removed the old batch-crossing total summary model. `append_summary_log()` now writes a current-batch snapshot only. Batch 2 no longer includes Batch 1 time, and later batches are not accumulated into any `total_*` field.
+- Removed the old timing fields from active Python records:
+
+  ```text
+  prefill_time_ms
+  prefill_time_total_ms
+  decode_time_total_ms
+  inference_compute_total_ms
+  total_prefill_time_ms
+  total_decode_time_ms
+  total_inference_compute_time_ms
+  ```
+
+- Added the new active timing fields:
+
+  ```text
+  prefill_comp_time_ms
+  prefill_transfer_time_ms
+  cloud_prefill_rank2_time_ms
+  kv_cache_send_time_ms
+  kv_cache_recv_time_ms
+  decode_step_count
+  decode_comp_time_ms
+  decode_transfer_time_ms
+  decode_time_per_token_ms
+  ```
+
+- Timing semantics:
+
+  ```text
+  *_comp_time_ms
+      Measures rank-local model computation. For prefill this means the local
+      prefill forward path. For decode this means the local decode forward path
+      and token bookkeeping before the outgoing boundary message.
+
+  *_transfer_time_ms
+      Measures outgoing communication from this rank. When Environment is active,
+      this includes the simulated bandwidth / fixed-delay wait in addition to
+      the real send call.
+
+  decode_time_per_token_ms
+      Computed as:
+      (decode_comp_time_ms + decode_transfer_time_ms) / decode_step_count
+  ```
+
+- Distributed prefill mapping:
+
+  ```text
+  Rank 0 prefill_comp_time_ms      = layers [rank0_start, rank0_end) forward
+  Rank 0 prefill_transfer_time_ms  = hidden states Rank 0 -> Rank 1
+
+  Rank 1 prefill_comp_time_ms      = middle partition forward
+  Rank 1 prefill_transfer_time_ms  = hidden states Rank 1 -> Rank 2
+
+  Rank 2 prefill_comp_time_ms      = final partition forward + first-token logits
+  Rank 2 prefill_transfer_time_ms  = first token Rank 2 -> Rank 0
+  ```
+
+- Cloud-base prefill mapping:
+
+  ```text
+  Rank 0 prefill_transfer_time_ms       = tokenized prompt tensors Rank 0 -> Rank 2
+  Rank 0 kv_cache_recv_time_ms          = receive + rebuild Rank 0 KV cache
+
+  Rank 1 kv_cache_recv_time_ms          = receive + rebuild Rank 1 KV cache
+
+  Rank 2 cloud_prefill_rank2_time_ms    = full-model prefill on Rank 2
+  Rank 2 kv_cache_send_time_ms          = parallel KV cache metadata/payload send
+  Rank 2 prefill_transfer_time_ms       = first token Rank 2 -> Rank 0
+  ```
+
+- `experiment_report.py` was rewritten around the new record schema. It now prints the record in three sections: `distributed parameter`, `Cloud-base parameter`, and `Common parameter`. It also prints the current batch layer allocation and Environment snapshot in the summary.
+- `inference_loops.py` was refactored so Rank 0 and worker ranks no longer use one large timer around "compute + send". Each path now records local forward time separately from outgoing communication time.
+- `bandwidth_transfer.py` wrappers now return elapsed milliseconds for limited hidden-state, token, and prefill-input sends. This allows the inference loop to record transfer time without reimplementing the Environment delay calculation.
+- `kv_cache_transfer.py` now returns elapsed milliseconds from `send_prefill_inputs()`, so cloud-base Rank 0 can record prompt-transfer time using the same field as other prefill boundary transfers.
+- `readme.md` was rewritten to document only the current startup flow and active log fields.
+
 ### Environment-based per-link bandwidth and delay simulation
 
 - Replaced the old single `--bandwidth` / `BANDWIDTH` experiment interface with a Rank-0-owned `Environment` class in `environment.py`. Network simulation is no longer configured from `run.sh`; it is configured by editing `environment.py` on Rank 0 and then broadcasting the active snapshot to worker ranks.

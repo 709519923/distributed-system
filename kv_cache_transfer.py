@@ -255,9 +255,11 @@ def send_prefill_inputs(input_ids, attention_mask_2d, dst, comm_device):
     attention_mask_2d = attention_mask_2d.to(device=comm_device, dtype=torch.long).contiguous()
     batch_size, seq_len = input_ids.shape
     meta = torch.tensor([batch_size, seq_len], dtype=torch.long, device=comm_device)
+    start = time.perf_counter()
     dist.send(meta, dst=dst)
     dist.send(input_ids, dst=dst)
     dist.send(attention_mask_2d, dst=dst)
+    return (time.perf_counter() - start) * 1000.0
 
 
 def recv_prefill_inputs(src, device):

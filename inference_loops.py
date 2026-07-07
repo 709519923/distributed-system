@@ -16,7 +16,6 @@ from distributed_env import broadcast_environment
 from experiment_report import (
     append_experiment_log,
     append_summary_log,
-    create_summary,
     make_log_path,
     normalize_record,
     metric_to_tensor,
@@ -24,7 +23,6 @@ from experiment_report import (
     recv_metric_tensor,
     send_metric_record,
     send_metric_tensor,
-    update_summary,
 )
 from kv_cache_transfer import (
     cache_batch_seq_len,
@@ -35,13 +33,9 @@ from kv_cache_transfer import (
     split_kv_cache_by_boundaries,
 )
 from kv_cache_utils import (
-    count_model_parameters,
-    cuda_memory_allocated,
-    cuda_memory_reserved,
     estimate_parameter_bytes,
     estimate_past_key_values_bytes,
     synchronize_cuda,
-    tensor_bytes,
 )
 from model_forward import choose_next_token, rank0_forward, rank1_forward_logits, rank_middle_forward
 from model_loader import get_total_layers_from_config, load_full_model_for_prefill, load_model_part
@@ -88,6 +82,7 @@ def send_hidden_from_rank0(
     Rank 0 can optionally compute on CPU. NCCL still requires CUDA tensors, so
     only the boundary tensor and mask are copied to comm_device for transport.
     """
+    start_time = time.perf_counter()
     transfer_hidden_states = hidden_states.to(
         device=comm_device,
         dtype=comm_dtype,
@@ -110,9 +105,41 @@ def send_hidden_from_rank0(
             environment=environment,
             src=0,
         )
+        return (time.perf_counter() - start_time) * 1000.0
+    return (time.perf_counter() - start_time) * 1000.0
 
 
-def build_prefill_metric(
+def send_hidden_from_worker(hidden_states, dst, attention_mask_2d, environment=None, src=None):
+    """Send hidden states from a non-master rank and return transfer wall time."""
+    start_time = time.perf_counter()
+    if not environment_link_has_effect(environment, src, dst):
+        send_hidden(hidden_states, dst=dst, attention_mask_2d=attention_mask_2d)
+    else:
+        from bandwidth_transfer import send_hidden_limited
+
+        send_hidden_limited(
+            hidden_states,
+            dst=dst,
+            attention_mask_2d=attention_mask_2d,
+            environment=environment,
+            src=src,
+        )
+    return (time.perf_counter() - start_time) * 1000.0
+
+
+def send_token_with_timing(next_token, dst, environment=None, src=None):
+    """Send one generated token and return transfer wall time."""
+    start_time = time.perf_counter()
+    if environment_link_has_effect(environment, src, dst):
+        from bandwidth_transfer import send_token_limited
+
+        send_token_limited(next_token, dst=dst, environment=environment, src=src)
+    else:
+        send_token(next_token, dst=dst)
+    return (time.perf_counter() - start_time) * 1000.0
+
+
+def build_batch_metric(
     batch_number,
     rank,
     world_size,
@@ -124,22 +151,13 @@ def build_prefill_metric(
     input_seq_len_avg,
     model,
     past_key_values,
-    hidden_states,
-    memory_before,
-    memory_after,
-    memory_reserved_after,
-    prefill_time_ms,
+    prefill_comp_time_ms=0.0,
+    prefill_transfer_time_ms=0.0,
     cloud_prefill_rank2_time_ms=0.0,
     kv_cache_send_time_ms=0.0,
     kv_cache_recv_time_ms=0.0,
 ):
-    """Build one record for the text experiment log."""
-    if hidden_states is None:
-        hidden_shape = [0, 0, 0]
-        hidden_prefill_bytes = 0
-    else:
-        hidden_shape = list(hidden_states.shape)
-        hidden_prefill_bytes = tensor_bytes(hidden_states)
+    """Build one rank-local metric record for the current batch."""
     return {
         "batch": batch_number,
         "rank": rank,
@@ -151,26 +169,29 @@ def build_prefill_metric(
         "prompt_count": prompt_count,
         "input_seq_len_max": input_seq_len_max,
         "input_seq_len_avg": input_seq_len_avg,
-        "prefill_param_count": count_model_parameters(model),
         "prefill_param_bytes": estimate_parameter_bytes(model),
         "kv_cache_bytes_after_prefill": estimate_past_key_values_bytes(past_key_values),
-        "hidden_prefill_batch": hidden_shape[0],
-        "hidden_prefill_seq_len": hidden_shape[1],
-        "hidden_prefill_hidden_size": hidden_shape[2],
-        "hidden_prefill_bytes": hidden_prefill_bytes,
-        "cuda_memory_allocated_before_prefill": memory_before,
-        "cuda_memory_allocated_after_prefill": memory_after,
-        "cuda_memory_reserved_after_prefill": memory_reserved_after,
-        "prefill_time_ms": prefill_time_ms,
-        "prefill_time_total_ms": prefill_time_ms,
-        "decode_step_count": 0,
-        "decode_time_total_ms": 0.0,
-        "decode_time_per_token_ms": 0.0,
-        "inference_compute_total_ms": prefill_time_ms,
+        "prefill_comp_time_ms": prefill_comp_time_ms,
+        "prefill_transfer_time_ms": prefill_transfer_time_ms,
         "cloud_prefill_rank2_time_ms": cloud_prefill_rank2_time_ms,
         "kv_cache_send_time_ms": kv_cache_send_time_ms,
         "kv_cache_recv_time_ms": kv_cache_recv_time_ms,
+        "decode_step_count": 0,
+        "decode_comp_time_ms": 0.0,
+        "decode_transfer_time_ms": 0.0,
+        "decode_time_per_token_ms": 0.0,
     }
+
+
+def finish_decode_metric(metric, decode_step_count, decode_comp_time_ms, decode_transfer_time_ms):
+    """Write decode-stage timing into a metric record."""
+    metric["decode_step_count"] = int(decode_step_count)
+    metric["decode_comp_time_ms"] = float(decode_comp_time_ms)
+    metric["decode_transfer_time_ms"] = float(decode_transfer_time_ms)
+    decode_elapsed_time_ms = float(decode_comp_time_ms) + float(decode_transfer_time_ms)
+    metric["decode_time_per_token_ms"] = (
+        decode_elapsed_time_ms / int(decode_step_count) if int(decode_step_count) else 0.0
+    )
 
 
 def generate_rows_for_prompts(
@@ -241,8 +262,7 @@ def generate_rows_for_prompts(
 
     with torch.inference_mode():
         synchronize_cuda()
-        memory_before = cuda_memory_allocated(device)
-        start_time = time.perf_counter()
+        prefill_compute_start_time = time.perf_counter()
         hidden_states, rank0_past_key_values = rank0_forward(
             model,
             input_ids,
@@ -251,11 +271,9 @@ def generate_rows_for_prompts(
             past_key_values=None,
         )
         synchronize_cuda()
-        prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
-        memory_after = cuda_memory_allocated(device)
-        memory_reserved_after = cuda_memory_reserved(device)
+        prefill_comp_time_ms = (time.perf_counter() - prefill_compute_start_time) * 1000.0
 
-        send_hidden_from_rank0(
+        prefill_transfer_time_ms = send_hidden_from_rank0(
             hidden_states,
             dst=1,
             attention_mask_2d=attention_mask_2d,
@@ -266,7 +284,7 @@ def generate_rows_for_prompts(
         last_rank = world_size - 1
         next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
 
-        rank0_metric = build_prefill_metric(
+        rank0_metric = build_batch_metric(
             batch_number=batch_number,
             rank=0,
             world_size=world_size,
@@ -278,18 +296,16 @@ def generate_rows_for_prompts(
             input_seq_len_avg=input_seq_len_avg,
             model=model,
             past_key_values=rank0_past_key_values,
-            hidden_states=hidden_states,
-            memory_before=memory_before,
-            memory_after=memory_after,
-            memory_reserved_after=memory_reserved_after,
-            prefill_time_ms=prefill_time_ms,
+            prefill_comp_time_ms=prefill_comp_time_ms,
+            prefill_transfer_time_ms=prefill_transfer_time_ms,
         )
         records = [normalize_record(rank0_metric, str(model.dtype))]
-        rank0_decode_time_ms = 0.0
+        rank0_decode_comp_time_ms = 0.0
+        rank0_decode_transfer_time_ms = 0.0
         rank0_decode_step_count = 0
         for token_index in range(args.max_new_tokens):
             synchronize_cuda()
-            rank0_decode_start_time = time.perf_counter()
+            rank0_decode_compute_start_time = time.perf_counter()
             active = ~finished
             tokens_to_append = torch.where(
                 active.unsqueeze(1),
@@ -317,7 +333,11 @@ def generate_rows_for_prompts(
                 attention_mask_2d,
                 past_key_values=rank0_past_key_values,
             )
-            send_hidden_from_rank0(
+            synchronize_cuda()
+            rank0_decode_comp_time_ms += (
+                time.perf_counter() - rank0_decode_compute_start_time
+            ) * 1000.0
+            rank0_decode_transfer_time_ms += send_hidden_from_rank0(
                 hidden_states,
                 dst=1,
                 attention_mask_2d=attention_mask_2d,
@@ -325,21 +345,14 @@ def generate_rows_for_prompts(
                 comm_dtype=comm_dtype,
                 environment=environment,
             )
-            synchronize_cuda()
-            rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
             rank0_decode_step_count += 1
             next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
 
-        rank0_decode_time_per_token_ms = (
-            rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
-        )
-        records[0]["decode_step_count"] = rank0_decode_step_count
-        records[0]["decode_time_total_ms"] = rank0_decode_time_ms
-        records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
-        records[0]["inference_compute_total_ms"] = (
-            records[0]["prefill_time_total_ms"]
-            + records[0]["cloud_prefill_rank2_time_ms"]
-            + rank0_decode_time_ms
+        finish_decode_metric(
+            records[0],
+            rank0_decode_step_count,
+            rank0_decode_comp_time_ms,
+            rank0_decode_transfer_time_ms,
         )
 
     rows = []
@@ -418,11 +431,16 @@ def generate_rows_for_prompts_cloud_base(
         f"input_ids_shape={tuple(input_ids.shape)}"
     )
     if not environment_link_has_effect(environment, 0, last_rank):
-        send_prefill_inputs(input_ids, attention_mask_2d, dst=last_rank, comm_device=comm_device)
+        prefill_transfer_time_ms = send_prefill_inputs(
+            input_ids,
+            attention_mask_2d,
+            dst=last_rank,
+            comm_device=comm_device,
+        )
     else:
         from bandwidth_transfer import send_prefill_inputs_limited
 
-        send_prefill_inputs_limited(
+        prefill_transfer_time_ms = send_prefill_inputs_limited(
             input_ids,
             attention_mask_2d,
             dst=last_rank,
@@ -432,7 +450,6 @@ def generate_rows_for_prompts_cloud_base(
         )
     print("[Rank 0] Cloud-base: prefill inputs sent; waiting for local KV cache from Rank 2...")
     synchronize_cuda()
-    memory_before = cuda_memory_allocated(device)
     if not cloud_base_kv_transfer_has_effect(environment, last_rank, world_size):
         rank0_past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
             src=last_rank,
@@ -454,8 +471,6 @@ def generate_rows_for_prompts_cloud_base(
             compute_dtype=getattr(model, "dtype", comm_dtype),
         )
     synchronize_cuda()
-    memory_after = cuda_memory_allocated(device)
-    memory_reserved_after = cuda_memory_reserved(device)
     print(
         f"[Rank 0] Cloud-base: received local KV cache in "
         f"{kv_cache_recv_time_ms:.2f} ms; waiting for first token from Rank {last_rank}..."
@@ -463,7 +478,7 @@ def generate_rows_for_prompts_cloud_base(
     next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
     print("[Rank 0] Cloud-base: received first token; entering decode loop.")
 
-    rank0_metric = build_prefill_metric(
+    rank0_metric = build_batch_metric(
         batch_number=batch_number,
         rank=0,
         world_size=world_size,
@@ -475,23 +490,21 @@ def generate_rows_for_prompts_cloud_base(
         input_seq_len_avg=input_seq_len_avg,
         model=model,
         past_key_values=rank0_past_key_values,
-        hidden_states=None,
-        memory_before=memory_before,
-        memory_after=memory_after,
-        memory_reserved_after=memory_reserved_after,
-        prefill_time_ms=0.0,
+        prefill_comp_time_ms=0.0,
+        prefill_transfer_time_ms=prefill_transfer_time_ms,
         kv_cache_recv_time_ms=kv_cache_recv_time_ms,
     )
     records = [normalize_record(rank0_metric, str(model.dtype))]
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
     generated_tokens = [[] for _ in range(batch_size)]
-    rank0_decode_time_ms = 0.0
+    rank0_decode_comp_time_ms = 0.0
+    rank0_decode_transfer_time_ms = 0.0
     rank0_decode_step_count = 0
 
     with torch.inference_mode():
         for token_index in range(args.max_new_tokens):
             synchronize_cuda()
-            rank0_decode_start_time = time.perf_counter()
+            rank0_decode_compute_start_time = time.perf_counter()
             active = ~finished
             tokens_to_append = torch.where(
                 active.unsqueeze(1),
@@ -518,7 +531,11 @@ def generate_rows_for_prompts_cloud_base(
                 attention_mask_2d,
                 past_key_values=rank0_past_key_values,
             )
-            send_hidden_from_rank0(
+            synchronize_cuda()
+            rank0_decode_comp_time_ms += (
+                time.perf_counter() - rank0_decode_compute_start_time
+            ) * 1000.0
+            rank0_decode_transfer_time_ms += send_hidden_from_rank0(
                 hidden_states,
                 dst=1,
                 attention_mask_2d=attention_mask_2d,
@@ -526,18 +543,15 @@ def generate_rows_for_prompts_cloud_base(
                 comm_dtype=comm_dtype,
                 environment=environment,
             )
-            synchronize_cuda()
-            rank0_decode_time_ms += (time.perf_counter() - rank0_decode_start_time) * 1000.0
             rank0_decode_step_count += 1
             next_token = recv_token(src=last_rank, device=comm_device, batch_size=batch_size).to(device)
 
-    rank0_decode_time_per_token_ms = (
-        rank0_decode_time_ms / rank0_decode_step_count if rank0_decode_step_count else 0.0
+    finish_decode_metric(
+        records[0],
+        rank0_decode_step_count,
+        rank0_decode_comp_time_ms,
+        rank0_decode_transfer_time_ms,
     )
-    records[0]["decode_step_count"] = rank0_decode_step_count
-    records[0]["decode_time_total_ms"] = rank0_decode_time_ms
-    records[0]["decode_time_per_token_ms"] = rank0_decode_time_per_token_ms
-    records[0]["inference_compute_total_ms"] = rank0_decode_time_ms
 
     rows = []
     for local_index, prompt in enumerate(prompts, start=1):
@@ -580,7 +594,6 @@ def receive_cloud_base_cache_metric(
     """Receive this worker's cloud-base KV cache from Rank 2 and build metrics."""
     print(f"[Rank {rank}] Cloud-base: waiting for local KV cache from Rank {world_size - 1}...")
     synchronize_cuda()
-    memory_before = cuda_memory_allocated(device)
     if not cloud_base_kv_transfer_has_effect(environment, world_size - 1, world_size):
         past_key_values, kv_cache_recv_time_ms = recv_kv_cache(
             src=world_size - 1,
@@ -602,11 +615,9 @@ def receive_cloud_base_cache_metric(
             compute_dtype=getattr(model, "dtype", torch.float16),
         )
     synchronize_cuda()
-    memory_after = cuda_memory_allocated(device)
-    memory_reserved_after = cuda_memory_reserved(device)
     print(f"[Rank {rank}] Cloud-base: received local KV cache in {kv_cache_recv_time_ms:.2f} ms.")
     batch_size, seq_len = cache_batch_seq_len(past_key_values)
-    metric = build_prefill_metric(
+    metric = build_batch_metric(
         batch_number=batch_number,
         rank=rank,
         world_size=world_size,
@@ -618,11 +629,8 @@ def receive_cloud_base_cache_metric(
         input_seq_len_avg=float(seq_len),
         model=model,
         past_key_values=past_key_values,
-        hidden_states=None,
-        memory_before=memory_before,
-        memory_after=memory_after,
-        memory_reserved_after=memory_reserved_after,
-        prefill_time_ms=0.0,
+        prefill_comp_time_ms=0.0,
+        prefill_transfer_time_ms=0.0,
         kv_cache_recv_time_ms=kv_cache_recv_time_ms,
     )
     return past_key_values, metric
@@ -658,7 +666,6 @@ def run_rank2_cloud_base_prefill(
     )
 
     synchronize_cuda()
-    memory_before = cuda_memory_allocated(device)
     prefill_start = time.perf_counter()
     print("[Rank 2] Cloud-base: running full-model prefill...")
     hidden_states, full_past_key_values = rank0_forward(
@@ -701,17 +708,15 @@ def run_rank2_cloud_base_prefill(
         f"[Rank 2] Cloud-base: KV cache partitions sent in "
         f"{kv_cache_send_time_ms:.2f} ms; sending first token to Rank 0."
     )
-    if environment_link_has_effect(environment, world_size - 1, 0):
-        from bandwidth_transfer import send_token_limited
-
-        send_token_limited(next_token, dst=0, environment=environment, src=world_size - 1)
-    else:
-        send_token(next_token, dst=0)
+    first_token_transfer_time_ms = send_token_with_timing(
+        next_token,
+        dst=0,
+        environment=environment,
+        src=world_size - 1,
+    )
     synchronize_cuda()
-    memory_after = cuda_memory_allocated(device)
-    memory_reserved_after = cuda_memory_reserved(device)
 
-    metric = build_prefill_metric(
+    metric = build_batch_metric(
         batch_number=batch_number,
         rank=world_size - 1,
         world_size=world_size,
@@ -723,11 +728,8 @@ def run_rank2_cloud_base_prefill(
         input_seq_len_avg=input_seq_len_avg,
         model=decode_model,
         past_key_values=rank2_past_key_values,
-        hidden_states=hidden_states,
-        memory_before=memory_before,
-        memory_after=memory_after,
-        memory_reserved_after=memory_reserved_after,
-        prefill_time_ms=0.0,
+        prefill_comp_time_ms=0.0,
+        prefill_transfer_time_ms=first_token_transfer_time_ms,
         cloud_prefill_rank2_time_ms=cloud_prefill_rank2_time_ms,
         kv_cache_send_time_ms=kv_cache_send_time_ms,
     )
@@ -759,7 +761,6 @@ def rank0_generate(
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
-    summary_by_rank = create_summary(world_size)
     for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
         print(f"[Rank 0] Static batch {batch_number}; prompts={len(prompt_batch)}")
         if args.prefill_mode == "cloud-base":
@@ -802,8 +803,14 @@ def rank0_generate(
         send_batch_done(comm_device)
         records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
         append_experiment_log(log_path, records)
-        update_summary(summary_by_rank, records)
-        append_summary_log(log_path, summary_by_rank, batch_number)
+        append_summary_log(
+            log_path,
+            records,
+            batch_number,
+            environment=environment,
+            boundaries=boundaries,
+            prefill_mode=args.prefill_mode,
+        )
         print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
 
     write_output_rows(args.output_csv, all_rows)
@@ -861,7 +868,6 @@ def rank0_generate_dynamic(
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
-    summary_by_rank = create_summary(world_size)
     model = None
     current_stage = None
 
@@ -967,8 +973,14 @@ def rank0_generate_dynamic(
                     scheduler.update_environment_data(batch_number, environment.snapshot())
                 scheduler.reallocate_layer(batch=batch_number + 1)
             append_experiment_log(log_path, records)
-            update_summary(summary_by_rank, records)
-            append_summary_log(log_path, summary_by_rank, batch_number)
+            append_summary_log(
+                log_path,
+                records,
+                batch_number,
+                environment=environment,
+                boundaries=boundaries,
+                prefill_mode=args.prefill_mode,
+            )
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
@@ -997,7 +1009,8 @@ def handle_worker_batch(
     is_last_rank = rank == world_size - 1
     past_key_values = initial_past_key_values
     metric = initial_metric
-    decode_time_ms = 0.0
+    decode_comp_time_ms = 0.0
+    decode_transfer_time_ms = 0.0
     decode_step_count = 0
 
     with torch.inference_mode():
@@ -1016,15 +1029,11 @@ def handle_worker_batch(
                         for _ in range(world_size - rank - 1)
                     ]
                 if metric is not None:
-                    metric["decode_step_count"] = decode_step_count
-                    metric["decode_time_total_ms"] = decode_time_ms
-                    metric["decode_time_per_token_ms"] = (
-                        decode_time_ms / decode_step_count if decode_step_count else 0.0
-                    )
-                    metric["inference_compute_total_ms"] = (
-                        metric["prefill_time_total_ms"]
-                        + metric["cloud_prefill_rank2_time_ms"]
-                        + decode_time_ms
+                    finish_decode_metric(
+                        metric,
+                        decode_step_count,
+                        decode_comp_time_ms,
+                        decode_transfer_time_ms,
                     )
                     if is_last_rank:
                         send_metric_record(metric, device, dst=prev_rank)
@@ -1041,12 +1050,9 @@ def handle_worker_batch(
                 prompt_count = batch_size
                 input_seq_len_max = int(attention_mask_2d.shape[1])
                 input_seq_len_avg = float(attention_mask_2d.sum(dim=1).float().mean().item())
-                synchronize_cuda()
-                memory_before = cuda_memory_allocated(device)
-                start_time = time.perf_counter()
-            else:
-                synchronize_cuda()
-                decode_start_time = time.perf_counter()
+
+            synchronize_cuda()
+            compute_start_time = time.perf_counter()
 
             if is_last_rank:
                 logits, past_key_values = rank1_forward_logits(
@@ -1056,17 +1062,15 @@ def handle_worker_batch(
                     attention_mask_2d,
                     past_key_values=past_key_values,
                 )
-                output_hidden_states = hidden_states
-                if is_prefill and metric is None:
-                    synchronize_cuda()
-                    prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
-                    memory_after = cuda_memory_allocated(device)
-                    memory_reserved_after = cuda_memory_reserved(device)
                 next_token = choose_next_token(logits, args.temperature).to(torch.long).contiguous()
-                if not is_prefill:
-                    synchronize_cuda()
-                    decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
-                    decode_step_count += 1
+                synchronize_cuda()
+                comp_time_ms = (time.perf_counter() - compute_start_time) * 1000.0
+                transfer_time_ms = send_token_with_timing(
+                    next_token,
+                    dst=0,
+                    environment=environment,
+                    src=rank,
+                )
             else:
                 output_hidden_states, past_key_values = rank_middle_forward(
                     model,
@@ -1075,33 +1079,18 @@ def handle_worker_batch(
                     attention_mask_2d,
                     past_key_values=past_key_values,
                 )
-                if is_prefill and metric is None:
-                    synchronize_cuda()
-                    prefill_time_ms = (time.perf_counter() - start_time) * 1000.0
-                    memory_after = cuda_memory_allocated(device)
-                    memory_reserved_after = cuda_memory_reserved(device)
-                if not environment_link_has_effect(environment, rank, next_rank):
-                    send_hidden(output_hidden_states, dst=next_rank, attention_mask_2d=attention_mask_2d)
-                else:
-                    from bandwidth_transfer import send_hidden_limited
-
-                    send_hidden_limited(
-                        output_hidden_states,
-                        dst=next_rank,
-                        attention_mask_2d=attention_mask_2d,
-                        environment=environment,
-                        src=rank,
-                    )
-                if not is_prefill:
-                    synchronize_cuda()
-                    decode_time_ms += (time.perf_counter() - decode_start_time) * 1000.0
-                    decode_step_count += 1
-                # Middle ranks only forward hidden states. The final rank now
-                # sends the generated token directly back to Rank 0.
-                next_token = None
+                synchronize_cuda()
+                comp_time_ms = (time.perf_counter() - compute_start_time) * 1000.0
+                transfer_time_ms = send_hidden_from_worker(
+                    output_hidden_states,
+                    dst=next_rank,
+                    attention_mask_2d=attention_mask_2d,
+                    environment=environment,
+                    src=rank,
+                )
 
             if is_prefill and metric is None:
-                metric = build_prefill_metric(
+                metric = build_batch_metric(
                     batch_number=batch_number,
                     rank=rank,
                     world_size=world_size,
@@ -1113,20 +1102,13 @@ def handle_worker_batch(
                     input_seq_len_avg=input_seq_len_avg,
                     model=model,
                     past_key_values=past_key_values,
-                    hidden_states=output_hidden_states,
-                    memory_before=memory_before,
-                    memory_after=memory_after,
-                    memory_reserved_after=memory_reserved_after,
-                    prefill_time_ms=prefill_time_ms,
+                    prefill_comp_time_ms=comp_time_ms,
+                    prefill_transfer_time_ms=transfer_time_ms,
                 )
-
-            if is_last_rank:
-                if environment_link_has_effect(environment, rank, 0):
-                    from bandwidth_transfer import send_token_limited
-
-                    send_token_limited(next_token, dst=0, environment=environment, src=rank)
-                else:
-                    send_token(next_token, dst=0)
+            elif not is_prefill:
+                decode_comp_time_ms += comp_time_ms
+                decode_transfer_time_ms += transfer_time_ms
+                decode_step_count += 1
 
 
 def pipeline_serve_static(
