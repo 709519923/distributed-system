@@ -226,6 +226,8 @@ def append_summary_log(log_path, records, batch_number, environment=None, bounda
         _write_environment(f, environment)
         for rank in sorted(records_by_rank):
             record = records_by_rank[rank]
+            is_distributed_mode = prefill_mode == "distributed"
+            is_cloud_base_mode = prefill_mode == "cloud-base"
             distributed_compute = (
                 float(record["prefill_comp_time_ms"])
                 + float(record["decode_comp_time_ms"])
@@ -239,23 +241,28 @@ def append_summary_log(log_path, records, batch_number, environment=None, bounda
                 float(record["cloud_prefill_rank2_time_ms"])
                 + float(record["kv_cache_send_time_ms"])
                 + float(record["kv_cache_recv_time_ms"])
-                + float(record["prefill_transfer_time_ms"])
                 + float(record["decode_comp_time_ms"])
                 + float(record["decode_transfer_time_ms"])
             )
             f.write(f"rank={int(rank)}\n")
             f.write("Distributed:\n")
-            f.write(
-                "Tcompute_plus_Ttransfer_plus_Tcomm_ms="
-                f"{distributed_total:.2f}\n"
-            )
-            f.write(f"Tcompute_ms={distributed_compute:.2f}\n")
-            f.write(f"Ttransfer_plus_Tcomm_ms={distributed_transfer:.2f}\n")
+            if is_cloud_base_mode:
+                f.write("not applicable\n")
+            else:
+                f.write(
+                    "Tcompute_plus_Ttransfer_plus_Tcomm_ms="
+                    f"{distributed_total:.2f}\n"
+                )
+                f.write(f"Tcompute_ms={distributed_compute:.2f}\n")
+                f.write(f"Ttransfer_plus_Tcomm_ms={distributed_transfer:.2f}\n")
             f.write("Cloud-base:\n")
-            f.write(
-                "Tdecode_plus_Ttransfer_plus_Tcomm_ms="
-                f"{cloud_total:.2f}\n"
-            )
+            if is_distributed_mode:
+                f.write("not applicable\n")
+            else:
+                f.write(
+                    "Tdecode_plus_Ttransfer_plus_Tcomm_ms="
+                    f"{cloud_total:.2f}\n"
+                )
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())

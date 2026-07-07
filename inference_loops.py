@@ -431,7 +431,7 @@ def generate_rows_for_prompts_cloud_base(
         f"input_ids_shape={tuple(input_ids.shape)}"
     )
     if not environment_link_has_effect(environment, 0, last_rank):
-        prefill_transfer_time_ms = send_prefill_inputs(
+        send_prefill_inputs(
             input_ids,
             attention_mask_2d,
             dst=last_rank,
@@ -440,7 +440,7 @@ def generate_rows_for_prompts_cloud_base(
     else:
         from bandwidth_transfer import send_prefill_inputs_limited
 
-        prefill_transfer_time_ms = send_prefill_inputs_limited(
+        send_prefill_inputs_limited(
             input_ids,
             attention_mask_2d,
             dst=last_rank,
@@ -491,7 +491,7 @@ def generate_rows_for_prompts_cloud_base(
         model=model,
         past_key_values=rank0_past_key_values,
         prefill_comp_time_ms=0.0,
-        prefill_transfer_time_ms=prefill_transfer_time_ms,
+        prefill_transfer_time_ms=0.0,
         kv_cache_recv_time_ms=kv_cache_recv_time_ms,
     )
     records = [normalize_record(rank0_metric, str(model.dtype))]
@@ -708,7 +708,7 @@ def run_rank2_cloud_base_prefill(
         f"[Rank 2] Cloud-base: KV cache partitions sent in "
         f"{kv_cache_send_time_ms:.2f} ms; sending first token to Rank 0."
     )
-    first_token_transfer_time_ms = send_token_with_timing(
+    send_token_with_timing(
         next_token,
         dst=0,
         environment=environment,
@@ -729,7 +729,7 @@ def run_rank2_cloud_base_prefill(
         model=decode_model,
         past_key_values=rank2_past_key_values,
         prefill_comp_time_ms=0.0,
-        prefill_transfer_time_ms=first_token_transfer_time_ms,
+        prefill_transfer_time_ms=0.0,
         cloud_prefill_rank2_time_ms=cloud_prefill_rank2_time_ms,
         kv_cache_send_time_ms=kv_cache_send_time_ms,
     )

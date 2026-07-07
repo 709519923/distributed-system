@@ -149,6 +149,7 @@ kv_cache_size_mb_after_prefill     当前 rank 的 KV cache 大小
 distributed parameter:
 prefill_comp_time_ms               prefill 阶段本 rank 计算时间
 prefill_transfer_time_ms           prefill 阶段本 rank 发出数据的传输时间，包含环境模拟时延
+                                  只用于 PREFILL_MODE=distributed；cloud-base 下应为 0.00
 
 Cloud-base parameter:
 cloud_prefill_rank2_time_ms        cloud-base 中 Rank 2 完整模型 prefill 时间
@@ -160,6 +161,7 @@ decode_step_count                  decode 自回归 forward 次数
 decode_comp_time_ms                decode 阶段本 rank 计算时间
 decode_transfer_time_ms            decode 阶段本 rank 发出数据的传输时间，包含环境模拟时延
 decode_time_per_token_ms           (decode_comp_time_ms + decode_transfer_time_ms) / decode_step_count
+                                  只统计 prefill 之后继续自回归的 decode；cloud-base 的 first token 不计入
 ```
 
 summary 主要包含：
@@ -169,6 +171,7 @@ summary 主要包含：
 当前 batch 的 layer_allocation
 当前 batch 的 Environment 带宽和通信时延
 每个 rank 当前 batch 的 Distributed / Cloud-base 汇总时间
+非当前 PREFILL_MODE 的 summary 栏目会写 not applicable
 ```
 
 ## 排查建议

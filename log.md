@@ -1,5 +1,39 @@
 # Version Log
 
+## 2026-07-07
+
+### Cloud-base log field correction
+
+- Corrected the `cloud-base` metric semantics after experiment output showed `Rank 0 prefill_transfer_time_ms` as non-zero. That value came from `Rank 0 -> Rank 2` prompt transfer, but this field belongs to the `distributed parameter` section and should only describe the distributed prefill pipeline.
+- In `PREFILL_MODE=cloud-base`, all ranks now keep the distributed prefill fields at zero:
+
+  ```text
+  prefill_comp_time_ms=0.00
+  prefill_transfer_time_ms=0.00
+  ```
+
+- `cloud-base` still performs `Rank 0 -> Rank 2` prompt transfer and `Rank 2 -> Rank 0` first-token transfer, but these are not recorded in `distributed parameter`. The cloud-base section remains focused on:
+
+  ```text
+  cloud_prefill_rank2_time_ms
+  kv_cache_send_time_ms
+  kv_cache_recv_time_ms
+  ```
+
+- `Common parameter` remains decode-only. It starts after the first token has already been produced by prefill. If a batch naturally stops after that first token, these fields can be zero:
+
+  ```text
+  decode_step_count=0
+  decode_comp_time_ms=0.00
+  decode_transfer_time_ms=0.00
+  decode_time_per_token_ms=0.00
+  ```
+
+- Updated `experiment_report.py` summary calculation so the cloud-base summary no longer adds `prefill_transfer_time_ms`.
+- Updated `experiment_report.py` summary display so only the active `PREFILL_MODE` prints timing values. The inactive mode is kept as a section header but writes `not applicable`, which avoids implying that distributed and cloud-base prefill both ran in the same batch.
+- Updated `inference_loops.py` so cloud-base Rank 0 no longer writes prompt transfer time into `prefill_transfer_time_ms`, and cloud-base Rank 2 no longer writes first-token transfer time into `prefill_transfer_time_ms`.
+- Updated `readme.md` to document that `distributed parameter` only applies to `PREFILL_MODE=distributed`.
+
 ## 2026-07-06
 
 ### Experiment log timing rework
@@ -66,20 +100,24 @@
 - Cloud-base prefill mapping:
 
   ```text
-  Rank 0 prefill_transfer_time_ms       = tokenized prompt tensors Rank 0 -> Rank 2
+  Rank 0 prefill_comp_time_ms           = 0.00
+  Rank 0 prefill_transfer_time_ms       = 0.00
   Rank 0 kv_cache_recv_time_ms          = receive + rebuild Rank 0 KV cache
 
+  Rank 1 prefill_comp_time_ms           = 0.00
+  Rank 1 prefill_transfer_time_ms       = 0.00
   Rank 1 kv_cache_recv_time_ms          = receive + rebuild Rank 1 KV cache
 
+  Rank 2 prefill_comp_time_ms           = 0.00
+  Rank 2 prefill_transfer_time_ms       = 0.00
   Rank 2 cloud_prefill_rank2_time_ms    = full-model prefill on Rank 2
   Rank 2 kv_cache_send_time_ms          = parallel KV cache metadata/payload send
-  Rank 2 prefill_transfer_time_ms       = first token Rank 2 -> Rank 0
   ```
 
 - `experiment_report.py` was rewritten around the new record schema. It now prints the record in three sections: `distributed parameter`, `Cloud-base parameter`, and `Common parameter`. It also prints the current batch layer allocation and Environment snapshot in the summary.
 - `inference_loops.py` was refactored so Rank 0 and worker ranks no longer use one large timer around "compute + send". Each path now records local forward time separately from outgoing communication time.
 - `bandwidth_transfer.py` wrappers now return elapsed milliseconds for limited hidden-state, token, and prefill-input sends. This allows the inference loop to record transfer time without reimplementing the Environment delay calculation.
-- `kv_cache_transfer.py` now returns elapsed milliseconds from `send_prefill_inputs()`, so cloud-base Rank 0 can record prompt-transfer time using the same field as other prefill boundary transfers.
+- `kv_cache_transfer.py` now returns elapsed milliseconds from `send_prefill_inputs()`, but cloud-base prompt transfer is intentionally not written to `prefill_transfer_time_ms` because that field belongs to distributed prefill.
 - `readme.md` was rewritten to document only the current startup flow and active log fields.
 
 ### Environment-based per-link bandwidth and delay simulation
