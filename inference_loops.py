@@ -194,6 +194,23 @@ def finish_decode_metric(metric, decode_step_count, decode_comp_time_ms, decode_
     )
 
 
+def force_decode_enabled(args):
+    """Return True when the run should ignore EOS and execute fixed decode steps."""
+    return getattr(args, "force_decode_steps", None) is not None
+
+
+def decode_iteration_limit(args):
+    """Return Rank 0 loop iterations needed for normal or forced decoding.
+
+    The token immediately available after prefill is appended before the first
+    decode forward. Therefore N forced decode forwards require N+1 loop
+    iterations: one to append the prefill token, then N decode sends.
+    """
+    if force_decode_enabled(args):
+        return int(args.force_decode_steps) + 1
+    return int(args.max_new_tokens)
+
+
 def generate_rows_for_prompts(
     args,
     model,
@@ -303,10 +320,14 @@ def generate_rows_for_prompts(
         rank0_decode_comp_time_ms = 0.0
         rank0_decode_transfer_time_ms = 0.0
         rank0_decode_step_count = 0
-        for token_index in range(args.max_new_tokens):
+        force_decode = force_decode_enabled(args)
+        for token_index in range(decode_iteration_limit(args)):
             synchronize_cuda()
             rank0_decode_compute_start_time = time.perf_counter()
-            active = ~finished
+            if force_decode:
+                active = torch.ones(batch_size, dtype=torch.bool, device=device)
+            else:
+                active = ~finished
             tokens_to_append = torch.where(
                 active.unsqueeze(1),
                 next_token,
@@ -318,11 +339,15 @@ def generate_rows_for_prompts(
                 if active[row_index]:
                     token_value = int(next_token[row_index, 0].item())
                     generated_tokens[row_index].append(token_value)
-                    if eos_token_id is not None and token_value == eos_token_id:
+                    if not force_decode and eos_token_id is not None and token_value == eos_token_id:
                         finished[row_index] = True
 
             attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
-            if bool(finished.all().item()) or token_index == args.max_new_tokens - 1:
+            if force_decode:
+                should_stop = rank0_decode_step_count >= int(args.force_decode_steps)
+            else:
+                should_stop = bool(finished.all().item()) or token_index == args.max_new_tokens - 1
+            if should_stop:
                 break
 
             decode_input_ids = tokens_to_append
@@ -502,10 +527,14 @@ def generate_rows_for_prompts_cloud_base(
     rank0_decode_step_count = 0
 
     with torch.inference_mode():
-        for token_index in range(args.max_new_tokens):
+        force_decode = force_decode_enabled(args)
+        for token_index in range(decode_iteration_limit(args)):
             synchronize_cuda()
             rank0_decode_compute_start_time = time.perf_counter()
-            active = ~finished
+            if force_decode:
+                active = torch.ones(batch_size, dtype=torch.bool, device=device)
+            else:
+                active = ~finished
             tokens_to_append = torch.where(
                 active.unsqueeze(1),
                 next_token,
@@ -517,11 +546,15 @@ def generate_rows_for_prompts_cloud_base(
                 if active[row_index]:
                     token_value = int(next_token[row_index, 0].item())
                     generated_tokens[row_index].append(token_value)
-                    if eos_token_id is not None and token_value == eos_token_id:
+                    if not force_decode and eos_token_id is not None and token_value == eos_token_id:
                         finished[row_index] = True
 
             attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
-            if bool(finished.all().item()) or token_index == args.max_new_tokens - 1:
+            if force_decode:
+                should_stop = rank0_decode_step_count >= int(args.force_decode_steps)
+            else:
+                should_stop = bool(finished.all().item()) or token_index == args.max_new_tokens - 1
+            if should_stop:
                 break
 
             hidden_states, rank0_past_key_values = rank0_forward(

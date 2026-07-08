@@ -1,5 +1,25 @@
 # Version Log
 
+## 2026-07-08
+
+### Forced decode-step mode
+
+- Added the runtime option `--force-decode-steps N`. This option ignores EOS and forces Rank 0 to drive exactly `N` decode forward steps after prefill.
+- Added `FORCE_DECODE_STEPS` to `run.sh`. Leave it empty to keep the normal stopping rule. Set it to a number, for example `128`, to pass `--force-decode-steps 128` to the Python program:
+
+  ```bash
+  FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
+  ```
+
+- The forced count is decode-forward count, not total generated-token count. The first token produced directly by prefill is not counted. Therefore `--force-decode-steps 128` means:
+
+  ```text
+  first token from prefill + 128 forced decode forwards
+  ```
+
+- In forced mode, Rank 0 keeps every row active even if EOS appears. This keeps batch shape and decode work stable for performance experiments.
+- Worker ranks do not need their own stopping logic. They continue to be message-driven: Rank 0 sends hidden states for as many forced decode steps as requested, then sends `batch_done`.
+
 ## 2026-07-07
 
 ### Cloud-base log field correction

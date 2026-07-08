@@ -64,6 +64,15 @@ def parse_args():
         help="Maximum generated tokens for each prompt. Default: 512",
     )
     parser.add_argument(
+        "--force-decode-steps",
+        type=int,
+        default=None,
+        help=(
+            "Ignore EOS and force this many decode forward steps after prefill. "
+            "When set, --max-new-tokens is not used as the decode loop limit."
+        ),
+    )
+    parser.add_argument(
         "--max-input-tokens",
         type=int,
         default=1024,
@@ -162,6 +171,8 @@ def parse_args():
         ),
     )
     args = parser.parse_args()
+    if args.force_decode_steps is not None and args.force_decode_steps < 0:
+        parser.error("--force-decode-steps must be a non-negative integer.")
     return args
 
 

@@ -13,6 +13,12 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
+
+FORCE_DECODE_STEPS_ARG=""
+if [ -n "$FORCE_DECODE_STEPS" ]; then
+    FORCE_DECODE_STEPS_ARG="--force-decode-steps $FORCE_DECODE_STEPS"
+fi
 
 RANK_ARG=$1
 
@@ -32,7 +38,7 @@ else
     PREFILL_MODE_TEXT="receive-from-rank0"
 fi
 
-echo "[run.sh] RANK=$RANK_ARG WORLD_SIZE=$WORLD_SIZE_VALUE PREFILL_MODE=$PREFILL_MODE_TEXT BATCH_SIZE=$BATCH_SIZE SPLIT_LAYERS=$SPLIT_LAYERS SCHEDULER_CSV=$SCHEDULER_CSV INIT_METHOD=$INIT_METHOD COMPUTE_DEVICE=$COMPUTE_DEVICE"
+echo "[run.sh] RANK=$RANK_ARG WORLD_SIZE=$WORLD_SIZE_VALUE PREFILL_MODE=$PREFILL_MODE_TEXT BATCH_SIZE=$BATCH_SIZE SPLIT_LAYERS=$SPLIT_LAYERS SCHEDULER_CSV=$SCHEDULER_CSV INIT_METHOD=$INIT_METHOD COMPUTE_DEVICE=$COMPUTE_DEVICE FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-off}"
 
 if [ "$RANK_ARG" = "0" ]; then
     export WORLD_SIZE=$WORLD_SIZE_VALUE
@@ -54,7 +60,8 @@ if [ "$RANK_ARG" = "0" ]; then
       --output-csv $OUTPUT_CSV \
       --csv-has-header \
       --prompt-column prompt \
-      --max-input-tokens $MAX_INPUT_TOKENS
+      --max-input-tokens $MAX_INPUT_TOKENS \
+      $FORCE_DECODE_STEPS_ARG
 fi
 
 if [ "$RANK_ARG" = "1" ]; then
@@ -72,7 +79,8 @@ if [ "$RANK_ARG" = "1" ]; then
       --model-dir $MODEL_DIR \
       --csv-has-header \
       --prompt-column prompt \
-      --max-input-tokens $MAX_INPUT_TOKENS
+      --max-input-tokens $MAX_INPUT_TOKENS \
+      $FORCE_DECODE_STEPS_ARG
 fi
 
 if [ "$RANK_ARG" = "2" ]; then
@@ -90,5 +98,6 @@ if [ "$RANK_ARG" = "2" ]; then
       --model-dir $MODEL_DIR \
       --csv-has-header \
       --prompt-column prompt \
-      --max-input-tokens $MAX_INPUT_TOKENS
+      --max-input-tokens $MAX_INPUT_TOKENS \
+      $FORCE_DECODE_STEPS_ARG
 fi

@@ -30,6 +30,7 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 ```
 
 含义：
@@ -46,7 +47,16 @@ MODEL_DIR         TinyLlama 模型目录
 INPUT_CSV         Rank 0 读取的输入 CSV
 OUTPUT_CSV        Rank 0 写出的结果 CSV
 MAX_INPUT_TOKENS  输入 prompt 最大 token 长度
+FORCE_DECODE_STEPS 固定 decode forward 次数；空值表示按 EOS / max_new_tokens 自然停止
 ```
+
+如果要固定 decode 阶段执行 128 步，在 `run.sh` 顶部设置：
+
+```bash
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
+```
+
+该参数对应命令行 `--force-decode-steps 128`。它会忽略 EOS，强制执行 128 次 prefill 之后的 decode forward。prefill 直接得到的 first token 不计入这 128 步。
 
 ## Scheduler
 
