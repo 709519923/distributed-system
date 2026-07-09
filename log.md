@@ -5,6 +5,58 @@
 ### multi-arm bandit algorithm
 
 - Added the first runnable online multi-arm bandit scheduler inside `scheduler.py`. The goal of this version is to close the adaptive scheduling loop with a small, auditable algorithm before adding more complex policies.
+- Added a dedicated Bandit log directory:
+
+  ```text
+  bandit_logs/
+  ```
+
+  This directory stores Scheduler and Bandit observation files for the current run. These files are for inspection and later analysis only. The online Bandit decision still uses in-memory data and does not read these CSV files during inference.
+
+- Moved the Scheduler summary file from the project root into `bandit_logs/`, and added a run timestamp to the filename:
+
+  ```text
+  bandit_logs/scheduler_summary_YYYY-MM-DD-HH-MM.csv
+  ```
+
+  The file content is unchanged:
+
+  ```text
+  batch,prefill_mode,layer_allocation,rank,time_label,time_ms
+  ```
+
+- Added a compact per-batch arm score file:
+
+  ```text
+  bandit_logs/arm_details_YYYY-MM-DD-HH-MM.csv
+  ```
+
+  After every completed batch, this file appends one row for every candidate arm. The current fields are:
+
+  ```text
+  batch,arm,reward,score,selected
+  ```
+
+  Field meaning:
+
+  ```text
+  batch
+      The completed batch that triggered this snapshot.
+
+  arm
+      Candidate layer split in the form (p1,p2).
+
+  reward
+      Current normalized reward of the arm.
+
+  score
+      Current UCB score of the arm. Unmeasured arms are written as "untried"
+      because the policy gives them priority before numeric UCB comparison.
+
+  selected
+      1 if this arm was selected for the next batch, otherwise 0.
+  ```
+
 - The code now separates the three scheduler responsibilities:
 
   ```text
@@ -220,7 +272,7 @@
       -> scheduler.csv stores the layer split for batch N+1
   ```
 
-- `scheduler_summary.csv` remains an audit and post-processing file. The bandit does not read it during online scheduling. Online decisions use `Scheduler.batch_summary_history` directly from memory.
+- `bandit_logs/scheduler_summary_YYYY-MM-DD-HH-MM.csv` remains an audit and post-processing file. The bandit does not read it during online scheduling. Online decisions use `Scheduler.batch_summary_history` directly from memory.
 
 ## 2026-07-08
 

@@ -25,6 +25,7 @@ import csv
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -302,6 +303,34 @@ class LayerBanditPolicy:
                 best_score = score
         return best_arm
 
+    def arm_score_snapshot(self, selected_arm):
+        """Return compact per-arm reward/score rows for logging."""
+        selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        rows = []
+        log_total = math.log(max(self.total_pulls, 2))
+        for arm in self.arms:
+            stats = self.stats[arm]
+            pulls = int(stats["pulls"])
+            reward = float(stats["reward"])
+            if pulls == 0:
+                score = "untried"
+            else:
+                score_value = reward + self.exploration_weight * math.sqrt(log_total / pulls)
+                score = f"{score_value:.6f}"
+            rows.append(
+                {
+                    "arm": self._format_arm(arm),
+                    "reward": f"{reward:.6f}",
+                    "score": score,
+                    "selected": 1 if arm == selected_arm else 0,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _format_arm(arm):
+        return f"({int(arm[0])},{int(arm[1])})"
+
 
 class Scheduler:
     """Maintain per-batch layer allocations in scheduler.csv.
@@ -317,7 +346,10 @@ class Scheduler:
         self.world_size = int(world_size)
         self.default_boundaries = [int(value) for value in default_boundaries]
         self.fieldnames = ["batch"] + [f"rank{rank}" for rank in range(self.world_size)]
-        self.summary_path = self.path.with_name("scheduler_summary.csv")
+        self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+        self.bandit_log_dir = self.path.parent / "bandit_logs"
+        self.summary_path = self.bandit_log_dir / f"scheduler_summary_{self.run_timestamp}.csv"
+        self.arm_details_path = self.bandit_log_dir / f"arm_details_{self.run_timestamp}.csv"
         self.summary_fieldnames = [
             "batch",
             "prefill_mode",
@@ -326,6 +358,7 @@ class Scheduler:
             "time_label",
             "time_ms",
         ]
+        self.arm_details_fieldnames = ["batch", "arm", "reward", "score", "selected"]
         self.allocations = {}
         # These fields keep online data in memory so adaptive policies do not
         # need to parse scheduler_summary.csv during the running experiment.
@@ -442,10 +475,12 @@ class Scheduler:
 
     def run_bandit_after_batch(self, batch):
         """Run the online bandit policy after one batch summary is collected."""
-        return self.bandit.observe_and_select(
+        selected_arm = self.bandit.observe_and_select(
             batch=batch,
             batch_summary_history=self.batch_summary_history,
         )
+        self.append_arm_details(batch, selected_arm)
+        return selected_arm
 
     def reallocate_layer(self, batch=None, arm=None, rank_metrics=None):
         """Write the selected next-batch layer allocation to scheduler.csv.
@@ -500,6 +535,25 @@ class Scheduler:
                             "time_ms": f"{float(summary['rank_times'][rank]):.6f}",
                         }
                     )
+
+    def append_arm_details(self, batch, selected_arm):
+        """Append one compact reward/score snapshot for every candidate arm."""
+        self.arm_details_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = self.arm_details_path.exists()
+        with open(self.arm_details_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.arm_details_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            for row in self.bandit.arm_score_snapshot(selected_arm):
+                writer.writerow(
+                    {
+                        "batch": int(batch),
+                        "arm": row["arm"],
+                        "reward": row["reward"],
+                        "score": row["score"],
+                        "selected": row["selected"],
+                    }
+                )
 
     def _load_existing_file(self):
         """Load scheduler.csv if it already exists."""
