@@ -1,6 +1,304 @@
 # Version Log
 
+## 2026-07-09
+
+### multi-arm bandit algorithm
+
+- Added the first runnable online multi-arm bandit scheduler inside `scheduler.py`. The goal of this version is to close the adaptive scheduling loop with a small, auditable algorithm before adding more complex policies.
+- The code now separates the three scheduler responsibilities:
+
+  ```text
+  collect_batch_summary()
+      -> collect the completed batch data into Scheduler memory
+
+  run_bandit_after_batch()
+      -> run the bandit policy and return the next arm
+
+  reallocate_layer()
+      -> write the selected next-batch allocation to scheduler.csv
+  ```
+
+- `reallocate_layer()` is intentionally not the decision maker. It is now the final writer: it receives an arm selected by the bandit, converts that arm into layer boundaries, validates the boundaries, and writes the next `scheduler.csv` row.
+- Added `LayerBanditPolicy` to `scheduler.py`. This class owns the bandit state in memory:
+
+  ```text
+  current_arm
+  active_batches
+  per-arm pulls
+  per-arm mean_cost
+  per-arm normalized reward
+  total_pulls
+  ```
+
+- The algorithm currently targets the three-rank layout. One arm is:
+
+  $$
+  arm_t = (p_1, p_2)
+  $$
+
+  It maps to:
+
+  $$
+  \begin{aligned}
+  \text{rank0} &: [0, p_1) \\
+  \text{rank1} &: [p_1, p_2) \\
+  \text{rank2} &: [p_2, L)
+  \end{aligned}
+  $$
+
+  where \(L\) is the total number of decoder layers.
+
+- For TinyLlama with `total_layers=22`, an example arm is:
+
+  $$
+  arm_t = (5, 15)
+  $$
+
+  $$
+  \begin{aligned}
+  \text{rank0} &: [0, 5) \\
+  \text{rank1} &: [5, 15) \\
+  \text{rank2} &: [15, 22)
+  \end{aligned}
+  $$
+
+- Candidate arms are generated as a small local search space around the default `--split-layers` value. For example, if the default split is `(5, 15)`, the policy tries nearby values using offsets `-4, -2, 0, +2, +4`, while keeping only valid arms satisfying:
+
+  $$
+  0 < p_1 < p_2 < L
+  $$
+
+- One arm is measured for six completed batches:
+
+  $$
+  W = 6
+  $$
+
+  The first batch is treated as warmup, and only the following five batches update the reward:
+
+  $$
+  \mathcal{B}_{reward} = \{b_2, b_3, b_4, b_5, b_6\}
+  $$
+
+  This is meant to reduce the effect of model reload, CUDA warmup, lazy-load behavior, and first-communication setup noise.
+
+- For each completed batch `b`, the scheduler already has one summary time per rank in memory:
+
+  $$
+  T_{b,0},\quad T_{b,1},\quad T_{b,2}
+  $$
+
+  In `PREFILL_MODE=distributed`, this time is:
+
+  $$
+  T_{b,r}
+  =
+  \texttt{Tcompute\_plus\_Ttransfer\_plus\_Tcomm\_ms}_{b,r}
+  $$
+
+  This is the active value printed in the `Distributed` summary section for rank \(r\) in batch \(b\).
+
+  In `PREFILL_MODE=cloud-base`, this time is:
+
+  $$
+  T_{b,r}
+  =
+  \texttt{Tdecode\_plus\_Ttransfer\_plus\_Tcomm\_ms}_{b,r}
+  $$
+
+  This is the active value printed in the `Cloud-base` summary section for rank \(r\) in batch \(b\).
+
+- The cost of one batch is the slowest rank in that batch:
+
+  $$
+  C_b = \max(T_{b,0}, T_{b,1}, T_{b,2})
+  $$
+
+  This matches pipeline behavior: the slowest stage is the batch bottleneck.
+
+- The cost of one arm is the mean bottleneck cost over the five non-warmup batches:
+
+  $$
+  cost(arm_t)
+  =
+  \frac{1}{5}
+  \sum_{b \in \mathcal{B}_{reward}} C_b
+  $$
+
+- The reward is normalized across arms that have already been measured. The policy does not compare raw absolute milliseconds directly. For an observed arm `a`:
+
+  $$
+  reward(a)
+  =
+  1
+  -
+  \frac{\overline{C}_a - C_{min}}{C_{max} - C_{min}}
+  $$
+
+  where:
+
+  $$
+  C_{min} = \min_{a \in \mathcal{A}_{obs}} \overline{C}_a
+  $$
+
+  $$
+  C_{max} = \max_{a \in \mathcal{A}_{obs}} \overline{C}_a
+  $$
+
+  and \(\overline{C}_a\) is the current mean measured cost of arm \(a\).
+
+  Symbol details:
+
+  $$
+  a
+  $$
+
+  is one candidate arm, for example \((5, 15)\).
+
+  $$
+  \mathcal{A}_{obs}
+  $$
+
+  is the set of arms that already have at least one completed six-batch measurement window.
+
+  $$
+  \overline{C}_a
+  $$
+
+  is the running mean cost of arm \(a\). If the same arm is tested multiple times, each six-batch window produces one measured cost, and \(\overline{C}_a\) is the average of those measured costs.
+
+  $$
+  C_{min}
+  $$
+
+  is the smallest \(\overline{C}_a\) among all observed arms, meaning the best measured arm so far.
+
+  $$
+  C_{max}
+  $$
+
+  is the largest \(\overline{C}_a\) among all observed arms, meaning the worst measured arm so far.
+
+  Interpretation:
+
+  ```text
+  reward ~= 1.0 means this arm is currently the best observed arm
+  reward ~= 0.0 means this arm is currently the worst observed arm
+  reward = 0.5 is used when only one arm has been measured or all observed costs are equal
+  ```
+
+- The arm selector uses a simple UCB-style score:
+
+  $$
+  score(a)
+  =
+  reward(a)
+  +
+  c
+  \sqrt{
+    \frac{\log(N)}{n_a}
+  }
+  $$
+
+  with:
+
+  $$
+  c = 0.5
+  $$
+
+  where \(N\) is the total number of measured arm windows, and \(n_a\) is the number of measured windows for arm \(a\).
+
+  Arms that have never been tested are selected first. After every candidate has at least one measured window, the policy balances exploitation of high-reward arms and exploration of less-tested arms.
+
+- Runtime flow on Rank 0 is now:
+
+  ```text
+  batch N finishes
+      -> collect_batch_summary(batch=N)
+      -> run_bandit_after_batch(batch=N)
+      -> reallocate_layer(batch=N+1, arm=next_arm)
+      -> scheduler.csv stores the layer split for batch N+1
+  ```
+
+- `scheduler_summary.csv` remains an audit and post-processing file. The bandit does not read it during online scheduling. Online decisions use `Scheduler.batch_summary_history` directly from memory.
+
 ## 2026-07-08
+
+### online data collection
+
+- Added the first minimal online data collection path inside `Scheduler`. The purpose is to let future scheduling algorithms read one compact batch-level signal without parsing the human experiment log.
+- The design intentionally follows the same timing value shown in `--- summary after batch ...`. It does not collect detailed per-field records yet. The collected data is limited to:
+
+  ```text
+  Batch Number
+  Way of layer allocation
+  Rank
+  One mode-dependent summary time
+  ```
+
+- In memory, `Scheduler` now keeps:
+
+  ```text
+  scheduler.batch_summary_history[batch]
+  ```
+
+  Each entry has this shape:
+
+  ```text
+  {
+      "batch": batch_number,
+      "prefill_mode": "distributed" or "cloud-base",
+      "layer_allocation": "rank0=[0,5) rank1=[5,15) rank2=[15,22)",
+      "time_label": "...",
+      "rank_times": {
+          0: time_ms,
+          1: time_ms,
+          2: time_ms,
+      },
+  }
+  ```
+
+- The same data is written after each completed batch to:
+
+  ```text
+  scheduler_summary.csv
+  ```
+
+  The file format is intentionally narrow:
+
+  ```text
+  batch,prefill_mode,layer_allocation,rank,time_label,time_ms
+  ```
+
+- Timing rule for `PREFILL_MODE=distributed`:
+
+  ```text
+  time_label = T_comp + T_transfer + T_comm
+  time_ms =
+      prefill_comp_time_ms
+    + prefill_transfer_time_ms
+    + decode_comp_time_ms
+    + decode_transfer_time_ms
+  ```
+
+- Timing rule for `PREFILL_MODE=cloud-base`:
+
+  ```text
+  time_label = T_decode + T_transfer + T_comm
+  time_ms =
+      cloud_prefill_rank2_time_ms
+    + kv_cache_send_time_ms
+    + kv_cache_recv_time_ms
+    + decode_comp_time_ms
+    + decode_transfer_time_ms
+  ```
+
+- No extra detailed fields are collected in this version. In particular, scheduler online data does not store parameter size, KV-cache size, decode step count, Environment bandwidth, Environment delay, or every raw metric component separately. Those can be added later only if the scheduling policy needs them.
+- `inference_loops.py` now calls `scheduler.collect_batch_summary(...)` after Rank 0 receives all rank records for a completed batch and before `scheduler.reallocate_layer(...)`. This gives future policies a stable control point:
+
+  ```text
+  batch finished -> summary data collected -> scheduler may decide next allocation
+  ```
 
 ### Forced decode-step mode
 

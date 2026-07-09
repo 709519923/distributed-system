@@ -1001,10 +1001,14 @@ def rank0_generate_dynamic(
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
             if scheduler is not None:
-                scheduler.update_rank_metrics_from_records(records, batch=batch_number)
-                if environment is not None:
-                    scheduler.update_environment_data(batch_number, environment.snapshot())
-                scheduler.reallocate_layer(batch=batch_number + 1)
+                scheduler.collect_batch_summary(
+                    batch=batch_number,
+                    prefill_mode=args.prefill_mode,
+                    boundaries=boundaries,
+                    records=records,
+                )
+                next_arm = scheduler.run_bandit_after_batch(batch_number)
+                scheduler.reallocate_layer(batch=batch_number + 1, arm=next_arm)
             append_experiment_log(log_path, records)
             append_summary_log(
                 log_path,
