@@ -1,6 +1,6 @@
 # Version Log
 
-## 2026-07-09
+## 2026-07-15
 
 ### cold start analyzer
 
@@ -18,10 +18,20 @@
   ```
 
 - The analyzer reads `prefill_mode` and `layer_allocation` from `--- summary after batch ...`, then joins them with each rank's `--- record ---` block by `batch` and `rank`.
-- The cold-start key is rank-local:
+- A cold-start estimate is emitted only when a full layer allocation appears for the first time and the immediately following batch uses the exact same allocation:
 
   ```text
-  prefill_mode, rank, layer_start, layer_end, batch_size, input_seq_len_max
+  batch N:   layer_allocation=A
+  batch N+1: layer_allocation=A
+  ```
+
+- Non-consecutive repeated allocations are ignored. This prevents comparing samples that have gone through another model partition in between.
+- Each emitted row is still rank-local and includes:
+
+  ```text
+  prefill_mode, layer_allocation, rank, layer_start, layer_end,
+  batch_size, input_seq_len_max, first_batch, second_batch,
+  cold_start_type, first_observed_ms, second_observed_ms, cold_start_ms
   ```
 
 - For `PREFILL_MODE=distributed`, cold start is estimated from prefill compute time:
@@ -43,6 +53,8 @@
   ```bash
   python cold_start_analyzer.py logs/log_YYYY-MM-DD-HH-MM.txt
   ```
+
+## 2026-07-09
 
 ### multi-arm bandit algorithm
 

@@ -25,6 +25,7 @@ class SummaryInfo:
 
     batch: int
     prefill_mode: str
+    layer_allocation: str
     rank_layers: dict
 
 
@@ -46,6 +47,7 @@ class ColdStartAnalyzer:
 
     output_fields = [
         "prefill_mode",
+        "layer_allocation",
         "rank",
         "layer_start",
         "layer_end",
@@ -91,36 +93,46 @@ class ColdStartAnalyzer:
             index += 1
 
     def compute(self):
-        """Compute one cold-start row per matching partition key."""
-        groups = {}
-        for record in self.records:
-            summary = self.summaries.get(record.batch)
-            if summary is None:
-                continue
-            layer = summary.rank_layers.get(record.rank)
-            if layer is None:
-                continue
+        """Compute cold starts only for first-seen consecutive allocations.
 
-            layer_start, layer_end = layer
-            key = (
-                summary.prefill_mode,
-                record.rank,
-                layer_start,
-                layer_end,
-                record.batch_size,
-                record.input_seq_len_max,
-            )
-            groups.setdefault(key, []).append(record)
-
+        A cold-start estimate is valid only when a full layer allocation appears
+        for the first time and the immediately following batch uses the exact
+        same allocation. This avoids comparing non-consecutive samples that may
+        have gone through a different model partition in between.
+        """
+        records_by_batch_rank = {
+            (record.batch, record.rank): record
+            for record in self.records
+        }
+        seen_allocations = set()
         rows = []
-        for key in sorted(groups):
-            samples = sorted(groups[key], key=lambda item: item.batch)
-            if len(samples) < 2:
+
+        for batch in sorted(self.summaries):
+            summary = self.summaries[batch]
+            allocation_key = (summary.prefill_mode, summary.layer_allocation)
+            if allocation_key in seen_allocations:
                 continue
-            first, second = samples[0], samples[1]
-            row = self._compute_pair(key, first, second)
-            if row is not None:
-                rows.append(row)
+            seen_allocations.add(allocation_key)
+
+            next_summary = self.summaries.get(batch + 1)
+            if next_summary is None:
+                continue
+            next_key = (next_summary.prefill_mode, next_summary.layer_allocation)
+            if next_key != allocation_key:
+                continue
+
+            for rank in sorted(summary.rank_layers):
+                first = records_by_batch_rank.get((batch, rank))
+                second = records_by_batch_rank.get((batch + 1, rank))
+                if first is None or second is None:
+                    continue
+                layer = summary.rank_layers.get(rank)
+                next_layer = next_summary.rank_layers.get(rank)
+                if layer is None or next_layer is None or layer != next_layer:
+                    continue
+                row = self._compute_pair(summary, rank, layer, first, second)
+                if row is not None:
+                    rows.append(row)
         return rows
 
     def default_output_path(self):
@@ -152,11 +164,13 @@ class ColdStartAnalyzer:
             index += 1
 
         prefill_mode = block.get("prefill_mode", "")
-        rank_layers = self._parse_layer_allocation(block.get("layer_allocation", ""))
-        if prefill_mode and rank_layers:
+        layer_allocation = self._normalize_layer_allocation(block.get("layer_allocation", ""))
+        rank_layers = self._parse_layer_allocation(layer_allocation)
+        if prefill_mode and layer_allocation and rank_layers:
             self.summaries[batch] = SummaryInfo(
                 batch=batch,
                 prefill_mode=prefill_mode,
+                layer_allocation=layer_allocation,
                 rank_layers=rank_layers,
             )
         return index
@@ -203,8 +217,24 @@ class ColdStartAnalyzer:
             rank_layers[int(match.group(1))] = (int(match.group(2)), int(match.group(3)))
         return rank_layers
 
-    def _compute_pair(self, key, first, second):
-        prefill_mode, rank, layer_start, layer_end, batch_size, input_seq_len_max = key
+    @staticmethod
+    def _normalize_layer_allocation(value):
+        intervals = []
+        for match in INTERVAL_RE.finditer(value):
+            rank = int(match.group(1))
+            start = int(match.group(2))
+            end = int(match.group(3))
+            intervals.append((rank, start, end))
+        if not intervals:
+            return ""
+        return " ".join(
+            f"rank{rank}=[{start},{end})"
+            for rank, start, end in sorted(intervals)
+        )
+
+    def _compute_pair(self, summary, rank, layer, first, second):
+        prefill_mode = summary.prefill_mode
+        layer_start, layer_end = layer
         if prefill_mode == "distributed":
             first_observed = first.prefill_comp_time_ms
             second_observed = second.prefill_comp_time_ms
@@ -224,11 +254,12 @@ class ColdStartAnalyzer:
 
         return {
             "prefill_mode": prefill_mode,
+            "layer_allocation": summary.layer_allocation,
             "rank": rank,
             "layer_start": layer_start,
             "layer_end": layer_end,
-            "batch_size": batch_size,
-            "input_seq_len_max": input_seq_len_max,
+            "batch_size": first.batch_size,
+            "input_seq_len_max": first.input_seq_len_max,
             "first_batch": first.batch,
             "second_batch": second.batch,
             "cold_start_type": cold_start_type,
