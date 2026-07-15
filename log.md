@@ -2,6 +2,48 @@
 
 ## 2026-07-09
 
+### cold start analyzer
+
+- Added `cold_start_analyzer.py` as an offline log analyzer. It does not change the distributed inference path.
+- Input:
+
+  ```text
+  logs/log_YYYY-MM-DD-HH-MM.txt
+  ```
+
+- Output:
+
+  ```text
+  logs/cold_start_time_log_YYYY-MM-DD-HH-MM.csv
+  ```
+
+- The analyzer reads `prefill_mode` and `layer_allocation` from `--- summary after batch ...`, then joins them with each rank's `--- record ---` block by `batch` and `rank`.
+- The cold-start key is rank-local:
+
+  ```text
+  prefill_mode, rank, layer_start, layer_end, batch_size, input_seq_len_max
+  ```
+
+- For `PREFILL_MODE=distributed`, cold start is estimated from prefill compute time:
+
+  ```text
+  cold_start_ms = max(0, first.prefill_comp_time_ms - second.prefill_comp_time_ms)
+  ```
+
+- For `PREFILL_MODE=cloud-base`, cold start is estimated from decode compute time after normalizing for different decode step counts:
+
+  ```text
+  stable_decode_ms_per_step = second.decode_comp_time_ms / second.decode_step_count
+  expected_first_decode_ms = stable_decode_ms_per_step * first.decode_step_count
+  cold_start_ms = max(0, first.decode_comp_time_ms - expected_first_decode_ms)
+  ```
+
+- Usage:
+
+  ```bash
+  python cold_start_analyzer.py logs/log_YYYY-MM-DD-HH-MM.txt
+  ```
+
 ### multi-arm bandit algorithm
 
 - Added the first runnable online multi-arm bandit scheduler inside `scheduler.py`. The goal of this version is to close the adaptive scheduling loop with a small, auditable algorithm before adding more complex policies.
