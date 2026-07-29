@@ -379,7 +379,7 @@ class LayerBanditPolicy:
             return []
 
         default_p1, default_p2 = self.current_arm
-        offsets = (-4, -2, 0, 2, 4)
+        offsets = (-4, 0, 4)
         arms = set()
         for p1_offset in offsets:
             for p2_offset in offsets:

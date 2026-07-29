@@ -247,6 +247,29 @@
 
 - For plain `ucb`, the window cost is now the mean of per-token bottleneck costs inside the reward window, and the stored reward is computed from that absolute cost. For `contextual`, each completed selected arm already uses the same per-token cost and absolute reward.
 
+#### 5. Smaller arm set for early algorithm tests
+
+- Reduced the candidate split offsets from:
+
+  ```text
+  (-4, -2, 0, 2, 4)
+  ```
+
+  to:
+
+  ```text
+  (-4, 0, 4)
+  ```
+
+- With the default split `(5, 15)`, the candidate grid becomes:
+
+  ```text
+  p1 in {1, 5, 9}
+  p2 in {11, 15, 19}
+  ```
+
+  which gives 9 arms instead of 25 arms. This is intended for shorter early runs where the goal is to observe whether the scheduling algorithm behaves correctly before expanding the search space.
+
 ### Files changed
 
 - `scheduler.py`: added context construction helpers, changed policy timing to `select_arm()` before batch and `update_after_batch()` after batch, implemented `ContextualBanditPolicy` with a per-arm linear model, and kept compatibility wrappers for old method names.
