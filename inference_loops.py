@@ -49,7 +49,7 @@ from pipeline_comm import (
     send_token,
     stop_boundaries,
 )
-from scheduler import Scheduler
+from scheduler import Scheduler, build_prompt_batch_contexts
 
 
 def cloud_base_kv_transfer_has_effect(environment, src_rank, world_size):
@@ -895,8 +895,21 @@ def rank0_generate_dynamic(
     total_layers = get_total_layers_from_config(args.model_dir)
     default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
     scheduler = None
+    batch_contexts = {}
     if args.allocation_csv:
-        scheduler = Scheduler(args.allocation_csv, total_layers, default_boundaries, world_size)
+        scheduler = Scheduler(
+            args.allocation_csv,
+            total_layers,
+            default_boundaries,
+            world_size,
+            bandit_policy=args.bandit_policy,
+        )
+        batch_contexts = build_prompt_batch_contexts(
+            prompts=prompts,
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            max_input_tokens=args.max_input_tokens,
+        )
 
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
@@ -906,7 +919,33 @@ def rank0_generate_dynamic(
 
     try:
         for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
-            boundaries, allocation = boundaries_for_batch(args, scheduler, default_boundaries, batch_number)
+            batch_context = batch_contexts.get(batch_number)
+            if scheduler is not None:
+                selected_arm = scheduler.select_arm_before_batch(
+                    batch=batch_number,
+                    context=batch_context,
+                )
+                if selected_arm is None:
+                    boundaries, allocation = boundaries_for_batch(
+                        args,
+                        scheduler,
+                        default_boundaries,
+                        batch_number,
+                    )
+                else:
+                    boundaries = scheduler.reallocate_layer(
+                        batch=batch_number,
+                        arm=selected_arm,
+                    )
+                    allocation = scheduler.get_or_create(batch_number)
+            else:
+                selected_arm = None
+                boundaries, allocation = boundaries_for_batch(
+                    args,
+                    scheduler,
+                    default_boundaries,
+                    batch_number,
+                )
             layer_start, layer_end = stage_from_boundaries(boundaries, rank=0)
             next_stage = (layer_start, layer_end)
             if allocation is None:
@@ -1006,9 +1045,10 @@ def rank0_generate_dynamic(
                     prefill_mode=args.prefill_mode,
                     boundaries=boundaries,
                     records=records,
+                    context=batch_context,
+                    selected_arm=selected_arm,
                 )
-                next_arm = scheduler.run_bandit_after_batch(batch_number)
-                scheduler.reallocate_layer(batch=batch_number + 1, arm=next_arm)
+                scheduler.update_policy_after_batch(batch_number)
             append_experiment_log(log_path, records)
             append_summary_log(
                 log_path,

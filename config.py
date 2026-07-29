@@ -146,6 +146,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--bandit-policy",
+        choices=("ucb", "contextual", "lipschitz", "contextual_lipschitz"),
+        default="ucb",
+        help=(
+            "Rank 0 scheduler bandit policy. Default: ucb. contextual uses "
+            "current-batch prompt context before selecting the current arm."
+        ),
+    )
+    parser.add_argument(
         "--cuda-device",
         default="0",
         help="CUDA device index used by this process. Default: 0",

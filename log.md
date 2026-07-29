@@ -1,5 +1,203 @@
 # Version Log
 
+## 2026-07-29
+
+### current-batch arm selection and Contextual Bandit
+
+#### 1. Arm selection timing change
+
+- Changed the scheduler control loop from "previous batch selects next batch" to "current batch context selects current batch".
+- Previous timing:
+
+  ```text
+  run batch N
+  -> collect records for batch N
+  -> update Bandit
+  -> select arm for batch N+1
+  -> reallocate_layer(batch=N+1)
+  ```
+
+- New timing:
+
+  ```text
+  Rank 0 reads prompts
+  -> precompute context for every prompt batch
+
+  before running batch N:
+      context_N is loaded
+      policy selects arm_N from context_N and historical observations
+      reallocate_layer(batch=N, arm=arm_N)
+      Rank 0 broadcasts boundaries_N
+
+  after running batch N:
+      Rank 0 collects all rank timing records
+      scheduler stores summary_N
+      policy updates from context_N, arm_N, reward_N
+      arm_details logs the post-update policy snapshot
+  ```
+
+- This timing now applies to every policy. Plain `ucb` ignores the context vector but still selects before the current batch. `contextual` uses the current batch context directly. `reallocate_layer()` remains only the writer: it converts the selected arm into layer boundaries and writes the current batch row in `scheduler.csv`.
+
+#### 2. Contextual Bandit design
+
+- Added an active `ContextualBanditPolicy` implementation in `scheduler.py`. The policy is enabled by setting:
+
+  ```bash
+  BANDIT_POLICY=${BANDIT_POLICY:-contextual}
+  ```
+
+  `run.sh` passes this as `--bandit-policy` on Rank 0 only. The default remains:
+
+  ```bash
+  BANDIT_POLICY=${BANDIT_POLICY:-ucb}
+  ```
+
+- Rank 0 builds one context vector for each prompt batch after reading the input CSV. No extra dataset file and no extra worker metric tensor field is required.
+- The request type is inferred from input token length:
+
+  ```text
+  short_input_long_output:    L_in in [10, 150],    L_out_est = 384
+  medium_input_medium_output: L_in in [200, 600],   L_out_est = 256
+  long_input_short_output:    L_in in [800, 1500],  L_out_est = 72
+  ```
+
+  If a batch falls outside these intervals, it is assigned to the nearest interval. `L_out_est` is therefore inferred from `L_in`; it is not passed as a separate input.
+- The contextual feature vector is:
+
+  $$
+  x_t =
+  \begin{bmatrix}
+  1 \\
+  L_{in,norm} \\
+  L_{out,norm} \\
+  B_{norm}
+  \end{bmatrix}
+  $$
+
+  with:
+
+  $$
+  L_{in,norm} = \min\left(\frac{L_t^{in}}{1500}, 1\right)
+  $$
+
+  $$
+  L_{out,norm} = \min\left(\frac{\hat{L}_t^{out}}{512}, 1\right)
+  $$
+
+  $$
+  B_{norm} = \min\left(\frac{B_t}{128}, 1\right)
+  $$
+
+- Each arm is still a three-rank layer split:
+
+  $$
+  a = (p_1, p_2)
+  $$
+
+  $$
+  rank_0 = [0, p_1), \quad rank_1 = [p_1, p_2), \quad rank_2 = [p_2, L)
+  $$
+
+- Each arm maintains an independent linear model:
+
+  $$
+  A_a = \lambda I
+  $$
+
+  $$
+  b_a = 0
+  $$
+
+  $$
+  \theta_a = A_a^{-1} b_a
+  $$
+
+- Before batch `t`, Contextual Bandit selects:
+
+  $$
+  score_t(a)
+  =
+  \theta_a^T x_t
+  +
+  \alpha
+  \sqrt{x_t^T A_a^{-1} x_t}
+  $$
+
+  $$
+  a_t = \arg\max_a score_t(a)
+  $$
+
+  where `alpha` currently reuses the existing `exploration_weight` value.
+- Contextual Bandit does have an exploration term. In the score above:
+
+  $$
+  \alpha \sqrt{x_t^T A_a^{-1} x_t}
+  $$
+
+  is the uncertainty bonus. The first part,
+
+  $$
+  \theta_a^T x_t
+  $$
+
+  is exploitation, meaning the predicted reward under the current linear model. The second part is exploration, meaning arms with less certainty under the current context get a higher score. Larger `exploration_weight` / `alpha` explores more aggressively; smaller values make the policy greedier.
+- After batch `t`, Rank 0 computes the observed bottleneck cost:
+
+  $$
+  T_t = \max_r T_{t,r}
+  $$
+
+  $$
+  D_t = \max(1, decode\_step\_count_t)
+  $$
+
+  $$
+  C_t = \frac{T_t}{D_t}
+  $$
+
+  Here `T_{t,r}` is the same mode-dependent rank time stored in `scheduler_summary`: for `distributed`, it is `T_comp + T_transfer + T_comm`; for `cloud-base`, it is `T_decode + T_transfer + T_comm`.
+- The bounded reward is:
+
+  $$
+  r_t =
+  \frac{1}{1 + \frac{C_t}{\tau}}
+  $$
+
+  with `tau = 100 ms` in this first implementation. Larger per-token bottleneck cost gives a smaller reward.
+- Only the selected arm's model is updated:
+
+  $$
+  A_{a_t} \leftarrow A_{a_t} + x_t x_t^T
+  $$
+
+  $$
+  b_{a_t} \leftarrow b_{a_t} + r_t x_t
+  $$
+
+- `ContextualLipschitzBanditPolicy` now inherits the contextual LinUCB implementation and keeps `arm_distance()` as the reserved Lipschitz hook. `LipschitzBanditPolicy` remains a UCB-compatible placeholder with only the distance hook.
+
+### Files changed
+
+- `scheduler.py`: added context construction helpers, changed policy timing to `select_arm()` before batch and `update_after_batch()` after batch, implemented `ContextualBanditPolicy` with a per-arm linear model, and kept compatibility wrappers for old method names.
+- `inference_loops.py`: Rank 0 now precomputes batch contexts after reading prompts, selects the current batch arm before broadcasting boundaries, and updates the policy after records are collected.
+- `config.py`: added `--bandit-policy`.
+- `run.sh`: added `BANDIT_POLICY` and passes it on Rank 0.
+- `log.md`: documented the new selection timing and Contextual Bandit formula.
+
+### bandit policy extension hooks retained
+
+- The policy registry remains the single place for switching scheduler algorithms:
+
+  ```text
+  ucb -> LayerBanditPolicy
+  contextual -> ContextualBanditPolicy
+  lipschitz -> LipschitzBanditPolicy
+  contextual_lipschitz -> ContextualLipschitzBanditPolicy
+  ```
+
+- `lipschitz` is still a UCB-compatible placeholder with `arm_distance()`.
+- `contextual_lipschitz` currently inherits the contextual LinUCB implementation and keeps `arm_distance()` for later Lipschitz smoothing.
+
 ## 2026-07-15
 
 ### cold start analyzer

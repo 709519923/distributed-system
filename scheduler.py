@@ -94,6 +94,167 @@ def boundaries_to_intervals(boundaries):
     )
 
 
+REQUEST_TYPE_SPECS = (
+    {
+        "name": "short_input_long_output",
+        "input_min": 10.0,
+        "input_max": 150.0,
+        "output_estimate": 384.0,
+    },
+    {
+        "name": "medium_input_medium_output",
+        "input_min": 200.0,
+        "input_max": 600.0,
+        "output_estimate": 256.0,
+    },
+    {
+        "name": "long_input_short_output",
+        "input_min": 800.0,
+        "input_max": 1500.0,
+        "output_estimate": 72.0,
+    },
+)
+
+CONTEXT_INPUT_TOKEN_SCALE = 1500.0
+CONTEXT_OUTPUT_TOKEN_SCALE = 512.0
+CONTEXT_BATCH_SIZE_SCALE = 128.0
+CONTEXT_VECTOR_SIZE = 4
+
+
+def clamp01(value):
+    """Clamp a numeric feature into [0, 1]."""
+    return max(0.0, min(float(value), 1.0))
+
+
+def classify_request_type(input_tokens):
+    """Classify a prompt batch by input token length.
+
+    The three ranges match the prepared dataset buckets. Values outside the
+    ranges are assigned to the closest range, which keeps the scheduler usable
+    when a dataset has slightly noisy token counts.
+    """
+    input_tokens = float(input_tokens)
+    best_spec = None
+    best_distance = None
+    for spec in REQUEST_TYPE_SPECS:
+        input_min = float(spec["input_min"])
+        input_max = float(spec["input_max"])
+        if input_min <= input_tokens <= input_max:
+            return spec
+        distance = min(abs(input_tokens - input_min), abs(input_tokens - input_max))
+        if best_distance is None or distance < best_distance:
+            best_spec = spec
+            best_distance = distance
+    return best_spec
+
+
+def build_context_from_lengths(input_tokens, batch_size):
+    """Build the contextual-bandit feature vector for one prompt batch."""
+    request_spec = classify_request_type(input_tokens)
+    output_estimate = float(request_spec["output_estimate"])
+    batch_size = int(batch_size)
+    input_tokens = float(input_tokens)
+    features = [
+        1.0,
+        clamp01(input_tokens / CONTEXT_INPUT_TOKEN_SCALE),
+        clamp01(output_estimate / CONTEXT_OUTPUT_TOKEN_SCALE),
+        clamp01(batch_size / CONTEXT_BATCH_SIZE_SCALE),
+    ]
+    return {
+        "request_type": request_spec["name"],
+        "input_tokens": input_tokens,
+        "estimated_output_tokens": output_estimate,
+        "batch_size": batch_size,
+        "features": features,
+    }
+
+
+def build_prompt_batch_contexts(prompts, tokenizer, batch_size, max_input_tokens):
+    """Precompute context for every Rank 0 prompt batch.
+
+    This is Rank 0 only bookkeeping. It does not change the input CSV format and
+    does not add any worker-rank metric fields.
+    """
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    contexts = {}
+    for start in range(0, len(prompts), batch_size):
+        prompt_batch = prompts[start : start + batch_size]
+        lengths = []
+        for prompt in prompt_batch:
+            encoded = tokenizer(
+                prompt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_input_tokens,
+            )
+            lengths.append(len(encoded["input_ids"]))
+        input_tokens_avg = sum(lengths) / len(lengths) if lengths else 0.0
+        input_tokens_max = max(lengths) if lengths else 0
+        batch_number = start // batch_size + 1
+        context = build_context_from_lengths(
+            input_tokens=input_tokens_avg,
+            batch_size=len(prompt_batch),
+        )
+        context["input_tokens_max"] = int(input_tokens_max)
+        contexts[batch_number] = context
+    return contexts
+
+
+def identity_matrix(size, scale=1.0):
+    """Return scale * I as a list-of-lists matrix."""
+    return [
+        [float(scale) if row == col else 0.0 for col in range(size)]
+        for row in range(size)
+    ]
+
+
+def solve_linear_system(matrix, vector):
+    """Solve Ax=b for small dense systems using Gauss-Jordan elimination."""
+    size = len(vector)
+    augmented = [
+        [float(matrix[row][col]) for col in range(size)] + [float(vector[row])]
+        for row in range(size)
+    ]
+
+    for col in range(size):
+        pivot_row = max(range(col, size), key=lambda row: abs(augmented[row][col]))
+        pivot = augmented[pivot_row][col]
+        if math.isclose(pivot, 0.0, abs_tol=1e-12):
+            raise ValueError("linear system is singular")
+        if pivot_row != col:
+            augmented[col], augmented[pivot_row] = augmented[pivot_row], augmented[col]
+
+        pivot = augmented[col][col]
+        for item in range(col, size + 1):
+            augmented[col][item] /= pivot
+
+        for row in range(size):
+            if row == col:
+                continue
+            factor = augmented[row][col]
+            if math.isclose(factor, 0.0, abs_tol=1e-12):
+                continue
+            for item in range(col, size + 1):
+                augmented[row][item] -= factor * augmented[col][item]
+
+    return [augmented[row][size] for row in range(size)]
+
+
+def dot(left, right):
+    """Return dot(left, right) for short numeric vectors."""
+    return sum(float(a) * float(b) for a, b in zip(left, right))
+
+
+def add_outer_product_in_place(matrix, vector):
+    """Update matrix += vector vector^T in place."""
+    for row in range(len(vector)):
+        for col in range(len(vector)):
+            matrix[row][col] += float(vector[row]) * float(vector[col])
+
+
 class LayerBanditPolicy:
     """Small UCB-style policy for choosing 3-rank layer split arms.
 
@@ -143,26 +304,35 @@ class LayerBanditPolicy:
             "reward": 0.5,
         }
 
-    def observe_and_select(self, batch, batch_summary_history):
-        """Observe one completed batch and return the arm for the next batch."""
+    def select_arm(self, context=None, batch=None):
+        """Select the arm used by the current batch.
+
+        Plain UCB does not use context, but it follows the same before-batch
+        interface as contextual policies.
+        """
+        _ = context
+        _ = batch
+        if not self.enabled:
+            return None
+        return self.current_arm
+
+    def update_after_batch(self, batch, batch_summary_history):
+        """Observe one completed batch and update the policy state."""
         if not self.enabled:
             return None
 
         batch = int(batch)
         summary = batch_summary_history.get(batch)
         if not summary:
-            return self.current_arm
+            return None
 
-        completed_arm = summary.get("arm")
+        completed_arm = self._completed_arm_from_summary(summary)
         if completed_arm is None:
-            completed_arm = self.boundaries_to_arm(summary.get("boundaries"))
-        if completed_arm is None:
-            return self.current_arm
-        completed_arm = tuple(int(value) for value in completed_arm)
+            return None
         self._ensure_arm(completed_arm)
 
-        # If a manual scheduler.csv row changes the split, treat it as the new
-        # active arm and start a fresh six-batch measurement window.
+        # If a manual row or a different policy changes the split, treat it as
+        # the active arm and start a fresh measurement window.
         if completed_arm != self.current_arm:
             self.current_arm = completed_arm
             self.active_batches = []
@@ -180,10 +350,13 @@ class LayerBanditPolicy:
             return self.current_arm
         self._update_arm_cost(self.current_arm, arm_cost)
 
-        next_arm = self._select_next_arm()
-        self.current_arm = next_arm
+        self.current_arm = self._select_next_arm()
         self.active_batches = []
-        return next_arm
+        return self.current_arm
+
+    def observe_and_select(self, batch, batch_summary_history):
+        """Backward-compatible wrapper for the previous after-batch API."""
+        return self.update_after_batch(batch, batch_summary_history)
 
     def boundaries_to_arm(self, boundaries):
         """Convert [0, p1, p2, total] to (p1, p2)."""
@@ -236,6 +409,14 @@ class LayerBanditPolicy:
         if arm not in self.stats:
             self.arms.append(arm)
             self.stats[arm] = self._new_stats()
+
+    def _completed_arm_from_summary(self, summary):
+        completed_arm = summary.get("arm")
+        if completed_arm is None:
+            completed_arm = self.boundaries_to_arm(summary.get("boundaries"))
+        if completed_arm is None:
+            return None
+        return tuple(int(value) for value in completed_arm)
 
     def _mean_window_cost(self, batches, batch_summary_history):
         """Return the mean bottleneck-rank cost for one evaluation window."""
@@ -332,6 +513,246 @@ class LayerBanditPolicy:
         return f"({int(arm[0])},{int(arm[1])})"
 
 
+class ContextualBanditPolicy(LayerBanditPolicy):
+    """Linear contextual-bandit policy for request-aware layer allocation.
+
+    Each arm keeps a ridge-regression model. At batch start, the current
+    context x_t selects the current arm. After the batch finishes, the observed
+    reward updates only the selected arm's model.
+    """
+
+    policy_name = "contextual"
+
+    def __init__(
+        self,
+        total_layers,
+        default_boundaries,
+        world_size,
+        window_size=6,
+        warmup_skip=1,
+        exploration_weight=0.5,
+        ridge_lambda=1.0,
+        reward_scale_ms=100.0,
+    ):
+        self.ridge_lambda = float(ridge_lambda)
+        self.reward_scale_ms = float(reward_scale_ms)
+        self.last_context = None
+        self.last_features = [1.0, 0.0, 0.0, 0.0]
+        super().__init__(
+            total_layers=total_layers,
+            default_boundaries=default_boundaries,
+            world_size=world_size,
+            window_size=window_size,
+            warmup_skip=warmup_skip,
+            exploration_weight=exploration_weight,
+        )
+
+    def _new_stats(self):
+        stats = super()._new_stats()
+        stats.update(
+            {
+                "A": identity_matrix(CONTEXT_VECTOR_SIZE, self.ridge_lambda),
+                "b": [0.0 for _ in range(CONTEXT_VECTOR_SIZE)],
+                "mean_reward": 0.0,
+                "last_reward": None,
+            }
+        )
+        return stats
+
+    def select_arm(self, context=None, batch=None):
+        """Select the current batch arm with LinUCB score."""
+        _ = batch
+        if not self.enabled:
+            return None
+
+        features = self._features_from_context(context)
+        self.last_context = context
+        self.last_features = features
+
+        best_arm = self.arms[0]
+        best_score = None
+        for arm in self.arms:
+            score = self._score_arm(arm, features)
+            if best_score is None or score > best_score:
+                best_arm = arm
+                best_score = score
+        self.current_arm = best_arm
+        return best_arm
+
+    def update_after_batch(self, batch, batch_summary_history):
+        """Update the selected arm's linear model from one completed batch."""
+        if not self.enabled:
+            return None
+
+        summary = batch_summary_history.get(int(batch))
+        if not summary:
+            return None
+        completed_arm = self._completed_arm_from_summary(summary)
+        if completed_arm is None:
+            return None
+        self._ensure_arm(completed_arm)
+
+        context = summary.get("context") or self.last_context
+        features = self._features_from_context(context)
+        cost = self._cost_per_token(summary)
+        if cost is None:
+            return completed_arm
+        reward = self._reward_from_cost(cost)
+
+        stats = self.stats[completed_arm]
+        add_outer_product_in_place(stats["A"], features)
+        for index, value in enumerate(features):
+            stats["b"][index] += reward * float(value)
+
+        pulls = int(stats["pulls"])
+        stats["mean_cost"] = (float(stats["mean_cost"]) * pulls + cost) / (pulls + 1)
+        stats["last_cost"] = cost
+        stats["mean_reward"] = (
+            float(stats["mean_reward"]) * pulls + reward
+        ) / (pulls + 1)
+        stats["last_reward"] = reward
+        stats["reward"] = stats["mean_reward"]
+        stats["pulls"] = pulls + 1
+        self.total_pulls += 1
+        self.current_arm = completed_arm
+        return completed_arm
+
+    def build_context(self, batch, batch_summary_history, environment_history=None):
+        """Return stored context for compatibility with earlier policy hooks."""
+        _ = environment_history
+        summary = batch_summary_history.get(int(batch), {})
+        return summary.get("context", {})
+
+    def arm_score_snapshot(self, selected_arm):
+        """Return per-arm reward/score rows for the current context."""
+        selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        features = self.last_features
+        rows = []
+        for arm in self.arms:
+            stats = self.stats[arm]
+            score = self._score_arm(arm, features)
+            rows.append(
+                {
+                    "arm": self._format_arm(arm),
+                    "reward": f"{float(stats['reward']):.6f}",
+                    "score": f"{score:.6f}",
+                    "selected": 1 if arm == selected_arm else 0,
+                }
+            )
+        return rows
+
+    def _features_from_context(self, context):
+        if not context:
+            return [1.0, 0.0, 0.0, 0.0]
+        features = context.get("features")
+        if features is None:
+            features = build_context_from_lengths(
+                input_tokens=context.get("input_tokens", 0.0),
+                batch_size=context.get("batch_size", 1),
+            )["features"]
+        features = [float(value) for value in features]
+        if len(features) != CONTEXT_VECTOR_SIZE:
+            raise ValueError(
+                f"context feature size must be {CONTEXT_VECTOR_SIZE}; got {features}"
+            )
+        return features
+
+    def _score_arm(self, arm, features):
+        stats = self.stats[arm]
+        theta = solve_linear_system(stats["A"], stats["b"])
+        confidence_direction = solve_linear_system(stats["A"], features)
+        prediction = dot(theta, features)
+        uncertainty = math.sqrt(max(dot(features, confidence_direction), 0.0))
+        return prediction + self.exploration_weight * uncertainty
+
+    def _cost_per_token(self, summary):
+        rank_times = summary.get("rank_times", {})
+        if len(rank_times) < self.world_size:
+            return None
+        bottleneck_ms = max(float(value) for value in rank_times.values())
+        decode_steps = max(1, int(summary.get("decode_step_count", 0)))
+        return bottleneck_ms / decode_steps
+
+    def _reward_from_cost(self, cost_per_token_ms):
+        return 1.0 / (1.0 + (float(cost_per_token_ms) / self.reward_scale_ms))
+
+
+class LipschitzBanditPolicy(LayerBanditPolicy):
+    """Reserved Lipschitz-bandit policy hook.
+
+    The class intentionally inherits the current UCB behavior. Future work can
+    use arm_distance() to share observations between nearby layer splits, based
+    on the assumption that similar splits should have similar costs.
+    """
+
+    policy_name = "lipschitz"
+
+    def arm_distance(self, left_arm, right_arm):
+        """Return normalized L1 distance between two 3-rank split arms."""
+        if left_arm is None or right_arm is None:
+            return None
+        left = tuple(int(value) for value in left_arm)
+        right = tuple(int(value) for value in right_arm)
+        if len(left) != len(right):
+            raise ValueError(f"arm sizes differ: {left_arm} vs {right_arm}")
+        distance = sum(abs(a - b) for a, b in zip(left, right))
+        return distance / max(float(self.total_layers), 1.0)
+
+
+class ContextualLipschitzBanditPolicy(ContextualBanditPolicy):
+    """Reserved policy hook combining contextual and Lipschitz ideas.
+
+    It currently reuses ContextualBanditPolicy's LinUCB update and exposes an
+    arm-distance hook for later reward smoothing across nearby allocations.
+    """
+
+    policy_name = "contextual_lipschitz"
+
+    def build_context(self, batch, batch_summary_history, environment_history=None):
+        """Return stored context for compatibility with earlier policy hooks."""
+        _ = environment_history
+        return super().build_context(batch, batch_summary_history)
+
+    def arm_distance(self, left_arm, right_arm):
+        """Return normalized L1 distance between two 3-rank split arms."""
+        if left_arm is None or right_arm is None:
+            return None
+        left = tuple(int(value) for value in left_arm)
+        right = tuple(int(value) for value in right_arm)
+        if len(left) != len(right):
+            raise ValueError(f"arm sizes differ: {left_arm} vs {right_arm}")
+        distance = sum(abs(a - b) for a, b in zip(left, right))
+        return distance / max(float(self.total_layers), 1.0)
+
+
+BANDIT_POLICY_CLASSES = {
+    "ucb": LayerBanditPolicy,
+    "contextual": ContextualBanditPolicy,
+    "lipschitz": LipschitzBanditPolicy,
+    "contextual_lipschitz": ContextualLipschitzBanditPolicy,
+}
+
+
+
+def normalize_bandit_policy_name(name):
+    """Normalize user/internal policy names to registry keys."""
+    return (name or "ucb").strip().lower().replace("-", "_")
+
+
+def create_bandit_policy(policy_name, total_layers, default_boundaries, world_size):
+    """Create a bandit policy while keeping UCB as the default behavior."""
+    normalized_name = normalize_bandit_policy_name(policy_name)
+    policy_class = BANDIT_POLICY_CLASSES.get(normalized_name)
+    if policy_class is None:
+        valid_names = ", ".join(sorted(BANDIT_POLICY_CLASSES))
+        raise ValueError(f"Unknown bandit_policy={policy_name!r}; valid values: {valid_names}")
+    return policy_class(
+        total_layers=total_layers,
+        default_boundaries=default_boundaries,
+        world_size=world_size,
+    )
+
+
 class Scheduler:
     """Maintain per-batch layer allocations in scheduler.csv.
 
@@ -340,7 +761,14 @@ class Scheduler:
     scheduler file; the Rank 0 scheduler file is the single source of truth.
     """
 
-    def __init__(self, allocation_csv, total_layers, default_boundaries, world_size):
+    def __init__(
+        self,
+        allocation_csv,
+        total_layers,
+        default_boundaries,
+        world_size,
+        bandit_policy="ucb",
+    ):
         self.path = Path(allocation_csv)
         self.total_layers = int(total_layers)
         self.world_size = int(world_size)
@@ -373,7 +801,9 @@ class Scheduler:
 
         self._validate_boundaries(self.default_boundaries)
         self._load_existing_file()
-        self.bandit = LayerBanditPolicy(
+        self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
+        self.bandit = create_bandit_policy(
+            policy_name=self.bandit_policy_name,
             total_layers=self.total_layers,
             default_boundaries=self.default_boundaries,
             world_size=self.world_size,
@@ -444,46 +874,75 @@ class Scheduler:
         self.environment_data = snapshot
         self.environment_history[batch] = snapshot
 
-    def collect_batch_summary(self, batch, prefill_mode, boundaries, records):
+    def collect_batch_summary(
+        self,
+        batch,
+        prefill_mode,
+        boundaries,
+        records,
+        context=None,
+        selected_arm=None,
+    ):
         """Collect the minimal online data needed by future scheduling policy.
 
         This method intentionally mirrors the active value shown in
         "--- summary after batch ...". It stores only batch number, layer
-        allocation, rank, and one mode-dependent timing value per rank.
+        allocation, rank, one mode-dependent timing value per rank, and the
+        batch context used by contextual policies.
         """
         batch = int(batch)
         boundaries = [int(value) for value in boundaries]
         layer_allocation = self._allocation_text(boundaries)
         time_label = self._time_label_for_mode(prefill_mode)
         rank_times = {}
+        decode_step_count = 0
         for record in records:
             if not isinstance(record, dict) or "rank" not in record:
                 continue
             rank = int(record["rank"])
             rank_times[rank] = self._summary_time_for_record(prefill_mode, record)
+            decode_step_count = max(decode_step_count, int(record.get("decode_step_count", 0)))
 
+        summary_arm = selected_arm
+        if summary_arm is None and self.world_size == 3:
+            summary_arm = tuple(boundaries[1:-1])
+        if summary_arm is not None:
+            summary_arm = tuple(int(value) for value in summary_arm)
         self.batch_summary_history[batch] = {
             "batch": batch,
             "prefill_mode": prefill_mode,
             "layer_allocation": layer_allocation,
             "boundaries": boundaries,
-            "arm": tuple(boundaries[1:-1]) if self.world_size == 3 else None,
+            "arm": summary_arm,
+            "context": dict(context) if context else None,
+            "decode_step_count": decode_step_count,
             "time_label": time_label,
             "rank_times": rank_times,
         }
         self.save_summary_history()
 
-    def run_bandit_after_batch(self, batch):
-        """Run the online bandit policy after one batch summary is collected."""
-        selected_arm = self.bandit.observe_and_select(
+    def select_arm_before_batch(self, batch, context=None):
+        """Select the layer-allocation arm for the current batch."""
+        _ = batch
+        return self.bandit.select_arm(context=context, batch=batch)
+
+    def update_policy_after_batch(self, batch):
+        """Update the active policy from the completed batch summary."""
+        selected_arm = self.bandit.update_after_batch(
             batch=batch,
             batch_summary_history=self.batch_summary_history,
         )
-        self.append_arm_details(batch, selected_arm)
+        summary = self.batch_summary_history.get(int(batch), {})
+        used_arm = summary.get("arm", selected_arm)
+        self.append_arm_details(batch, used_arm)
         return selected_arm
 
+    def run_bandit_after_batch(self, batch):
+        """Backward-compatible wrapper for the previous after-batch hook."""
+        return self.update_policy_after_batch(batch)
+
     def reallocate_layer(self, batch=None, arm=None, rank_metrics=None):
-        """Write the selected next-batch layer allocation to scheduler.csv.
+        """Write the selected current-batch layer allocation to scheduler.csv.
 
         The bandit policy decides the arm before this method is called. This
         method is deliberately only the allocation writer: it converts the arm
