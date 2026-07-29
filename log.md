@@ -176,6 +176,77 @@
 
 - `ContextualLipschitzBanditPolicy` now inherits the contextual LinUCB implementation and keeps `arm_distance()` as the reserved Lipschitz hook. `LipschitzBanditPolicy` remains a UCB-compatible placeholder with only the distance hook.
 
+#### 3. Contextual warmup exploration
+
+- Fixed the first contextual implementation's tendency to stay at the default split `(5, 15)`.
+- Cause: all arms start with the same model state:
+
+  $$
+  A_a = \lambda I,\quad b_a = 0,\quad \theta_a = 0
+  $$
+
+  Therefore all arms initially have the same LinUCB score under the same context. The previous tie-break selected the first arm in the sorted candidate list, which is the default split `(5, 15)`. After `(5, 15)` received the first positive reward, it could keep winning against untried arms.
+- New rule:
+
+  ```text
+  if any arm has pulls = 0:
+      choose the first untried arm
+  else:
+      choose argmax LinUCB score
+  ```
+
+- The default exploration parameters were also reduced:
+
+  ```text
+  window_size = 2
+  exploration_weight = 0.01
+  ```
+
+  `window_size=2` means a selected arm is updated after two consecutive completed batches in the plain UCB path. In contextual mode, each completed selected arm updates its linear model directly, while `exploration_weight=0.01` controls the LinUCB uncertainty bonus after all arms have at least one observation.
+
+#### 4. Unified reward function
+
+- Removed the old relative normalized reward from plain `ucb`.
+- Previous `ucb` reward depended on the currently observed arm set:
+
+  $$
+  reward(a)
+  =
+  1
+  -
+  \frac{\bar{C}_a - C_{\min}}{C_{\max} - C_{\min}}
+  $$
+
+  This has been removed because the reward scale changes when new arms are observed or when the request context changes.
+- All policies now use the same cost and reward definition. First, compute bottleneck cost per decode step:
+
+  $$
+  T_t = \max_r T_{t,r}
+  $$
+
+  $$
+  D_t = \max(1, decode\_step\_count_t)
+  $$
+
+  $$
+  C_t = \frac{T_t}{D_t}
+  $$
+
+- Then convert it to an absolute bounded reward:
+
+  $$
+  r_t =
+  \frac{1}{1 + \frac{C_t}{\tau}}
+  $$
+
+  with:
+
+  $$
+  \tau = 100 ms
+  $$
+
+- For plain `ucb`, the window cost is now the mean of per-token bottleneck costs inside the reward window, and the stored reward is computed from that absolute cost. For `contextual`, each completed selected arm already uses the same per-token cost and absolute reward.
+
 ### Files changed
 
 - `scheduler.py`: added context construction helpers, changed policy timing to `select_arm()` before batch and `update_after_batch()` after batch, implemented `ContextualBanditPolicy` with a per-arm linear model, and kept compatibility wrappers for old method names.

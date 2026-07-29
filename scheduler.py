@@ -275,9 +275,9 @@ class LayerBanditPolicy:
         total_layers,
         default_boundaries,
         world_size,
-        window_size=6,
+        window_size=2,
         warmup_skip=1,
-        exploration_weight=0.5,
+        exploration_weight=0.01,
     ):
         self.total_layers = int(total_layers)
         self.default_boundaries = [int(value) for value in default_boundaries]
@@ -289,6 +289,7 @@ class LayerBanditPolicy:
         self.current_arm = self.boundaries_to_arm(self.default_boundaries)
         self.active_batches = []
         self.total_pulls = 0
+        self.reward_scale_ms = 100.0
 
         self.arms = self._build_candidate_arms()
         if self.enabled and self.current_arm not in self.arms:
@@ -419,16 +420,16 @@ class LayerBanditPolicy:
         return tuple(int(value) for value in completed_arm)
 
     def _mean_window_cost(self, batches, batch_summary_history):
-        """Return the mean bottleneck-rank cost for one evaluation window."""
+        """Return mean bottleneck-rank cost per decode step for a window."""
         costs = []
         for batch in batches:
             summary = batch_summary_history.get(int(batch))
             if not summary:
                 continue
-            rank_times = summary.get("rank_times", {})
-            if len(rank_times) < self.world_size:
+            cost = self._cost_per_token(summary)
+            if cost is None:
                 continue
-            costs.append(max(float(value) for value in rank_times.values()))
+            costs.append(cost)
         if not costs:
             return None
         return sum(costs) / len(costs)
@@ -438,33 +439,20 @@ class LayerBanditPolicy:
         pulls = int(stats["pulls"])
         stats["mean_cost"] = (float(stats["mean_cost"]) * pulls + float(cost)) / (pulls + 1)
         stats["last_cost"] = float(cost)
+        stats["reward"] = self._reward_from_cost(float(stats["mean_cost"]))
         stats["pulls"] = pulls + 1
         self.total_pulls += 1
-        self._refresh_normalized_rewards()
 
-    def _refresh_normalized_rewards(self):
-        observed = [
-            float(stats["mean_cost"])
-            for stats in self.stats.values()
-            if int(stats["pulls"]) > 0
-        ]
-        if not observed:
-            return
+    def _cost_per_token(self, summary):
+        rank_times = summary.get("rank_times", {})
+        if len(rank_times) < self.world_size:
+            return None
+        bottleneck_ms = max(float(value) for value in rank_times.values())
+        decode_steps = max(1, int(summary.get("decode_step_count", 0)))
+        return bottleneck_ms / decode_steps
 
-        min_cost = min(observed)
-        max_cost = max(observed)
-        if math.isclose(min_cost, max_cost):
-            for stats in self.stats.values():
-                if int(stats["pulls"]) > 0:
-                    stats["reward"] = 0.5
-            return
-
-        denominator = max_cost - min_cost
-        for stats in self.stats.values():
-            if int(stats["pulls"]) == 0:
-                stats["reward"] = 0.5
-                continue
-            stats["reward"] = 1.0 - ((float(stats["mean_cost"]) - min_cost) / denominator)
+    def _reward_from_cost(self, cost_per_token_ms):
+        return 1.0 / (1.0 + (float(cost_per_token_ms) / self.reward_scale_ms))
 
     def _select_next_arm(self):
         """Choose the next arm with UCB, testing unseen arms first."""
@@ -528,9 +516,9 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         total_layers,
         default_boundaries,
         world_size,
-        window_size=6,
+        window_size=2,
         warmup_skip=1,
-        exploration_weight=0.5,
+        exploration_weight=0.01,
         ridge_lambda=1.0,
         reward_scale_ms=100.0,
     ):
@@ -568,6 +556,11 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         features = self._features_from_context(context)
         self.last_context = context
         self.last_features = features
+
+        for arm in self.arms:
+            if int(self.stats[arm]["pulls"]) == 0:
+                self.current_arm = arm
+                return arm
 
         best_arm = self.arms[0]
         best_score = None
@@ -664,17 +657,6 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         prediction = dot(theta, features)
         uncertainty = math.sqrt(max(dot(features, confidence_direction), 0.0))
         return prediction + self.exploration_weight * uncertainty
-
-    def _cost_per_token(self, summary):
-        rank_times = summary.get("rank_times", {})
-        if len(rank_times) < self.world_size:
-            return None
-        bottleneck_ms = max(float(value) for value in rank_times.values())
-        decode_steps = max(1, int(summary.get("decode_step_count", 0)))
-        return bottleneck_ms / decode_steps
-
-    def _reward_from_cost(self, cost_per_token_ms):
-        return 1.0 / (1.0 + (float(cost_per_token_ms) / self.reward_scale_ms))
 
 
 class LipschitzBanditPolicy(LayerBanditPolicy):
