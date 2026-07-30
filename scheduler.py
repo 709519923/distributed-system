@@ -120,6 +120,18 @@ CONTEXT_OUTPUT_TOKEN_SCALE = 512.0
 CONTEXT_BATCH_SIZE_SCALE = 128.0
 CONTEXT_VECTOR_SIZE = 4
 
+CANDIDATE_ARMS = [
+    (1, 11),
+    (1, 15),
+    (1, 19),
+    (3, 11),
+    (3, 15),
+    (3, 19),
+    (9, 11),
+    (9, 15),
+    (9, 19),
+]
+
 
 def clamp01(value):
     """Clamp a numeric feature into [0, 1]."""
@@ -374,29 +386,16 @@ class LayerBanditPolicy:
         return [0] + [int(value) for value in arm] + [self.total_layers]
 
     def _build_candidate_arms(self):
-        """Generate a small local search space around the default split."""
+        """Return the explicit candidate split arms for this experiment."""
         if not self.enabled:
             return []
 
-        default_p1, default_p2 = self.current_arm
-        offsets = (-4, 0, 4)
-        arms = set()
-        for p1_offset in offsets:
-            for p2_offset in offsets:
-                arm = (default_p1 + p1_offset, default_p2 + p2_offset)
-                if self._valid_arm(arm):
-                    arms.add(arm)
-
-        return sorted(
-            arms,
-            key=lambda arm: (
-                abs(arm[0] - default_p1) + abs(arm[1] - default_p2),
-                abs(arm[0] - default_p1),
-                abs(arm[1] - default_p2),
-                arm[0],
-                arm[1],
-            ),
-        )
+        arms = []
+        for arm in CANDIDATE_ARMS:
+            normalized_arm = tuple(int(value) for value in arm)
+            if self._valid_arm(normalized_arm):
+                arms.append(normalized_arm)
+        return arms
 
     def _valid_arm(self, arm):
         if arm is None or len(arm) != 2:

@@ -247,28 +247,32 @@
 
 - For plain `ucb`, the window cost is now the mean of per-token bottleneck costs inside the reward window, and the stored reward is computed from that absolute cost. For `contextual`, each completed selected arm already uses the same per-token cost and absolute reward.
 
-#### 5. Smaller arm set for early algorithm tests
+#### 5. Explicit candidate arm set for early algorithm tests
 
-- Reduced the candidate split offsets from:
-
-  ```text
-  (-4, -2, 0, 2, 4)
-  ```
-
-  to:
+- Replaced offset-based arm generation with an explicit candidate arm list in `scheduler.py`.
+- The current candidate set is:
 
   ```text
-  (-4, 0, 4)
+  CANDIDATE_ARMS = [
+      (1, 11),
+      (1, 15),
+      (1, 19),
+      (5, 11),
+      (5, 15),
+      (5, 19),
+      (9, 11),
+      (9, 15),
+      (9, 19),
+  ]
   ```
 
-- With the default split `(5, 15)`, the candidate grid becomes:
+- This keeps the search space fixed across experiments. Changing `SPLIT_LAYERS` no longer silently changes the candidate arm set. Each arm is still validated by:
 
-  ```text
-  p1 in {1, 5, 9}
-  p2 in {11, 15, 19}
-  ```
+  $$
+  0 < p_1 < p_2 < total\_layers
+  $$
 
-  which gives 9 arms instead of 25 arms. This is intended for shorter early runs where the goal is to observe whether the scheduling algorithm behaves correctly before expanding the search space.
+  Invalid arms are skipped automatically for models with fewer layers.
 
 ### Files changed
 
