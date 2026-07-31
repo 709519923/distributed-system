@@ -1,5 +1,69 @@
 # Version Log
 
+## 2026-07-31
+
+### Context-aware warmup for Contextual Bandit
+
+- Fixed the contextual warmup logic so that exploration is grouped by request context instead of only by global arm pulls.
+- Previous contextual warmup used only:
+
+  ```text
+  stats[arm]["pulls"] == 0
+  ```
+
+  This means each arm was tried once globally. With an A/B/C mixed dataset, the first few batches could look like:
+
+  ```text
+  A -> arm1
+  B -> arm2
+  C -> arm3
+  A -> arm4
+  ...
+  ```
+
+  After every arm had one global observation, the policy immediately switched to score-based selection. That did not guarantee that every arm had been observed under every request type.
+- New contextual warmup tracks observations with:
+
+  ```text
+  context_arm_pulls[request_type][arm]
+  ```
+
+  where `request_type` is inferred from the current batch context:
+
+  ```text
+  long_input_short_output
+  short_input_long_output
+  medium_input_medium_output
+  ```
+
+- The new selection rule for `BANDIT_POLICY=contextual` is:
+
+  ```text
+  request_type = context.request_type
+
+  if any arm has context_arm_pulls[request_type][arm] == 0:
+      choose the first untried arm for this request_type
+  else:
+      choose argmax LinUCB score under the current context
+  ```
+
+- This makes the intended A/B/C learning stage possible. For example, with six arms and `batch_size=1`, the first eighteen batches can cover:
+
+  ```text
+  A -> arm1, B -> arm1, C -> arm1
+  A -> arm2, B -> arm2, C -> arm2
+  ...
+  A -> arm6, B -> arm6, C -> arm6
+  ```
+
+- Plain `BANDIT_POLICY=ucb` is unchanged. It still uses the global arm-pull logic and does not read request context.
+- `ContextualLipschitzBanditPolicy` inherits this contextual warmup behavior because it currently extends `ContextualBanditPolicy`.
+
+### Files changed
+
+- `scheduler.py`: added `context_arm_pulls`, context-key extraction, and per-context warmup selection inside `ContextualBanditPolicy`.
+- `log.md`: documented the 2026-07-31 contextual warmup correction separately from the earlier 2026-07-30 bandit changes.
+
 ## 2026-07-30
 
 ### Bandit reward, candidate arms, and Lipschitz policy

@@ -513,13 +513,14 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         world_size,
         window_size=2,
         warmup_skip=1,
-        exploration_weight=0.01,
+        exploration_weight=0.00,
         ridge_lambda=1.0,
         reward_scale_ms=100.0,
     ):
         self.ridge_lambda = float(ridge_lambda)
         self.reward_scale_ms = float(reward_scale_ms)
         self.last_context = None
+        self.last_context_key = "unknown"
         self.last_features = [1.0, 0.0, 0.0, 0.0]
         super().__init__(
             total_layers=total_layers,
@@ -529,6 +530,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
             warmup_skip=warmup_skip,
             exploration_weight=exploration_weight,
         )
+        self.context_arm_pulls = {}
 
     def _new_stats(self):
         stats = super()._new_stats()
@@ -549,11 +551,14 @@ class ContextualBanditPolicy(LayerBanditPolicy):
             return None
 
         features = self._features_from_context(context)
+        context_key = self._context_key_from_context(context)
         self.last_context = context
+        self.last_context_key = context_key
         self.last_features = features
 
+        context_pulls = self._ensure_context_arm_pulls(context_key)
         for arm in self.arms:
-            if int(self.stats[arm]["pulls"]) == 0:
+            if int(context_pulls.get(arm, 0)) == 0:
                 self.current_arm = arm
                 return arm
 
@@ -581,6 +586,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         self._ensure_arm(completed_arm)
 
         context = summary.get("context") or self.last_context
+        context_key = self._context_key_from_context(context)
         features = self._features_from_context(context)
         cost = self._cost_per_token(summary)
         if cost is None:
@@ -602,6 +608,9 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         stats["reward"] = stats["mean_reward"]
         stats["pulls"] = pulls + 1
         self.total_pulls += 1
+        context_pulls = self._ensure_context_arm_pulls(context_key)
+        context_pulls[completed_arm] = int(context_pulls.get(completed_arm, 0)) + 1
+        self.last_context_key = context_key
         self.current_arm = completed_arm
         return completed_arm
 
@@ -644,6 +653,28 @@ class ContextualBanditPolicy(LayerBanditPolicy):
                 f"context feature size must be {CONTEXT_VECTOR_SIZE}; got {features}"
             )
         return features
+
+    def _context_key_from_context(self, context):
+        """Return the request-type key used for context-aware warmup."""
+        if context and context.get("request_type"):
+            return str(context["request_type"])
+        if context:
+            inferred = build_context_from_lengths(
+                input_tokens=context.get("input_tokens", 0.0),
+                batch_size=context.get("batch_size", 1),
+            )
+            return str(inferred["request_type"])
+        return "unknown"
+
+    def _ensure_context_arm_pulls(self, context_key):
+        """Create the per-context arm-pull table used by contextual warmup."""
+        context_key = str(context_key or "unknown")
+        if context_key not in self.context_arm_pulls:
+            self.context_arm_pulls[context_key] = {}
+        context_pulls = self.context_arm_pulls[context_key]
+        for arm in self.arms:
+            context_pulls.setdefault(arm, 0)
+        return context_pulls
 
     def _score_arm(self, arm, features):
         stats = self.stats[arm]
