@@ -1,5 +1,189 @@
 # Version Log
 
+## 2026-07-30
+
+### Bandit reward, candidate arms, and Lipschitz policy
+
+#### 1. Contextual warmup exploration
+
+- Fixed the first contextual implementation's tendency to stay at the default split `(5, 15)`.
+- Cause: all arms start with the same model state:
+
+  $$
+  A_a = \lambda I,\quad b_a = 0,\quad \theta_a = 0
+  $$
+
+  Therefore all arms initially have the same LinUCB score under the same context. The previous tie-break selected the first arm in the sorted candidate list, which is the default split `(5, 15)`. After `(5, 15)` received the first positive reward, it could keep winning against untried arms.
+- New rule:
+
+  ```text
+  if any arm has pulls = 0:
+      choose the first untried arm
+  else:
+      choose argmax LinUCB score
+  ```
+
+- The default exploration parameters were also reduced:
+
+  ```text
+  window_size = 2
+  exploration_weight = 0.01
+  ```
+
+  `window_size=2` means a selected arm is updated after two consecutive completed batches in the plain UCB path. In contextual mode, each completed selected arm updates its linear model directly, while `exploration_weight=0.01` controls the LinUCB uncertainty bonus after all arms have at least one observation.
+
+#### 2. Unified reward function
+
+- Removed the old relative normalized reward from plain `ucb`.
+- Previous `ucb` reward depended on the currently observed arm set:
+
+  $$
+  reward(a)
+  =
+  1
+  -
+  \frac{\bar{C}_a - C_{\min}}{C_{\max} - C_{\min}}
+  $$
+
+  This has been removed because the reward scale changes when new arms are observed or when the request context changes.
+- All policies now use the same cost and reward definition. First, compute bottleneck cost per decode step:
+
+  $$
+  T_t = \max_r T_{t,r}
+  $$
+
+  $$
+  D_t = \max(1, decode\_step\_count_t)
+  $$
+
+  $$
+  C_t = \frac{T_t}{D_t}
+  $$
+
+- Then convert it to an absolute bounded reward:
+
+  $$
+  r_t =
+  \frac{1}{1 + \frac{C_t}{\tau}}
+  $$
+
+  with:
+
+  $$
+  \tau = 100 ms
+  $$
+
+- For plain `ucb`, the window cost is now the mean of per-token bottleneck costs inside the reward window, and the stored reward is computed from that absolute cost. For `contextual`, each completed selected arm already uses the same per-token cost and absolute reward.
+
+#### 3. Explicit candidate arm set for early algorithm tests
+
+- Replaced offset-based arm generation with an explicit candidate arm list in `scheduler.py`.
+- The current candidate set is:
+
+  ```text
+  CANDIDATE_ARMS = [
+      (1, 11),
+      (1, 15),
+      (1, 19),
+      (5, 11),
+      (5, 15),
+      (5, 19),
+      (9, 11),
+      (9, 15),
+      (9, 19),
+  ]
+  ```
+
+- This keeps the search space fixed across experiments. Changing `SPLIT_LAYERS` no longer silently changes the candidate arm set. Each arm is still validated by:
+
+  $$
+  0 < p_1 < p_2 < total\_layers
+  $$
+
+  Invalid arms are skipped automatically for models with fewer layers.
+
+#### 4. Simple Lipschitz-UCB implementation
+
+- Implemented a first runnable `LipschitzBanditPolicy`. It keeps the same before-batch selection and after-batch update timing as the other policies.
+- Reward update is unchanged and reuses the unified per-token absolute reward:
+
+  $$
+  C_t = \frac{\max_r T_{t,r}}{\max(1, decode\_step\_count_t)}
+  $$
+
+  $$
+  r_t = \frac{1}{1 + \frac{C_t}{\tau}}
+  $$
+
+- The Lipschitz policy changes only the arm score. Each arm is:
+
+  $$
+  a = (p_1, p_2)
+  $$
+
+  and the normalized distance between two arms is:
+
+  $$
+  d(a,b)
+  =
+  \frac{|p_1^a - p_1^b| + |p_2^a - p_2^b|}{total\_layers}
+  $$
+
+- For a candidate arm `a`, the Lipschitz-smoothed reward estimate is:
+
+  $$
+  \hat{r}_{lip}(a)
+  =
+  \max_{b \in \mathcal{O}}
+  \left(
+  r(b) - L \cdot d(a,b)
+  \right)
+  $$
+
+  where:
+
+  $$
+  \mathcal{O} = \{b \mid pulls(b) > 0\}
+  $$
+
+  is the set of observed arms, and `L` is the Lipschitz constant.
+- Current implementation uses:
+
+  $$
+  L = 0.5
+  $$
+
+- After all arms have been tried at least once, the selected arm maximizes:
+
+  $$
+  score(a)
+  =
+  \hat{r}_{lip}(a)
+  +
+  \alpha
+  \sqrt{\frac{\log N}{n_a}}
+  $$
+
+  where:
+
+  $$
+  N = total\_pulls,\quad n_a = pulls(a)
+  $$
+
+- Before all arms have observations, the policy keeps the same warmup behavior:
+
+  ```text
+  if any arm has pulls = 0:
+      choose the first untried arm
+  ```
+
+- `arm_details.score` for `BANDIT_POLICY=lipschitz` now records the Lipschitz-UCB score above. `arm_details.reward` remains the direct observed reward of that arm, not the smoothed estimate.
+
+### Files changed
+
+- `scheduler.py`: added contextual warmup exploration, replaced relative UCB reward with unified per-token absolute reward, changed candidate arms to an explicit list, and implemented the first runnable `LipschitzBanditPolicy`.
+- `log.md`: separated the 2026-07-30 bandit changes from the earlier 2026-07-29 contextual-bandit design notes.
+
 ## 2026-07-29
 
 ### current-batch arm selection and Contextual Bandit
@@ -174,105 +358,7 @@
   b_{a_t} \leftarrow b_{a_t} + r_t x_t
   $$
 
-- `ContextualLipschitzBanditPolicy` now inherits the contextual LinUCB implementation and keeps `arm_distance()` as the reserved Lipschitz hook. `LipschitzBanditPolicy` remains a UCB-compatible placeholder with only the distance hook.
-
-#### 3. Contextual warmup exploration
-
-- Fixed the first contextual implementation's tendency to stay at the default split `(5, 15)`.
-- Cause: all arms start with the same model state:
-
-  $$
-  A_a = \lambda I,\quad b_a = 0,\quad \theta_a = 0
-  $$
-
-  Therefore all arms initially have the same LinUCB score under the same context. The previous tie-break selected the first arm in the sorted candidate list, which is the default split `(5, 15)`. After `(5, 15)` received the first positive reward, it could keep winning against untried arms.
-- New rule:
-
-  ```text
-  if any arm has pulls = 0:
-      choose the first untried arm
-  else:
-      choose argmax LinUCB score
-  ```
-
-- The default exploration parameters were also reduced:
-
-  ```text
-  window_size = 2
-  exploration_weight = 0.01
-  ```
-
-  `window_size=2` means a selected arm is updated after two consecutive completed batches in the plain UCB path. In contextual mode, each completed selected arm updates its linear model directly, while `exploration_weight=0.01` controls the LinUCB uncertainty bonus after all arms have at least one observation.
-
-#### 4. Unified reward function
-
-- Removed the old relative normalized reward from plain `ucb`.
-- Previous `ucb` reward depended on the currently observed arm set:
-
-  $$
-  reward(a)
-  =
-  1
-  -
-  \frac{\bar{C}_a - C_{\min}}{C_{\max} - C_{\min}}
-  $$
-
-  This has been removed because the reward scale changes when new arms are observed or when the request context changes.
-- All policies now use the same cost and reward definition. First, compute bottleneck cost per decode step:
-
-  $$
-  T_t = \max_r T_{t,r}
-  $$
-
-  $$
-  D_t = \max(1, decode\_step\_count_t)
-  $$
-
-  $$
-  C_t = \frac{T_t}{D_t}
-  $$
-
-- Then convert it to an absolute bounded reward:
-
-  $$
-  r_t =
-  \frac{1}{1 + \frac{C_t}{\tau}}
-  $$
-
-  with:
-
-  $$
-  \tau = 100 ms
-  $$
-
-- For plain `ucb`, the window cost is now the mean of per-token bottleneck costs inside the reward window, and the stored reward is computed from that absolute cost. For `contextual`, each completed selected arm already uses the same per-token cost and absolute reward.
-
-#### 5. Explicit candidate arm set for early algorithm tests
-
-- Replaced offset-based arm generation with an explicit candidate arm list in `scheduler.py`.
-- The current candidate set is:
-
-  ```text
-  CANDIDATE_ARMS = [
-      (1, 11),
-      (1, 15),
-      (1, 19),
-      (5, 11),
-      (5, 15),
-      (5, 19),
-      (9, 11),
-      (9, 15),
-      (9, 19),
-  ]
-  ```
-
-- This keeps the search space fixed across experiments. Changing `SPLIT_LAYERS` no longer silently changes the candidate arm set. Each arm is still validated by:
-
-  $$
-  0 < p_1 < p_2 < total\_layers
-  $$
-
-  Invalid arms are skipped automatically for models with fewer layers.
+- `ContextualLipschitzBanditPolicy` was reserved as the future combined policy hook. The runnable Lipschitz implementation was added later in the 2026-07-30 section.
 
 ### Files changed
 
@@ -293,8 +379,8 @@
   contextual_lipschitz -> ContextualLipschitzBanditPolicy
   ```
 
-- `lipschitz` is still a UCB-compatible placeholder with `arm_distance()`.
-- `contextual_lipschitz` currently inherits the contextual LinUCB implementation and keeps `arm_distance()` for later Lipschitz smoothing.
+- At the 2026-07-29 checkpoint, `lipschitz` was only a UCB-compatible placeholder with `arm_distance()`.
+- At the 2026-07-29 checkpoint, `contextual_lipschitz` inherited the contextual LinUCB implementation and kept `arm_distance()` for later Lipschitz smoothing.
 
 ## 2026-07-15
 

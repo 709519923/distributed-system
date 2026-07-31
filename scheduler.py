@@ -122,13 +122,9 @@ CONTEXT_VECTOR_SIZE = 4
 
 CANDIDATE_ARMS = [
     (1, 11),
-    (1, 15),
     (1, 19),
+    (1, 7),
     (3, 11),
-    (3, 15),
-    (3, 19),
-    (9, 11),
-    (9, 15),
     (9, 19),
 ]
 
@@ -659,14 +655,76 @@ class ContextualBanditPolicy(LayerBanditPolicy):
 
 
 class LipschitzBanditPolicy(LayerBanditPolicy):
-    """Reserved Lipschitz-bandit policy hook.
+    """Simple Lipschitz-UCB policy for nearby layer-split sharing.
 
-    The class intentionally inherits the current UCB behavior. Future work can
-    use arm_distance() to share observations between nearby layer splits, based
-    on the assumption that similar splits should have similar costs.
+    Reward updates reuse LayerBanditPolicy's unified per-token absolute reward.
+    Arm selection replaces the raw arm reward with a Lipschitz-smoothed reward
+    estimate from already observed nearby arms.
     """
 
     policy_name = "lipschitz"
+    lipschitz_constant = 0.5
+
+    def _select_next_arm(self):
+        """Choose the next arm with a Lipschitz-smoothed UCB score."""
+        for arm in self.arms:
+            if int(self.stats[arm]["pulls"]) == 0:
+                return arm
+
+        log_total = math.log(max(self.total_pulls, 2))
+        best_arm = self.arms[0]
+        best_score = None
+        for arm in self.arms:
+            pulls = int(self.stats[arm]["pulls"])
+            smooth_reward = self._lipschitz_reward_estimate(arm)
+            exploration = self.exploration_weight * math.sqrt(log_total / pulls)
+            score = smooth_reward + exploration
+            if best_score is None or score > best_score:
+                best_arm = arm
+                best_score = score
+        return best_arm
+
+    def arm_score_snapshot(self, selected_arm):
+        """Return scores that expose the active Lipschitz-UCB selection value."""
+        selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        rows = []
+        log_total = math.log(max(self.total_pulls, 2))
+        for arm in self.arms:
+            stats = self.stats[arm]
+            pulls = int(stats["pulls"])
+            reward = float(stats["reward"])
+            if pulls == 0:
+                score = "untried"
+            else:
+                smooth_reward = self._lipschitz_reward_estimate(arm)
+                score_value = smooth_reward + self.exploration_weight * math.sqrt(
+                    log_total / pulls
+                )
+                score = f"{score_value:.6f}"
+            rows.append(
+                {
+                    "arm": self._format_arm(arm),
+                    "reward": f"{reward:.6f}",
+                    "score": score,
+                    "selected": 1 if arm == selected_arm else 0,
+                }
+            )
+        return rows
+
+    def _lipschitz_reward_estimate(self, arm):
+        """Estimate an arm reward from observed nearby arms."""
+        observed_arms = [
+            observed_arm
+            for observed_arm in self.arms
+            if int(self.stats[observed_arm]["pulls"]) > 0
+        ]
+        if not observed_arms:
+            return 0.5
+        return max(
+            float(self.stats[observed_arm]["reward"])
+            - self.lipschitz_constant * self.arm_distance(arm, observed_arm)
+            for observed_arm in observed_arms
+        )
 
     def arm_distance(self, left_arm, right_arm):
         """Return normalized L1 distance between two 3-rank split arms."""
