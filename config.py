@@ -27,12 +27,12 @@ def parse_args():
     decides which half of the pipeline this process runs.
     """
     parser = argparse.ArgumentParser(
-        description="Run TinyLlama pipeline inference across two or three NCCL ranks."
+        description="Run a Hugging Face causal language model across two or three NCCL ranks."
     )
     parser.add_argument(
         "--model-dir",
-        default="model/tinyllama",
-        help="Local TinyLlama model directory. Default: model/tinyllama",
+        default="model/qwen2-7b",
+        help="Local Hugging Face model directory. Default: model/qwen2-7b",
     )
     parser.add_argument(
         "--input-csv",
@@ -112,8 +112,8 @@ def parse_args():
     parser.add_argument(
         "--dtype",
         choices=("auto", "float16", "bfloat16", "float32"),
-        default="float16",
-        help="Model dtype. Default: float16",
+        default="auto",
+        help="Model dtype. auto reads the model config dtype. Default: auto",
     )
     parser.add_argument(
         "--lazy-load",

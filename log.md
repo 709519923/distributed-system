@@ -2,6 +2,17 @@
 
 ## 2026-08-04
 
+### Qwen2-7B distributed model compatibility
+
+- Changed the default model path in `run.sh` to `/home/dingcong/models/Qwen2-7B`. The existing initial split `5,15` and the manually maintained bandit candidate arms are intentionally unchanged.
+- Changed the CLI dtype default from `float16` to `auto` without adding another run-script parameter. At startup, `auto` is now resolved from the local model config before model loading and communication. Qwen2-7B therefore resolves to `torch.bfloat16`, while another model can continue to use the dtype declared by its own config.
+- Fixed an important cross-rank dtype issue in the old `auto` path. Previously, an auto-loaded BF16 model could still force Rank 0 communication tensors to FP16 while worker ranks allocated receive buffers using their model dtype. The resolved model dtype is now shared by model loading and NCCL payload allocation on every rank.
+- Rank 0 CPU compute remains separate from communication precision. When CPU compatibility requires FP32 compute, Rank 0 computes in FP32 and converts boundary hidden states to the resolved model dtype before CUDA/NCCL transport. Cloud-base KV cache receive similarly converts from the common communication dtype to the local compute dtype.
+- Generalized model-facing descriptions and startup messages from TinyLlama-specific wording to Hugging Face causal-language-model wording. The executable filename is kept unchanged to avoid changing established launch commands.
+- Added an early model-structure check for `model.model.layers`, `model.model.embed_tokens`, `model.model.norm`, and `model.lm_head`. These are the exact paths confirmed by `model_info.txt` for Qwen2-7B and required by the current pipeline partitioning code.
+- Changed lazy model construction so it creates only `layer_end - layer_start` decoder layers from a copied config instead of constructing all 28 Qwen2 layers and pruning afterward. Local layer keys are still mapped to their original global checkpoint layer numbers, so selective safetensors loading remains correct while startup CPU memory and construction time are reduced.
+- Kept rank-local cache alignment behavior. Decoder-layer and self-attention `layer_idx` attributes are renumbered when present, matching compact rank-local `DynamicCache` partitions in cloud-base mode.
+
 ### Qwen2 structure inspection utility
 
 - Added `inspect_qwen2_structure.py` as a single-node diagnostic script before changing the distributed inference logic for Qwen2-7B.

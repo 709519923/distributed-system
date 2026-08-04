@@ -1,4 +1,4 @@
-"""TinyLlama stage loading utilities.
+"""Hugging Face causal-language-model stage loading utilities.
 
 This file owns both loading modes:
 - full loading: load the complete checkpoint, then prune unused modules;
@@ -10,6 +10,7 @@ unexpected full-checkpoint reads, start debugging here.
 """
 
 import contextlib
+import copy
 import json
 from pathlib import Path
 
@@ -25,6 +26,32 @@ def get_total_layers_from_config(model_dir):
     if total_layers is None:
         raise RuntimeError("config.json does not define num_hidden_layers.")
     return int(total_layers)
+
+
+def resolve_model_dtype_from_config(model_dir, dtype):
+    """Resolve CLI dtype=auto before model loading and NCCL communication."""
+    if dtype != "auto":
+        return dtype
+    config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
+    return effective_lazy_dtype(dtype, config)
+
+
+def validate_model_structure(model):
+    """Fail early unless the model exposes the pipeline modules used here."""
+    backbone = getattr(model, "model", None)
+    required = {
+        "model": backbone,
+        "model.layers": getattr(backbone, "layers", None),
+        "model.embed_tokens": getattr(backbone, "embed_tokens", None),
+        "model.norm": getattr(backbone, "norm", None),
+        "lm_head": getattr(model, "lm_head", None),
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise RuntimeError(
+            "Model does not expose the Llama/Qwen-style pipeline structure: "
+            + ", ".join(missing)
+        )
 
 
 def load_model_part_full(model_dir, rank, world_size, layer_start, layer_end, dtype, device):
@@ -43,6 +70,7 @@ def load_model_part_full(model_dir, rank, world_size, layer_start, layer_end, dt
         low_cpu_mem_usage=True,
     )
     model.eval()
+    validate_model_structure(model)
 
     total_layers = len(model.model.layers)
     validate_layer_range(layer_start, layer_end, total_layers)
@@ -114,11 +142,9 @@ def prune_model_for_rank(model, rank, world_size, layer_start, layer_end):
 def renumber_local_layer_indices(model):
     """Make pruned decoder layers use rank-local cache indices.
 
-    Hugging Face Llama layers can keep their original global layer_idx after we
-    slice model.model.layers. That is harmless when a rank creates its own cache
-    from scratch, but cloud-base receives a compact rank-local KV cache whose
-    layers are indexed [0, local_layer_count). Renumbering keeps transferred KV
-    caches, DynamicCache.update(), and the pruned ModuleList aligned.
+    Llama/Qwen attention modules can keep their original global layer_idx after
+    slicing. Cloud-base receives a compact rank-local KV cache indexed from zero,
+    so both decoder-layer and self-attention indices are normalized when present.
     """
     for local_index, layer in enumerate(model.model.layers):
         if hasattr(layer, "layer_idx"):
@@ -253,21 +279,27 @@ def load_model_part_lazy(model_dir, rank, world_size, layer_start, layer_end, dt
     """Lazy checkpoint loader: read only the tensors needed by this rank.
 
     Flow:
-    1. Read config.json and build the TinyLlama module structure without loading
-       checkpoint weights.
+    1. Read config.json and build only this rank's decoder-layer structure.
     2. Prune the module tree to this rank's pipeline stage.
     3. Build a safetensors loading plan for the remaining parameters.
     4. Load only those checkpoint tensors and copy them into the pruned model.
 
-    This is the path that prevents both nodes from reading all 201 checkpoint
-    tensors during startup.
+    This avoids constructing every decoder layer before pruning, which is
+    especially important for Qwen2-7B and other larger checkpoints.
     """
     config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
     lazy_dtype = effective_lazy_dtype(dtype, config)
+    total_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    validate_layer_range(layer_start, layer_end, total_layers)
+    local_layer_count = layer_end - layer_start
 
-    # Build module structure from config. no_init_weights() avoids spending time
-    # filling parameters with random values that will immediately be overwritten
-    # by the selected checkpoint tensors.
+    # Build the requested number of layers directly. Local layer 0 is mapped back
+    # to checkpoint layer_start by original_checkpoint_key() below.
+    stage_config = copy.deepcopy(config)
+    stage_config.num_hidden_layers = local_layer_count
+
+    # no_init_weights() avoids random initialization of parameters that are
+    # immediately replaced by selected checkpoint tensors.
     try:
         from transformers.modeling_utils import no_init_weights
         init_context = no_init_weights()
@@ -275,12 +307,10 @@ def load_model_part_lazy(model_dir, rank, world_size, layer_start, layer_end, dt
         init_context = contextlib.nullcontext()
 
     with init_context:
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForCausalLM.from_config(stage_config)
     model.eval()
-
-    total_layers = len(model.model.layers)
-    validate_layer_range(layer_start, layer_end, total_layers)
-    prune_model_for_rank(model, rank, world_size, layer_start, layer_end)
+    validate_model_structure(model)
+    prune_model_for_rank(model, rank, world_size, 0, local_layer_count)
 
     weight_map = load_safetensors_weight_map(model_dir)
     plan_by_shard = build_lazy_load_plan(model, rank, world_size, layer_start, config, weight_map)
@@ -308,7 +338,8 @@ def load_model_part_lazy(model_dir, rank, world_size, layer_start, layer_end, dt
     tensor_count = sum(len(items) for items in plan_by_shard.values())
     shard_count = len(plan_by_shard)
     print(
-        f"[Rank {rank}] Lazy-loaded {tensor_count} tensors from {shard_count} "
+        f"[Rank {rank}] Lazy-loaded model_type={getattr(config, 'model_type', 'unknown')} "
+        f"with {tensor_count} tensors from {shard_count} "
         "safetensors shard(s)."
     )
     return model, total_layers, "lazy"
@@ -350,5 +381,6 @@ def load_full_model_for_prefill(model_dir, dtype, device):
         low_cpu_mem_usage=True,
     )
     model.eval()
+    validate_model_structure(model)
     model.to(device)
     return model

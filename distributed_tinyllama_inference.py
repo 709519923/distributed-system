@@ -1,5 +1,5 @@
 """
-TinyLlama two-node / three-node NCCL pipeline inference entry point.
+Two-node / three-node NCCL causal-language-model pipeline inference entry point.
 
 The implementation is split by function so debugging can start in the smallest
 relevant module:
@@ -40,7 +40,11 @@ from inference_loops import (
     rank0_generate,
     rank0_generate_dynamic,
 )
-from model_loader import get_total_layers_from_config, load_model_part
+from model_loader import (
+    get_total_layers_from_config,
+    load_model_part,
+    resolve_model_dtype_from_config,
+)
 
 
 def load_tokenizer(model_dir):
@@ -83,9 +87,17 @@ def main():
             raise RuntimeError("cloud-base prefill mode currently requires --dynamic-load.")
 
         requested_dtype = resolve_dtype(args.dtype)
-        comm_dtype = torch.float16 if requested_dtype == "auto" else requested_dtype
-        dtype = requested_dtype
-        if rank == 0 and model_device.type == "cpu" and dtype in (torch.float16, "auto"):
+        resolved_model_dtype = resolve_model_dtype_from_config(args.model_dir, requested_dtype)
+        comm_dtype = resolved_model_dtype
+        dtype = resolved_model_dtype
+        print(
+            f"[Rank {rank}] requested_dtype={args.dtype}; "
+            f"resolved_model_dtype={resolved_model_dtype}; comm_dtype={comm_dtype}"
+        )
+        if rank == 0 and model_device.type == "cpu" and dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
             print("[Rank 0] CPU compute uses dtype=float32 for PyTorch CPU compatibility.")
             dtype = torch.float32
 
@@ -124,7 +136,7 @@ def main():
             lazy_load=args.lazy_load,
         )
         print(
-            f"[Rank {rank}] Loaded TinyLlama from {args.model_dir}; "
+            f"[Rank {rank}] Loaded model from {args.model_dir}; "
             f"total_layers={total_layers}; stage=[{layer_start},{layer_end}); "
             f"load_mode={load_mode}"
         )
