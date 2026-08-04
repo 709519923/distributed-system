@@ -2,6 +2,31 @@
 
 ## 2026-08-04
 
+### 增量层切换与节点本地层缓存
+
+- 动态层分配不再在边界变化时释放整个模型分区并完整重载。新增 `incremental_layer_partition.py`，由每个 Rank 独立维护当前激活层和本节点已经加载过的非激活层。
+- 权重始终来自各节点自己的本地 safetensors 文件，不在 Rank 之间传输模型权重。新分区中的重叠层直接保留；目标层已经存在于本节点缓存时直接重新激活；只有本节点从未加载过的目标层才读取本地权重文件。
+- 对旧分区 $A_{old}$ 和新分区 $A_{new}$，切换时按以下集合处理：
+
+  $$
+  A_{keep}=A_{old}\cap A_{new}
+  $$
+
+  $$
+  A_{out}=A_{old}-A_{new}
+  $$
+
+  $$
+  A_{load}=A_{new}-A_{cache}
+  $$
+
+  其中 $A_{keep}$ 保持激活，$A_{out}$ 转入本节点非激活缓存，$A_{load}$ 才从本地 safetensors 读取。Embedding、最终 Norm 和 LM Head 的 Rank 归属不变，不会随 decoder 层边界切换反复加载。
+- 非激活层默认保留在原节点显存中，以减少后续重复切换的磁盘读取。可用显存按“CUDA 驱动空闲显存 + PyTorch 已保留但尚未分配的可复用显存”计算；不足以加载下一层时，按照最近最少使用顺序清理非激活层。当前目标分区需要的层不会被清理，被清理的层以后再次需要时仍然只从该节点本地文件重新读取。
+- 每次重新组合 `model.model.layers` 后，继续把 decoder layer 和 self-attention 的 `layer_idx` 重编号为本 Rank 的局部连续编号，保证 cloud-base 模式传入的紧凑 KV cache 与当前分区正确对齐。
+- 示例：分配从 `rank0=[0,5) rank1=[5,15) rank2=[15,28)` 改为 `rank0=[0,1) rank1=[1,11) rank2=[11,28)` 时，Rank 0 保留第 0 层并缓存第 1 至 4 层；Rank 1 保留第 5 至 10 层，只从本地读取第 1 至 4 层；Rank 2 保留第 15 至 27 层，只从本地读取第 11 至 14 层。整个集群只新增读取 8 层，而不是重新加载三个完整分区。
+- 新增 batch 级模型就绪屏障。三个 Rank 完成本轮增量切换后才开始 prefill/decode 通信；cloud-base 模式下，Rank 2 首次使用的完整 prefill 模型也必须在屏障前加载完毕，避免 Rank 0 已经进入 `recv` 而 Rank 2 仍在读取 Qwen2-7B 权重。
+- 分布式操作默认超时由 120 秒提高到 900 秒，为大型模型首次加载、磁盘较慢节点和首次 cloud-base 全模型加载保留合理时间。超时提高只避免正常加载被误判为 NCCL 故障，真正的 Rank 崩溃仍会在超时后暴露。
+
 ### Qwen2-7B distributed model compatibility
 
 - Changed the default model path in `run.sh` to `/home/dingcong/models/Qwen2-7B`. The existing initial split `5,15` and the manually maintained bandit candidate arms are intentionally unchanged.

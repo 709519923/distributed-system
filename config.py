@@ -106,8 +106,8 @@ def parse_args():
     parser.add_argument(
         "--timeout-seconds",
         type=int,
-        default=120,
-        help="Distributed initialization timeout. Default: 120",
+        default=900,
+        help="Distributed operation timeout in seconds. Default: 900",
     )
     parser.add_argument(
         "--dtype",

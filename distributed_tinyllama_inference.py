@@ -6,6 +6,7 @@ relevant module:
 - config.py: CLI options, split layers, status constants.
 - distributed_env.py: RANK/WORLD_SIZE, CUDA device, NCCL init.
 - model_loader.py: full loading, lazy loading, layer pruning.
+- incremental_layer_partition.py: local incremental layer switching and cache.
 - model_forward.py: attention mask, position ids, per-rank forward pass.
 - pipeline_comm.py: NCCL send/recv protocol and dynamic boundary broadcast.
 - environment.py: per-link bandwidth and communication-delay simulation.
