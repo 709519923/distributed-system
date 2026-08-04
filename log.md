@@ -7,6 +7,10 @@
 - Added `inspect_qwen2_structure.py` as a single-node diagnostic script before changing the distributed inference logic for Qwen2-7B.
 - The script checks local `config.json` fields, Hugging Face module paths, safetensors checkpoint keys, suggested three-rank split points, and optional prefill KV-cache tensor structure.
 - This keeps the Qwen migration low risk: first verify whether Qwen2 follows the same Llama-style paths used by the current project, then decide whether the existing loader/forward/KV-transfer code can be reused directly or needs a small model adapter.
+- Improved the script's long-running visibility after Qwen2-7B appeared to stop at `Module path compatibility`. Every substantial stage now prints `started`, a five-second heartbeat containing elapsed time and current process RSS, and `completed` or `failed` status.
+- The module-path inspection now constructs the Qwen2 skeleton on PyTorch's `meta` device together with `no_init_weights()`. This creates the complete Python module tree, layer list, module types, and forward signatures needed by the compatibility check, but avoids allocating the actual 7B parameter tensors in CPU memory. `--skip-forward` therefore still performs a complete structural and checkpoint-key inspection.
+- Safetensors inspection now reads each shard header explicitly, prints `shard i/N`, reports the number of keys found in each shard, and compares the scanned key set with `model.safetensors.index.json` when that index is present. Header scanning reads metadata only; it does not load weight payloads into memory.
+- When `--skip-forward` is omitted, tokenizer loading, full-checkpoint loading, device transfer, prompt tokenization, the prefill forward pass, and KV-cache parsing each expose the same progress heartbeat. CUDA synchronization occurs inside the forward stage so its completion message means the GPU prefill work has actually finished.
 
 ## 2026-07-31
 

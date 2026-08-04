@@ -15,6 +15,8 @@ import argparse
 import contextlib
 import json
 import os
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -96,10 +98,71 @@ def parse_args():
 
 
 def print_section(title):
-    print("")
-    print("=" * 80)
-    print(title)
-    print("=" * 80)
+    print("", flush=True)
+    print("=" * 80, flush=True)
+    print(title, flush=True)
+    print("=" * 80, flush=True)
+
+
+def current_rss_mb():
+    """Return current Linux process RSS without adding a psutil dependency."""
+    status_path = Path("/proc/self/status")
+    if not status_path.exists():
+        return None
+
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def runtime_status(start_time):
+    """Build a small progress line without forcing CUDA initialization."""
+    parts = [f"elapsed={time.perf_counter() - start_time:.1f}s"]
+    rss_mb = current_rss_mb()
+    if rss_mb is not None:
+        parts.append(f"rss={rss_mb:.1f}MB")
+
+    # Do not initialize CUDA merely for diagnostic output. Once CUDA is active,
+    # its allocated memory is useful context while loading or running the model.
+    if torch.cuda.is_initialized():
+        try:
+            device_index = torch.cuda.current_device()
+            allocated_mb = torch.cuda.memory_allocated(device_index) / 1024.0 / 1024.0
+            reserved_mb = torch.cuda.memory_reserved(device_index) / 1024.0 / 1024.0
+            parts.append(f"cuda:{device_index}_allocated={allocated_mb:.1f}MB")
+            parts.append(f"cuda:{device_index}_reserved={reserved_mb:.1f}MB")
+        except RuntimeError:
+            pass
+    return "; ".join(parts)
+
+
+@contextlib.contextmanager
+def progress_stage(name, heartbeat_seconds=5.0):
+    """Print start, periodic heartbeat, and finish messages for long stages."""
+    start_time = time.perf_counter()
+    stopped = threading.Event()
+
+    def heartbeat():
+        while not stopped.wait(heartbeat_seconds):
+            print(f"[progress] {name}: running; {runtime_status(start_time)}", flush=True)
+
+    print(f"[progress] {name}: started; {runtime_status(start_time)}", flush=True)
+    worker = threading.Thread(target=heartbeat, name="inspection-progress", daemon=True)
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        print(f"[progress] {name}: failed; {runtime_status(start_time)}", flush=True)
+        raise
+    else:
+        print(f"[progress] {name}: completed; {runtime_status(start_time)}", flush=True)
+    finally:
+        stopped.set()
+        worker.join(timeout=heartbeat_seconds + 1.0)
 
 
 def format_value(value):
@@ -168,7 +231,12 @@ def instantiate_empty_model(config, trust_remote_code):
     except ImportError:
         init_context = contextlib.nullcontext()
 
-    with init_context:
+    # ``no_init_weights`` skips random initialization but some PyTorch versions
+    # still allocate parameter storage. Meta tensors retain the whole module tree
+    # and its signatures without allocating the 7B parameter payload in host RAM.
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(init_context)
+        stack.enter_context(torch.device("meta"))
         model = AutoModelForCausalLM.from_config(
             config,
             trust_remote_code=trust_remote_code,
@@ -180,7 +248,8 @@ def instantiate_empty_model(config, trust_remote_code):
 def inspect_module_paths(config, trust_remote_code):
     print_section("Module path compatibility")
     try:
-        model = instantiate_empty_model(config, trust_remote_code)
+        with progress_stage("Build Qwen2 model skeleton on meta device"):
+            model = instantiate_empty_model(config, trust_remote_code)
     except Exception:
         print("empty_model_init=failed")
         traceback.print_exc()
@@ -234,13 +303,18 @@ def inspect_module_paths(config, trust_remote_code):
 def load_safetensors_weight_keys(model_dir):
     model_dir = Path(model_dir)
     index_path = model_dir / "model.safetensors.index.json"
+    index_keys = set()
+    indexed_shards = []
     if index_path.exists():
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
         weight_map = index.get("weight_map", {})
-        return sorted(weight_map.keys()), sorted(set(weight_map.values())), "index"
+        index_keys = set(weight_map.keys())
+        indexed_shards = sorted(set(weight_map.values()))
 
-    safetensor_files = sorted(model_dir.glob("*.safetensors"))
+    safetensor_files = [model_dir / name for name in indexed_shards]
+    if not safetensor_files:
+        safetensor_files = sorted(model_dir.glob("*.safetensors"))
     if not safetensor_files:
         return [], [], "missing"
 
@@ -251,10 +325,34 @@ def load_safetensors_weight_keys(model_dir):
         return [], [path.name for path in safetensor_files], "safetensors_import_failed"
 
     keys = []
-    for shard_path in safetensor_files:
-        with safe_open(str(shard_path), framework="pt", device="cpu") as shard:
-            keys.extend(shard.keys())
-    return sorted(keys), [path.name for path in safetensor_files], "scan"
+    with progress_stage("Read safetensors shard headers"):
+        for shard_index, shard_path in enumerate(safetensor_files, start=1):
+            print(
+                f"[progress] safetensors header {shard_index}/{len(safetensor_files)}: "
+                f"{shard_path.name}",
+                flush=True,
+            )
+            with safe_open(str(shard_path), framework="pt", device="cpu") as shard:
+                shard_keys = list(shard.keys())
+            keys.extend(shard_keys)
+            print(
+                f"[progress] safetensors header {shard_index}/{len(safetensor_files)}: "
+                f"found_keys={len(shard_keys)}",
+                flush=True,
+            )
+
+    scanned_keys = set(keys)
+    if index_keys:
+        source = "index_and_header_scan"
+        print(f"index_weight_key_count={len(index_keys)}")
+        print(f"index_matches_scanned_keys={index_keys == scanned_keys}")
+        missing_from_shards = sorted(index_keys - scanned_keys)
+        unexpected_in_shards = sorted(scanned_keys - index_keys)
+        print(f"index_keys_missing_from_shards={missing_from_shards[:20]}")
+        print(f"shard_keys_missing_from_index={unexpected_in_shards[:20]}")
+    else:
+        source = "header_scan"
+    return sorted(scanned_keys), [path.name for path in safetensor_files], source
 
 
 def parse_layer_index(key):
@@ -419,53 +517,61 @@ def inspect_forward(args, config):
     print(f"forward_device={device}")
     print(f"forward_dtype={dtype}")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_dir,
-        local_files_only=True,
-        trust_remote_code=args.trust_remote_code,
-    )
+    with progress_stage("Load tokenizer"):
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_dir,
+            local_files_only=True,
+            trust_remote_code=args.trust_remote_code,
+        )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"tokenizer_type={type(tokenizer)}")
     print(f"tokenizer_pad_token_id={tokenizer.pad_token_id}")
     print(f"tokenizer_eos_token_id={tokenizer.eos_token_id}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir,
-        torch_dtype=dtype,
-        local_files_only=True,
-        low_cpu_mem_usage=True,
-        trust_remote_code=args.trust_remote_code,
-    )
-    model.eval().to(device)
+    with progress_stage("Load full Qwen2 checkpoint"):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir,
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            trust_remote_code=args.trust_remote_code,
+        )
+    with progress_stage(f"Move full model to {device}"):
+        model.eval().to(device)
     print(f"loaded_model_type={type(model)}")
     print(f"loaded_model_dtype={getattr(model, 'dtype', None)}")
 
     prompts = [args.prompt] * args.batch_size
-    encoded = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=args.max_input_tokens,
-    )
+    with progress_stage("Tokenize inspection prompt"):
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.max_input_tokens,
+        )
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
     print(f"input_ids_shape={tuple(input_ids.shape)}")
     print(f"attention_mask_shape={tuple(attention_mask.shape)}")
 
-    with torch.inference_mode():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-            return_dict=True,
-        )
+    with progress_stage("Run full-model prefill and build KV cache"):
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                return_dict=True,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     logits = getattr(outputs, "logits", None)
     if torch.is_tensor(logits):
         print(f"logits_shape={tuple(logits.shape)} dtype={logits.dtype} device={logits.device}")
-    inspect_kv_cache(outputs.past_key_values)
+    with progress_stage("Inspect generated KV cache"):
+        inspect_kv_cache(outputs.past_key_values)
 
 
 def normalize_split(boundaries, total_layers):
@@ -511,11 +617,12 @@ def main():
     print(f"model_dir_exists={model_dir.exists()}")
     print(f"skip_forward={args.skip_forward}")
 
-    config = AutoConfig.from_pretrained(
-        args.model_dir,
-        local_files_only=True,
-        trust_remote_code=args.trust_remote_code,
-    )
+    with progress_stage("Load model config"):
+        config = AutoConfig.from_pretrained(
+            args.model_dir,
+            local_files_only=True,
+            trust_remote_code=args.trust_remote_code,
+        )
     inspect_config(config)
     inspect_module_paths(config, args.trust_remote_code)
     inspect_safetensors_keys(args.model_dir, config)
