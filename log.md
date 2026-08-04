@@ -1,5 +1,13 @@
 # Version Log
 
+## 2026-08-04
+
+### Qwen2 structure inspection utility
+
+- Added `inspect_qwen2_structure.py` as a single-node diagnostic script before changing the distributed inference logic for Qwen2-7B.
+- The script checks local `config.json` fields, Hugging Face module paths, safetensors checkpoint keys, suggested three-rank split points, and optional prefill KV-cache tensor structure.
+- This keeps the Qwen migration low risk: first verify whether Qwen2 follows the same Llama-style paths used by the current project, then decide whether the existing loader/forward/KV-transfer code can be reused directly or needs a small model adapter.
+
 ## 2026-07-31
 
 ### Context-aware warmup for Contextual Bandit
