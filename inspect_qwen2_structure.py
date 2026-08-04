@@ -15,9 +15,11 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -39,6 +41,29 @@ CONFIG_FIELDS = [
     "tie_word_embeddings",
     "vocab_size",
 ]
+
+
+class TeeStream:
+    """Write diagnostic output to the terminal and model_info.txt together."""
+
+    def __init__(self, terminal_stream, file_stream):
+        self.terminal_stream = terminal_stream
+        self.file_stream = file_stream
+
+    def write(self, text):
+        self.terminal_stream.write(text)
+        self.file_stream.write(text)
+        return len(text)
+
+    def flush(self):
+        self.terminal_stream.flush()
+        self.file_stream.flush()
+
+    def isatty(self):
+        return self.terminal_stream.isatty()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal_stream, name)
 
 
 def parse_args():
@@ -611,32 +636,53 @@ def print_split_suggestions(config):
 
 def main():
     args = parse_args()
-    model_dir = Path(args.model_dir)
-    print_section("Input")
-    print(f"model_dir={model_dir}")
-    print(f"model_dir_exists={model_dir.exists()}")
-    print(f"skip_forward={args.skip_forward}")
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "model_info.txt"
 
-    with progress_stage("Load model config"):
-        config = AutoConfig.from_pretrained(
-            args.model_dir,
-            local_files_only=True,
-            trust_remote_code=args.trust_remote_code,
-        )
-    inspect_config(config)
-    inspect_module_paths(config, args.trust_remote_code)
-    inspect_safetensors_keys(args.model_dir, config)
-    print_split_suggestions(config)
-
-    if args.skip_forward:
-        print_section("Single-node prefill forward")
-        print("forward_skipped=True")
-    else:
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
         try:
-            inspect_forward(args, config)
-        except Exception:
-            print("forward_failed=True")
+            print(f"inspection_started_at={datetime.now().isoformat(timespec='seconds')}")
+            print(f"model_info_log_path={log_path.resolve()}")
+            print(f"command_arguments={vars(args)}")
+
+            model_dir = Path(args.model_dir)
+            print_section("Input")
+            print(f"model_dir={model_dir}")
+            print(f"model_dir_exists={model_dir.exists()}")
+            print(f"skip_forward={args.skip_forward}")
+
+            with progress_stage("Load model config"):
+                config = AutoConfig.from_pretrained(
+                    args.model_dir,
+                    local_files_only=True,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            inspect_config(config)
+            inspect_module_paths(config, args.trust_remote_code)
+            inspect_safetensors_keys(args.model_dir, config)
+            print_split_suggestions(config)
+
+            if args.skip_forward:
+                print_section("Single-node prefill forward")
+                print("forward_skipped=True")
+            else:
+                try:
+                    inspect_forward(args, config)
+                except Exception:
+                    print("forward_failed=True")
+                    traceback.print_exc()
+        except BaseException:
+            # Keep failures from every inspection phase in model_info.txt too.
             traceback.print_exc()
+            raise
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 if __name__ == "__main__":
