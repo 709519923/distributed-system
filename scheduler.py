@@ -119,6 +119,9 @@ CONTEXT_INPUT_TOKEN_SCALE = 1500.0
 CONTEXT_OUTPUT_TOKEN_SCALE = 512.0
 CONTEXT_BATCH_SIZE_SCALE = 128.0
 CONTEXT_VECTOR_SIZE = 4
+# Number of mandatory observations for every actual arm under each request type.
+# Change this value to adjust contextual warmup without hard-coding an arm count.
+CONTEXT_WARMUP_PULLS = 1
 
 CANDIDATE_ARMS = [
     (1, 11),
@@ -519,6 +522,9 @@ class ContextualBanditPolicy(LayerBanditPolicy):
     ):
         self.ridge_lambda = float(ridge_lambda)
         self.reward_scale_ms = float(reward_scale_ms)
+        self.context_warmup_pulls = int(CONTEXT_WARMUP_PULLS)
+        if self.context_warmup_pulls < 1:
+            raise ValueError("CONTEXT_WARMUP_PULLS must be at least 1.")
         self.last_context = None
         self.last_context_key = "unknown"
         self.last_features = [1.0, 0.0, 0.0, 0.0]
@@ -558,7 +564,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
 
         context_pulls = self._ensure_context_arm_pulls(context_key)
         for arm in self.arms:
-            if int(context_pulls.get(arm, 0)) == 0:
+            if int(context_pulls.get(arm, 0)) < self.context_warmup_pulls:
                 self.current_arm = arm
                 return arm
 

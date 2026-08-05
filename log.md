@@ -1,5 +1,19 @@
 # Version Log
 
+## 2026-08-05
+
+### Contextual Bandit 可配置预热探索次数
+
+- 在 `scheduler.py` 的 Context 参数区域新增 `CONTEXT_WARMUP_PULLS`。该值表示每一种请求类型下，每个实际有效 arm 在进入 LinUCB 评分选择前必须完成的观测次数，默认值为 `1`，因此默认行为与修改前一致。
+- Contextual Bandit 的强制探索条件由“该请求类型下 arm 从未运行”改为“该请求类型下 arm 的运行次数小于 `CONTEXT_WARMUP_PULLS`”。将参数改为 `2`，即可让每种请求类型下的每个 arm 至少运行两次。
+- 没有设置固定的 arm 数量。策略始终遍历经过层边界校验后的实际 `self.arms`；修改 `CANDIDATE_ARMS`、过滤无效 arm 或自动插入默认分配后，预热逻辑都会按最终实际 arm 数量工作。
+- `ContextualLipschitzBanditPolicy` 继承 `ContextualBanditPolicy`，因此同步使用该预热次数；普通 UCB 和 Lipschitz Bandit 的探索逻辑不受影响。
+- 总预热 batch 数取决于实际 arm 数量、数据中出现的请求类型数量和配置的预热次数：
+
+  $$
+  N_{warmup}=N_{actual\ arms}\times N_{request\ types}\times CONTEXT\_WARMUP\_PULLS
+  $$
+
 ## 2026-08-04
 
 ### 增量层切换与节点本地层缓存
