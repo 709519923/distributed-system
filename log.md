@@ -1,5 +1,46 @@
 # Version Log
 
+## 2026-08-06
+
+### TinyLlama 动态切臂改为增量加载
+
+- 参考 `C:\Users\smbu\Desktop\lab7\dist` 中 qwen2-7b 版本的实现，为 tinyllama 版本补上增量 decoder layer 切换能力。动态切臂时不再释放旧模型分区后重新 lazy load 整个 rank stage，而是保留当前 rank 已经加载过的层。
+- 新增 `incremental_layer_partition.py`，由 `IncrementalLayerPartition` 管理本 rank 的 active / inactive decoder layers：
+  - 新 split 与旧 split 重叠的层直接保留在 `model.model.layers` 中。
+  - 旧 split 移出的层从 active `ModuleList` 移到本地缓存字典，后续切回时可直接命中。
+  - 新 split 需要但本地从未加载过的层，才从 safetensors checkpoint 读取。
+  - CUDA 显存不足时，会按 least-recently-used 方式清理 inactive layer，并保留目标 split 需要的层。
+- `rank0_generate_dynamic()` 和 `pipeline_serve_dynamic()` 已接入增量切换：
+  - 首个 batch 仍通过 `load_model_part(..., lazy_load=True)` 加载初始分区。
+  - 后续 batch 如果 split 不变，继续复用当前模型分区。
+  - 后续 batch 如果 split 变化，调用 `layer_partition.switch_to(layer_start, layer_end, batch_number)`，并打印 `retained`、`cache_hits`、`local_loaded`、`inactive_cache`、`evicted` 和 `elapsed_ms`，便于观察切臂是否真的只补加载缺失层。
+- 恢复动态加载后的 model-ready barrier。每个 batch 在所有 rank 完成本地加载或增量切换后，才进入 hidden states / KV cache 等 NCCL 通信，避免某个 rank 还在读 checkpoint 时其他 rank 已经进入 P2P recv/send。
+- cloud-base 模式下，Rank 2 的完整 prefill model 也会在 barrier 前完成首次加载，避免 Rank 0 / Rank 1 已经开始等待 KV cache，而 Rank 2 仍在加载完整模型造成计时或阻塞混淆。
+- `model_loader.py` 补齐 qwen2-7b 版本中的加载器改动：
+  - 新增 `resolve_model_dtype_from_config()`，当 `--dtype auto` 时先从 config 中解析真实 dtype，再用于模型加载和通信 dtype。
+  - 新增 `validate_model_structure()`，提前确认模型具有 Llama-style pipeline 所需的 `model.layers`、`embed_tokens`、`norm` 和 `lm_head`。
+  - lazy loader 改为只构造当前 rank 需要的 decoder layer 数量，再用 `original_checkpoint_key()` 将本地 layer index 映射回 checkpoint 的全局 layer id，减少初始化和切换开销。
+
+### Files changed
+
+- `incremental_layer_partition.py`: 新增本地层缓存、缺失层按需加载、inactive layer LRU 清理和切臂结果统计。
+- `inference_loops.py`: 动态推理路径从“split 变化时释放并重载”改为“split 变化时增量切换”，并加入 model-ready barrier。
+- `model_loader.py`: 补上 dtype 解析、结构校验，以及只构造 rank-local stage 的 lazy load 路径。
+- `distributed_tinyllama_inference.py`: 动态/静态入口统一使用解析后的模型 dtype 和通信 dtype。
+
+### Verification
+
+- 已使用 Codex bundled Python 对以下文件做语法编译检查：
+
+  ```text
+  distributed_tinyllama_inference.py
+  inference_loops.py
+  model_loader.py
+  incremental_layer_partition.py
+  ```
+
+- 未在本机执行 NCCL 多 rank 推理验证；该验证需要实际三节点 / GPU 运行环境。
+
 ## 2026-07-31
 
 ### Context-aware warmup for Contextual Bandit

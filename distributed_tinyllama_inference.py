@@ -6,6 +6,7 @@ relevant module:
 - config.py: CLI options, split layers, status constants.
 - distributed_env.py: RANK/WORLD_SIZE, CUDA device, NCCL init.
 - model_loader.py: full loading, lazy loading, layer pruning.
+- incremental_layer_partition.py: local incremental layer switching and cache.
 - model_forward.py: attention mask, position ids, per-rank forward pass.
 - pipeline_comm.py: NCCL send/recv protocol and dynamic boundary broadcast.
 - environment.py: per-link bandwidth and communication-delay simulation.
@@ -40,7 +41,11 @@ from inference_loops import (
     rank0_generate,
     rank0_generate_dynamic,
 )
-from model_loader import get_total_layers_from_config, load_model_part
+from model_loader import (
+    get_total_layers_from_config,
+    load_model_part,
+    resolve_model_dtype_from_config,
+)
 
 
 def load_tokenizer(model_dir):
@@ -83,9 +88,17 @@ def main():
             raise RuntimeError("cloud-base prefill mode currently requires --dynamic-load.")
 
         requested_dtype = resolve_dtype(args.dtype)
-        comm_dtype = torch.float16 if requested_dtype == "auto" else requested_dtype
-        dtype = requested_dtype
-        if rank == 0 and model_device.type == "cpu" and dtype in (torch.float16, "auto"):
+        resolved_model_dtype = resolve_model_dtype_from_config(args.model_dir, requested_dtype)
+        comm_dtype = resolved_model_dtype
+        dtype = resolved_model_dtype
+        print(
+            f"[Rank {rank}] requested_dtype={args.dtype}; "
+            f"resolved_model_dtype={resolved_model_dtype}; comm_dtype={comm_dtype}"
+        )
+        if rank == 0 and model_device.type == "cpu" and dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
             print("[Rank 0] CPU compute uses dtype=float32 for PyTorch CPU compatibility.")
             dtype = torch.float32
 

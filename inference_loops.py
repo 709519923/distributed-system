@@ -9,6 +9,7 @@ import gc
 import time
 
 import torch
+import torch.distributed as dist
 
 from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_from_boundaries
 from csv_io import chunk_items, read_prompts, write_output_rows
@@ -37,6 +38,7 @@ from kv_cache_utils import (
     estimate_past_key_values_bytes,
     synchronize_cuda,
 )
+from incremental_layer_partition import IncrementalLayerPartition
 from model_forward import choose_next_token, rank0_forward, rank1_forward_logits, rank_middle_forward
 from model_loader import get_total_layers_from_config, load_full_model_for_prefill, load_model_part
 from pipeline_comm import (
@@ -613,6 +615,18 @@ def release_model(model):
         torch.cuda.empty_cache()
 
 
+def wait_for_all_model_partitions(rank, batch_number, comm_device):
+    """Do not start batch communication until every rank has finished loading."""
+    if comm_device.type != "cuda":
+        raise RuntimeError("NCCL model-ready barrier requires a CUDA communication device.")
+    device_index = comm_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    print(f"[Rank {rank}] Batch {batch_number}: waiting at model-ready barrier.")
+    dist.barrier(device_ids=[device_index])
+    print(f"[Rank {rank}] Batch {batch_number}: all model partitions are ready.")
+
+
 def receive_cloud_base_cache_metric(
     args,
     model,
@@ -915,6 +929,7 @@ def rank0_generate_dynamic(
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
     model = None
+    layer_partition = None
     current_stage = None
 
     try:
@@ -969,15 +984,7 @@ def rank0_generate_dynamic(
                 environment.apply_batch(batch_number)
                 environment = broadcast_environment(environment, rank=0, device=comm_device)
                 print(f"[Rank 0] Batch {batch_number}: environment={environment.describe()}")
-            if model is None or next_stage != current_stage:
-                if model is not None:
-                    release_model(model)
-                    model = None
-                    print(
-                        f"[Rank 0] Batch {batch_number}: split changed "
-                        f"{current_stage}->{next_stage}; old partition released."
-                    )
-
+            if model is None:
                 model, _, load_mode = load_model_part(
                     args.model_dir,
                     rank=0,
@@ -988,16 +995,47 @@ def rank0_generate_dynamic(
                     device=device,
                     lazy_load=True,
                 )
+                layer_partition = IncrementalLayerPartition.from_loaded_model(
+                    model=model,
+                    model_dir=args.model_dir,
+                    rank=0,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    dtype=dtype,
+                    device=device,
+                    batch_number=batch_number,
+                )
                 current_stage = next_stage
                 print(
                     f"[Rank 0] Batch {batch_number} model loaded; "
                     f"stage=[{layer_start},{layer_end}); load_mode={load_mode}"
+                )
+            elif next_stage != current_stage:
+                switch_result = layer_partition.switch_to(
+                    layer_start,
+                    layer_end,
+                    batch_number,
+                )
+                model = layer_partition.model
+                current_stage = next_stage
+                print(
+                    f"[Rank 0] Batch {batch_number}: incremental split "
+                    f"{switch_result.old_stage}->{switch_result.new_stage}; "
+                    f"retained={switch_result.retained_layers}; "
+                    f"cache_hits={switch_result.cache_hit_layers}; "
+                    f"local_loaded={switch_result.loaded_layers}; "
+                    f"inactive_cache={layer_partition.inactive_layer_ids()}; "
+                    f"evicted={switch_result.evicted_layers}; "
+                    f"elapsed_ms={switch_result.elapsed_ms:.2f}."
                 )
             else:
                 print(
                     f"[Rank 0] Batch {batch_number}: reuse cached model partition "
                     f"for stage=[{layer_start},{layer_end})."
                 )
+
+            wait_for_all_model_partitions(0, batch_number, comm_device)
 
             if args.prefill_mode == "cloud-base":
                 rows, records = generate_rows_for_prompts_cloud_base(
@@ -1064,6 +1102,9 @@ def rank0_generate_dynamic(
         write_output_rows(args.output_csv, all_rows)
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
     finally:
+        if layer_partition is not None:
+            layer_partition.release()
+            model = None
         release_model(model)
 
 
@@ -1270,6 +1311,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=No
         scheduler = Scheduler(args.allocation_csv, total_layers, default_boundaries, world_size)
     batch_number = 1
     model = None
+    layer_partition = None
     full_prefill_model = None
     current_stage = None
 
@@ -1301,15 +1343,7 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=No
                 )
             print(f"[Rank {rank}] Batch {batch_number}: {interval_text}")
 
-            if model is None or next_stage != current_stage:
-                if model is not None:
-                    release_model(model)
-                    model = None
-                    print(
-                        f"[Rank {rank}] Batch {batch_number}: split changed "
-                        f"{current_stage}->{next_stage}; old partition released."
-                    )
-
+            if model is None:
                 model, _, load_mode = load_model_part(
                     args.model_dir,
                     rank=rank,
@@ -1320,10 +1354,39 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=No
                     device=device,
                     lazy_load=True,
                 )
+                layer_partition = IncrementalLayerPartition.from_loaded_model(
+                    model=model,
+                    model_dir=args.model_dir,
+                    rank=rank,
+                    world_size=world_size,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    dtype=dtype,
+                    device=device,
+                    batch_number=batch_number,
+                )
                 current_stage = next_stage
                 print(
                     f"[Rank {rank}] Batch {batch_number} model loaded; "
                     f"stage=[{layer_start},{layer_end}); load_mode={load_mode}"
+                )
+            elif next_stage != current_stage:
+                switch_result = layer_partition.switch_to(
+                    layer_start,
+                    layer_end,
+                    batch_number,
+                )
+                model = layer_partition.model
+                current_stage = next_stage
+                print(
+                    f"[Rank {rank}] Batch {batch_number}: incremental split "
+                    f"{switch_result.old_stage}->{switch_result.new_stage}; "
+                    f"retained={switch_result.retained_layers}; "
+                    f"cache_hits={switch_result.cache_hit_layers}; "
+                    f"local_loaded={switch_result.loaded_layers}; "
+                    f"inactive_cache={layer_partition.inactive_layer_ids()}; "
+                    f"evicted={switch_result.evicted_layers}; "
+                    f"elapsed_ms={switch_result.elapsed_ms:.2f}."
                 )
             else:
                 print(
@@ -1331,18 +1394,28 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=No
                     f"for stage=[{layer_start},{layer_end})."
                 )
 
+            # Rank 2's cloud-base full model is also a batch prerequisite. Load
+            # it before the barrier so Rank 0/1 do not enter P2P communication
+            # while Rank 2 is still reading the checkpoint.
+            if (
+                args.prefill_mode == "cloud-base"
+                and rank == world_size - 1
+                and full_prefill_model is None
+            ):
+                print(f"[Rank {rank}] Loading full model for cloud-base KV prefill...")
+                full_prefill_model = load_full_model_for_prefill(
+                    args.model_dir,
+                    dtype,
+                    device,
+                )
+                print(f"[Rank {rank}] Loaded full model for cloud-base KV prefill.")
+
+            wait_for_all_model_partitions(rank, batch_number, device)
+
             initial_past_key_values = None
             initial_metric = None
             if args.prefill_mode == "cloud-base":
                 if rank == world_size - 1:
-                    if full_prefill_model is None:
-                        print(f"[Rank {rank}] Loading full model for cloud-base KV prefill...")
-                        full_prefill_model = load_full_model_for_prefill(
-                            args.model_dir,
-                            dtype,
-                            device,
-                        )
-                        print(f"[Rank {rank}] Loaded full model for cloud-base KV prefill.")
                     initial_past_key_values, initial_metric = run_rank2_cloud_base_prefill(
                         args,
                         model,
@@ -1390,5 +1463,8 @@ def pipeline_serve_dynamic(args, rank, world_size, dtype, device, environment=No
 
         print(f"[Rank {rank}] Dynamic loading stop signal received.")
     finally:
+        if layer_partition is not None:
+            layer_partition.release()
+            model = None
         release_model(model)
         release_model(full_prefill_model)
