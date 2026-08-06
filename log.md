@@ -27,6 +27,7 @@
 - `inference_loops.py`: 动态推理路径从“split 变化时释放并重载”改为“split 变化时增量切换”，并加入 model-ready barrier。
 - `model_loader.py`: 补上 dtype 解析、结构校验，以及只构造 rank-local stage 的 lazy load 路径。
 - `distributed_tinyllama_inference.py`: 动态/静态入口统一使用解析后的模型 dtype 和通信 dtype。
+- `scheduler.py`: 补上 `CONTEXT_WARMUP_PULLS`，contextual bandit 预热阶段改为“每个请求类型下每个实际可用 arm 至少测试 N 次”。候选 arm 数量仍由 `CANDIDATE_ARMS` 和 `_valid_arm()` 根据实际 `total_layers` 过滤决定，不把 warmup 轮数和固定 arm 数量绑死。
 
 ### Verification
 
@@ -37,6 +38,7 @@
   inference_loops.py
   model_loader.py
   incremental_layer_partition.py
+  scheduler.py
   ```
 
 - 未在本机执行 NCCL 多 rank 推理验证；该验证需要实际三节点 / GPU 运行环境。
