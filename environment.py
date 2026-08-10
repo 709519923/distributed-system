@@ -21,13 +21,13 @@ DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
 # Example:
 DEFAULT_SCHEDULE = {
     10: {
-        "Bandwidth": [5, 5, 5, 5, 5],
+        "Bandwidth": [None, None, None, None, None],
         "time_comm_delay": [0.0, 0.0, 0.0, 0.0, 0.0],
-    }, 
+    },
     50: {
-        "Bandwidth": [5, 5, 5, 5, 5],
-        "time_comm_delay": [10.0, 50.0, 55.0, 50.0, 55.0],
-    }
+        "Bandwidth": [None, None, None, None, None],
+        "time_comm_delay": [0.0, 0.0, 0.0, 0.0, 0.0],
+    },
 }
 # DEFAULT_SCHEDULE = {}
 

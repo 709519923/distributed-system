@@ -2,6 +2,13 @@
 
 ## 2026-08-10
 
+### Environment 取消通信限制并保留变化点
+
+- 保留 `DEFAULT_SCHEDULE` 中 batch 10 和 batch 50 两个环境变化点，方便后续网络变化实验直接在原位置填写参数。
+- batch 10 和 batch 50 的五条有向链路均改为 `Bandwidth=None`，表示不施加应用层带宽上限。
+- 两个变化点的 `time_comm_delay` 均改为 `0.0 ms`，表示不增加模拟单向通信延迟。
+- `Environment.apply_batch()`、Rank 0 广播、Scheduler 环境快照和通信计时逻辑保持不变。本次只取消当前实验参数限制，没有删除动态变化接口。
+
 ### 加权 Lipschitz Bandit 与在线距离学习
 
 #### 设计目标
