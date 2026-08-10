@@ -1,5 +1,160 @@
 # Version Log
 
+## 2026-08-10
+
+### 加权 Lipschitz Bandit 与在线距离学习
+
+#### 设计目标
+
+本次只重写 `BANDIT_POLICY=lipschitz`，普通 UCB、Contextual Bandit 和预留的 Contextual + Lipschitz 接口均不改变。新版本解决三个问题：两个切分点对异构节点的影响不应被视为相同；未执行过的 arm 不再被强制逐一探索；Lipschitz policy 不读取 A/B/C 请求类型或其他 context。
+
+#### 1. 加权 arm 距离
+
+对三节点切分 arm
+
+$$
+a=(p_1,p_2)
+$$
+
+先计算归一化坐标差：
+
+$$
+x_1(a,b)=\frac{|p_1^a-p_1^b|}{N_{\mathrm{layers}}},\qquad
+x_2(a,b)=\frac{|p_2^a-p_2^b|}{N_{\mathrm{layers}}}
+$$
+
+不再固定使用相同权重，而是学习两个有效斜率：
+
+$$
+D_q(a,b)=q_1x_1(a,b)+q_2x_2(a,b)
+$$
+
+其中，$q_1$ 表示第一个切分点变化对 reward 的敏感程度，$q_2$ 表示第二个切分点变化对 reward 的敏感程度。初始化为：
+
+$$
+q_1=q_2=0.5
+$$
+
+这与旧实现中的 $0.5(x_1+x_2)$ 惩罚保持一致。为了便于解释和审计，同时派生：
+
+$$
+L=q_1+q_2,\qquad
+w_1=\frac{q_1}{q_1+q_2},\qquad
+w_2=\frac{q_2}{q_1+q_2}
+$$
+
+因此：
+
+$$
+D_q(a,b)=L\left(w_1x_1(a,b)+w_2x_2(a,b)\right)
+$$
+
+代码直接学习 $q_1,q_2$，避免同时学习 $L,w_1,w_2$ 时出现同一距离可以由多组缩放参数表示的问题。
+
+#### 2. q1/q2 在线更新
+
+每完成一次有效 pull，只使用已经有 reward 的 arm 与本次更新 arm 组成观测对。对观测 arm $a_i,a_j$：
+
+$$
+y=\gamma\left|\bar R(a_i)-\bar R(a_j)\right|,\qquad
+\hat y=q_1x_1(a_i,a_j)+q_2x_2(a_i,a_j)
+$$
+
+其中安全系数默认 $\gamma=1.1$。当距离惩罚低估 reward 差异时快速增大斜率；高估时缓慢减小，防止置信区间因一次噪声观测突然收缩：
+
+$$
+q_k\leftarrow\operatorname{clip}\left(
+q_k+\eta_+[y-\hat y]_+x_k-\eta_-[\hat y-y]_+x_k,
+q_{\min},q_{\max}
+\right)
+$$
+
+当前默认值：
+
+```text
+eta_up = 0.05
+eta_down = 0.005
+q_min = 0.001
+q_max = 10.0
+gamma = 1.1
+```
+
+#### 3. 取消未探索 arm 强制优先
+
+旧版本遇到 `pulls == 0` 的 arm 会直接返回该 arm，因此必须完整遍历所有候选臂。新版本删除这条规则，未执行过的 arm 也通过已观测 arm 推导出的 Lipschitz 置信区间参与选择。
+
+对已观测 arm $i$，统计置信半径：
+
+$$
+\beta_i=c\sqrt{\frac{\ln(\max(N,2))}{N_i}}
+$$
+
+其中 $c$ 为 `exploration_weight`，$N$ 为有效 pull 总数，$N_i$ 为 arm $i$ 的 pull 数。候选 arm $a$ 的置信下界和上界为：
+
+$$
+\operatorname{LCB}(a)=
+\max_{i\in\mathcal O}\left[\bar R_i-\beta_i-D_q(a,i)\right]
+$$
+
+$$
+\operatorname{UCB}(a)=
+\min_{i\in\mathcal O}\left[\bar R_i+\beta_i+D_q(a,i)\right]
+$$
+
+其中 $\mathcal O$ 是至少完成过一次有效 pull 的 arm 集合。尚无任何观测时，置信区间使用 $[0,1]$；第一份有效观测仍由当前默认切分产生，但不会触发“依次尝试全部未探索 arm”的循环。
+
+每轮选择当前 active arm 中上界最大的 arm：
+
+$$
+a_{t+1}=\arg\max_{a\in\mathcal A_{\mathrm{active}}}\operatorname{UCB}(a)
+$$
+
+#### 4. active_arms
+
+每次有效 pull 后，根据最新 reward、$q_1/q_2$ 和置信区间重新计算 active 集合：
+
+$$
+\mathcal A_{\mathrm{active}}=
+\left\{a:\operatorname{UCB}(a)+\epsilon\ge
+\max_b\operatorname{LCB}(b)\right\}
+$$
+
+当前 $\epsilon=0$。该集合不是永久删除列表，而是每轮从全部候选 arm 重算；随着新观测、斜率或置信区间变化，之前 inactive 的 arm 可以重新激活。
+
+#### 5. 非 Contextual 约束
+
+`LipschitzBanditPolicy` 继续继承非 contextual 的基础 policy，不读取 `request_type`、输入 token 数、预计输出 token 数、batch size 或 context vector。它只使用统一的每 token 成本 reward、arm 坐标和历史 pull 统计。混合 A/B/C 请求会共同更新同一个 arm 模型，这是本策略刻意保留的行为。
+
+#### 6. arm_details 审计增强
+
+`bandit_logs/arm_details_YYYY-MM-DD-HH-MM.csv` 仍然在每个 batch 后为所有候选 arm 写一行，但新增 `pull_completed` 用于识别该 batch 是否真正完成了一个统计窗口。热身 batch 也保留快照，变化值为 0；当 `pull_completed=1` 时，可以完整审计一次 policy 更新。
+
+主要新增字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| `policy` | 当前 policy 名称；本设计对应 `lipschitz` |
+| `pull_completed` | 当前 batch 是否完成一次有效 pull 更新 |
+| `pull_index` | 当前累计有效 pull 序号 |
+| `updated_arm` | 本次直接接收新成本/reward 的 arm |
+| `pulls_before`, `pulls`, `pulls_delta` | 每个 arm 更新前、更新后和变化的 pull 数 |
+| `reward_before`, `reward`, `reward_delta` | 每个 arm 的直接 reward 更新变化；通常只有 `updated_arm` 直接变化 |
+| `score_before`, `score`, `score_delta` | 每个 arm 的 Lipschitz 置信上界变化；即使 direct reward 不变，也可能因 $q_1/q_2$ 或其他 arm 的观测而变化 |
+| `confidence_lower`, `confidence_upper`, `confidence_width` | 每个 arm 当前置信区间及宽度 |
+| `q1`, `q2`, `q1_delta`, `q2_delta` | 当前有效斜率及本次 pull 的变化量 |
+| `lipschitz_constant`, `w1`, `w2` | 由 $q_1/q_2$ 派生的 $L,w_1,w_2$ |
+| `active` | 当前行 arm 是否属于 active 集合 |
+| `active_arms` | 当前全部 active arm 的完整列表 |
+| `selected` | 当前完成 batch 实际使用的 arm |
+| `next_selected` | policy 为下一统计窗口选中的 arm |
+
+普通 UCB 和 Contextual policy 仍使用原有 reward/score 逻辑；它们不具备含义的 Lipschitz 专用审计列保持为空。
+
+#### 修改文件
+
+- `scheduler.py`：重写 `LipschitzBanditPolicy` 的距离、在线斜率学习、置信区间、active arm 和选臂逻辑；扩展 `arm_details` 输出结构。
+- `log.md`：记录本次算法设计、公式、默认参数和审计字段。
+
 ## 2026-08-06
 
 ### TinyLlama 动态切臂改为增量加载

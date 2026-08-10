@@ -123,6 +123,17 @@ CONTEXT_VECTOR_SIZE = 4
 # Change this value to adjust contextual warmup without hard-coding an arm count.
 CONTEXT_WARMUP_PULLS = 1
 
+# Lipschitz distance uses two online-learned effective slopes. Initializing
+# both to 0.5 preserves the old penalty 0.5 * (|dp1| + |dp2|) / total_layers.
+LIPSCHITZ_INITIAL_Q1 = 0.5
+LIPSCHITZ_INITIAL_Q2 = 0.5
+LIPSCHITZ_LEARNING_RATE_UP = 0.05
+LIPSCHITZ_LEARNING_RATE_DOWN = 0.005
+LIPSCHITZ_MIN_SLOPE = 0.001
+LIPSCHITZ_MAX_SLOPE = 10.0
+LIPSCHITZ_SAFETY_FACTOR = 1.1
+LIPSCHITZ_ELIMINATION_MARGIN = 0.0
+
 CANDIDATE_ARMS = [
     (1, 11),
     (1, 19),
@@ -692,87 +703,257 @@ class ContextualBanditPolicy(LayerBanditPolicy):
 
 
 class LipschitzBanditPolicy(LayerBanditPolicy):
-    """Simple Lipschitz-UCB policy for nearby layer-split sharing.
+    """Non-contextual Lipschitz policy with online split-point sensitivity.
 
-    Reward updates reuse LayerBanditPolicy's unified per-token absolute reward.
-    Arm selection replaces the raw arm reward with a Lipschitz-smoothed reward
-    estimate from already observed nearby arms.
+    q1 and q2 are effective reward slopes for p1 and p2. They are learned from
+    observed reward differences, so the policy does not assume that moving the
+    two split points has the same performance impact on heterogeneous nodes.
     """
 
     policy_name = "lipschitz"
-    lipschitz_constant = 0.5
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.q1 = float(LIPSCHITZ_INITIAL_Q1)
+        self.q2 = float(LIPSCHITZ_INITIAL_Q2)
+        self.learning_rate_up = float(LIPSCHITZ_LEARNING_RATE_UP)
+        self.learning_rate_down = float(LIPSCHITZ_LEARNING_RATE_DOWN)
+        self.min_slope = float(LIPSCHITZ_MIN_SLOPE)
+        self.max_slope = float(LIPSCHITZ_MAX_SLOPE)
+        self.safety_factor = float(LIPSCHITZ_SAFETY_FACTOR)
+        self.elimination_margin = float(LIPSCHITZ_ELIMINATION_MARGIN)
+        self.active_arms = list(self.arms)
+        self.last_pull_audit = None
+
+    def update_after_batch(self, batch, batch_summary_history):
+        """Clear the audit marker before observing the next completed batch."""
+        self.last_pull_audit = None
+        return super().update_after_batch(batch, batch_summary_history)
+
+    def _ensure_arm(self, arm):
+        """Keep manually introduced valid arms visible to the active set."""
+        already_known = arm in self.stats
+        super()._ensure_arm(arm)
+        if not already_known and hasattr(self, "active_arms"):
+            self.active_arms.append(arm)
+
+    def _update_arm_cost(self, arm, cost):
+        """Update direct reward, online slopes, confidence bounds, and audit."""
+        before_state = self._audit_state()
+        q1_before = self.q1
+        q2_before = self.q2
+
+        super()._update_arm_cost(arm, cost)
+        self._update_effective_slopes(arm)
+        self._refresh_active_arms()
+
+        after_state = self._audit_state()
+        self.last_pull_audit = {
+            "updated_arm": arm,
+            "pull_index": self.total_pulls,
+            "q1_before": q1_before,
+            "q2_before": q2_before,
+            "q1_after": self.q1,
+            "q2_after": self.q2,
+            "before": before_state,
+            "after": after_state,
+        }
 
     def _select_next_arm(self):
-        """Choose the next arm with a Lipschitz-smoothed UCB score."""
-        for arm in self.arms:
-            if int(self.stats[arm]["pulls"]) == 0:
-                return arm
+        """Choose the largest optimistic bound without mandatory arm sweeps."""
+        candidates = self.active_arms or self.arms
+        if not candidates:
+            return self.current_arm
 
-        log_total = math.log(max(self.total_pulls, 2))
-        best_arm = self.arms[0]
-        best_score = None
-        for arm in self.arms:
-            pulls = int(self.stats[arm]["pulls"])
-            smooth_reward = self._lipschitz_reward_estimate(arm)
-            exploration = self.exploration_weight * math.sqrt(log_total / pulls)
-            score = smooth_reward + exploration
-            if best_score is None or score > best_score:
+        best_arm = self.current_arm if self.current_arm in candidates else candidates[0]
+        best_score = self._confidence_bounds(best_arm)[1]
+        for arm in candidates:
+            score = self._confidence_bounds(arm)[1]
+            if score > best_score:
                 best_arm = arm
                 best_score = score
         return best_arm
 
     def arm_score_snapshot(self, selected_arm):
-        """Return scores that expose the active Lipschitz-UCB selection value."""
+        """Return per-arm before/after changes and current Lipschitz state."""
         selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        audit = self.last_pull_audit
+        if audit is None:
+            current_state = self._audit_state()
+            audit = {
+                "updated_arm": None,
+                "pull_index": self.total_pulls,
+                "q1_before": self.q1,
+                "q2_before": self.q2,
+                "q1_after": self.q1,
+                "q2_after": self.q2,
+                "before": current_state,
+                "after": current_state,
+            }
+
+        q1_after = float(audit["q1_after"])
+        q2_after = float(audit["q2_after"])
+        effective_lipschitz = q1_after + q2_after
+        if effective_lipschitz > 0.0:
+            w1 = q1_after / effective_lipschitz
+            w2 = q2_after / effective_lipschitz
+        else:
+            w1 = 0.5
+            w2 = 0.5
+        active_arms_text = "|".join(self._format_arm(arm) for arm in self.active_arms)
+
         rows = []
-        log_total = math.log(max(self.total_pulls, 2))
         for arm in self.arms:
-            stats = self.stats[arm]
-            pulls = int(stats["pulls"])
-            reward = float(stats["reward"])
-            if pulls == 0:
-                score = "untried"
-            else:
-                smooth_reward = self._lipschitz_reward_estimate(arm)
-                score_value = smooth_reward + self.exploration_weight * math.sqrt(
-                    log_total / pulls
-                )
-                score = f"{score_value:.6f}"
+            before = audit["before"][arm]
+            after = audit["after"][arm]
             rows.append(
                 {
                     "arm": self._format_arm(arm),
-                    "reward": f"{reward:.6f}",
-                    "score": score,
+                    "pull_completed": 1 if audit["updated_arm"] is not None else 0,
+                    "pull_index": int(audit["pull_index"]),
+                    "updated_arm": (
+                        self._format_arm(audit["updated_arm"])
+                        if audit["updated_arm"] is not None
+                        else ""
+                    ),
+                    "pulls_before": int(before["pulls"]),
+                    "pulls": int(after["pulls"]),
+                    "pulls_delta": int(after["pulls"] - before["pulls"]),
+                    "reward_before": f"{before['reward']:.6f}",
+                    "reward": f"{after['reward']:.6f}",
+                    "reward_delta": f"{after['reward'] - before['reward']:.6f}",
+                    "score_before": f"{before['score']:.6f}",
+                    "score": f"{after['score']:.6f}",
+                    "score_delta": f"{after['score'] - before['score']:.6f}",
+                    "confidence_lower": f"{after['lower']:.6f}",
+                    "confidence_upper": f"{after['upper']:.6f}",
+                    "confidence_width": f"{after['upper'] - after['lower']:.6f}",
+                    "q1": f"{q1_after:.6f}",
+                    "q2": f"{q2_after:.6f}",
+                    "q1_delta": f"{q1_after - float(audit['q1_before']):.6f}",
+                    "q2_delta": f"{q2_after - float(audit['q2_before']):.6f}",
+                    "lipschitz_constant": f"{effective_lipschitz:.6f}",
+                    "w1": f"{w1:.6f}",
+                    "w2": f"{w2:.6f}",
+                    "active": 1 if arm in self.active_arms else 0,
+                    "active_arms": active_arms_text,
                     "selected": 1 if arm == selected_arm else 0,
+                    "next_selected": 1 if arm == self.current_arm else 0,
                 }
             )
         return rows
 
-    def _lipschitz_reward_estimate(self, arm):
-        """Estimate an arm reward from observed nearby arms."""
-        observed_arms = [
-            observed_arm
-            for observed_arm in self.arms
-            if int(self.stats[observed_arm]["pulls"]) > 0
-        ]
-        if not observed_arms:
-            return 0.5
-        return max(
-            float(self.stats[observed_arm]["reward"])
-            - self.lipschitz_constant * self.arm_distance(arm, observed_arm)
-            for observed_arm in observed_arms
-        )
+    def _audit_state(self):
+        """Capture direct rewards and derived confidence state for every arm."""
+        state = {}
+        for arm in self.arms:
+            lower, upper = self._confidence_bounds(arm)
+            state[arm] = {
+                "pulls": int(self.stats[arm]["pulls"]),
+                "reward": float(self.stats[arm]["reward"]),
+                "lower": lower,
+                "upper": upper,
+                "score": upper,
+            }
+        return state
 
-    def arm_distance(self, left_arm, right_arm):
-        """Return normalized L1 distance between two 3-rank split arms."""
+    def _update_effective_slopes(self, updated_arm):
+        """Learn q1/q2 from reward differences against observed peer arms."""
+        updated_reward = float(self.stats[updated_arm]["reward"])
+        for other_arm in self.arms:
+            if other_arm == updated_arm or int(self.stats[other_arm]["pulls"]) == 0:
+                continue
+            x1, x2 = self._distance_components(updated_arm, other_arm)
+            if x1 + x2 <= 0.0:
+                continue
+
+            other_reward = float(self.stats[other_arm]["reward"])
+            target = self.safety_factor * abs(updated_reward - other_reward)
+            predicted = self.q1 * x1 + self.q2 * x2
+            underestimated = max(target - predicted, 0.0)
+            overestimated = max(predicted - target, 0.0)
+
+            self.q1 = self._clamp_slope(
+                self.q1
+                + self.learning_rate_up * underestimated * x1
+                - self.learning_rate_down * overestimated * x1
+            )
+            self.q2 = self._clamp_slope(
+                self.q2
+                + self.learning_rate_up * underestimated * x2
+                - self.learning_rate_down * overestimated * x2
+            )
+
+    def _clamp_slope(self, value):
+        return max(self.min_slope, min(float(value), self.max_slope))
+
+    def _observed_arms(self):
+        return [arm for arm in self.arms if int(self.stats[arm]["pulls"]) > 0]
+
+    def _confidence_radius(self, observed_arm):
+        pulls = max(1, int(self.stats[observed_arm]["pulls"]))
+        log_total = math.log(max(self.total_pulls, 2))
+        return self.exploration_weight * math.sqrt(log_total / pulls)
+
+    def _confidence_bounds(self, arm):
+        """Infer a reward interval from all observed arms and weighted distance."""
+        observed_arms = self._observed_arms()
+        if not observed_arms:
+            return 0.0, 1.0
+
+        lower = 0.0
+        upper = 1.0
+        for observed_arm in observed_arms:
+            reward = float(self.stats[observed_arm]["reward"])
+            radius = self._confidence_radius(observed_arm)
+            penalty = self._lipschitz_penalty(arm, observed_arm)
+            lower = max(lower, reward - radius - penalty)
+            upper = min(upper, reward + radius + penalty)
+
+        lower = max(0.0, min(lower, 1.0))
+        upper = max(0.0, min(upper, 1.0))
+        if lower > upper:
+            midpoint = max(0.0, min((lower + upper) / 2.0, 1.0))
+            return midpoint, midpoint
+        return lower, upper
+
+    def _refresh_active_arms(self):
+        """Recompute confidence-based candidates; removed arms may reactivate."""
+        bounds = {arm: self._confidence_bounds(arm) for arm in self.arms}
+        best_lower = max(lower for lower, _ in bounds.values())
+        self.active_arms = [
+            arm
+            for arm in self.arms
+            if bounds[arm][1] + self.elimination_margin >= best_lower
+        ]
+        if not self.active_arms and self.arms:
+            self.active_arms = [max(self.arms, key=lambda arm: bounds[arm][1])]
+
+    def _distance_components(self, left_arm, right_arm):
         if left_arm is None or right_arm is None:
-            return None
+            raise ValueError("arms must not be None")
         left = tuple(int(value) for value in left_arm)
         right = tuple(int(value) for value in right_arm)
         if len(left) != len(right):
             raise ValueError(f"arm sizes differ: {left_arm} vs {right_arm}")
-        distance = sum(abs(a - b) for a, b in zip(left, right))
-        return distance / max(float(self.total_layers), 1.0)
+        if len(left) != 2:
+            raise ValueError(f"Lipschitz policy requires two split points: {left_arm}")
+        scale = max(float(self.total_layers), 1.0)
+        return abs(left[0] - right[0]) / scale, abs(left[1] - right[1]) / scale
+
+    def _lipschitz_penalty(self, left_arm, right_arm):
+        x1, x2 = self._distance_components(left_arm, right_arm)
+        return self.q1 * x1 + self.q2 * x2
+
+    def arm_distance(self, left_arm, right_arm):
+        """Return normalized weighted distance using the learned w1/w2."""
+        x1, x2 = self._distance_components(left_arm, right_arm)
+        effective_lipschitz = self.q1 + self.q2
+        if effective_lipschitz <= 0.0:
+            return 0.5 * x1 + 0.5 * x2
+        w1 = self.q1 / effective_lipschitz
+        w2 = self.q2 / effective_lipschitz
+        return w1 * x1 + w2 * x2
 
 
 class ContextualLipschitzBanditPolicy(ContextualBanditPolicy):
@@ -862,7 +1043,37 @@ class Scheduler:
             "time_label",
             "time_ms",
         ]
-        self.arm_details_fieldnames = ["batch", "arm", "reward", "score", "selected"]
+        self.arm_details_fieldnames = [
+            "batch",
+            "policy",
+            "pull_completed",
+            "pull_index",
+            "updated_arm",
+            "arm",
+            "pulls_before",
+            "pulls",
+            "pulls_delta",
+            "reward_before",
+            "reward",
+            "reward_delta",
+            "score_before",
+            "score",
+            "score_delta",
+            "confidence_lower",
+            "confidence_upper",
+            "confidence_width",
+            "q1",
+            "q2",
+            "q1_delta",
+            "q2_delta",
+            "lipschitz_constant",
+            "w1",
+            "w2",
+            "active",
+            "active_arms",
+            "selected",
+            "next_selected",
+        ]
         self.allocations = {}
         # These fields keep online data in memory so adaptive policies do not
         # need to parse scheduler_summary.csv during the running experiment.
@@ -1072,7 +1283,7 @@ class Scheduler:
                     )
 
     def append_arm_details(self, batch, selected_arm):
-        """Append one compact reward/score snapshot for every candidate arm."""
+        """Append one policy-state snapshot for every candidate arm."""
         self.arm_details_path.parent.mkdir(parents=True, exist_ok=True)
         file_exists = self.arm_details_path.exists()
         with open(self.arm_details_path, "a", encoding="utf-8", newline="") as f:
@@ -1080,15 +1291,10 @@ class Scheduler:
             if not file_exists:
                 writer.writeheader()
             for row in self.bandit.arm_score_snapshot(selected_arm):
-                writer.writerow(
-                    {
-                        "batch": int(batch),
-                        "arm": row["arm"],
-                        "reward": row["reward"],
-                        "score": row["score"],
-                        "selected": row["selected"],
-                    }
-                )
+                output = {field: row.get(field, "") for field in self.arm_details_fieldnames}
+                output["batch"] = int(batch)
+                output["policy"] = self.bandit_policy_name
+                writer.writerow(output)
 
     def _load_existing_file(self):
         """Load scheduler.csv if it already exists."""
