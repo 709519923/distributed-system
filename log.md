@@ -9,11 +9,65 @@
 - 两个变化点的 `time_comm_delay` 均改为 `0.0 ms`，表示不增加模拟单向通信延迟。
 - `Environment.apply_batch()`、Rank 0 广播、Scheduler 环境快照和通信计时逻辑保持不变。本次只取消当前实验参数限制，没有删除动态变化接口。
 
+### UCB算法重设计
+
+本次直接重写现有 `LayerBanditPolicy` 的普通 UCB 行为，没有新增 UCB policy 类。Contextual Bandit 保持自己的逐批线性模型更新；Lipschitz Bandit 继续使用原有窗口统计入口，因此本次规则只对 `BANDIT_POLICY=ucb` 生效。
+
+#### 改动前
+
+- 每个 arm 使用 `window_size=2`、`warmup_skip=1`：连续运行两个 batch，跳过第一个 batch，只用第二个 batch 形成一次有效 pull。
+- 每次获得新 cost 后，与该 arm 的历史 cost 计算累计平均值：
+
+  $$
+  \bar C_{a,n}=\frac{(n-1)\bar C_{a,n-1}+C_{a,n}}{n}
+  $$
+
+- reward 由历史平均 cost 生成，因此一次新的环境或性能变化会被旧数据平滑：
+
+  $$
+  R_{a,n}=\frac{1}{1+\bar C_{a,n}/100}
+  $$
+
+#### 改动后
+
+- 整次运行只有第一个完成的 batch 是全局预热。该 batch 不增加 `pulls`，不更新 cost/reward，也不使用 score 选下一个 arm；下一批继续使用相同的默认 arm。
+- 从第二个 batch 开始，每完成一个 batch 就形成一次有效 pull，并立即选择下一批使用的 arm。切换到新 arm 后不再额外跳过预热 batch。
+- cost 仍使用三个 Rank 中最慢节点的每 decode step 耗时：
+
+  $$
+  C_t=\frac{\max(T_0,T_1,T_2)}{\max(1,\text{decode\_step\_count})}
+  $$
+
+- 取消普通 UCB 的历史平均 reward。每次运行直接用最新 batch 覆盖该 arm 的 cost 和 reward：
+
+  $$
+  R_a\leftarrow R_t=\frac{1}{1+C_t/100}
+  $$
+
+- `pulls` 仍然累计，用于 UCB 探索项；score 使用该 arm 的最新 reward：
+
+  $$
+  \operatorname{Score}(a)=R_{a,\mathrm{latest}}+0.01\sqrt{\frac{\ln N}{N_a}}
+  $$
+
+- `exploration_weight` 默认值明确为 `0.01`。未观测 arm 优先执行的原有初始化机制保持不变。
+- `arm_details` 在全局预热 batch 中保留 arm 行，但 `reward` 和 `score` 为空；第二个 batch 起正常记录最新 reward 和 UCB score。
+
+#### 与旧 UCB 的核心区别
+
+| 项目 | 改动前 | 改动后 |
+|---|---|---|
+| 预热范围 | 每个 arm 的统计窗口都跳过第一个 batch | 整次运行只跳过 Batch 1 |
+| 更新频率 | 每两个 batch 更新一次 | Batch 2 起每个 batch 更新一次 |
+| reward 数据 | arm 历史平均 cost | arm 最近一次 cost |
+| 环境变化响应 | 较慢，旧观测持续影响 | 较快，最新观测立即覆盖 |
+| 探索强度 | `0.01` | `0.01`，明确为普通 UCB 默认值 |
+
 ### 加权 Lipschitz Bandit 与在线距离学习
 
 #### 设计目标
 
-本次只重写 `BANDIT_POLICY=lipschitz`，普通 UCB、Contextual Bandit 和预留的 Contextual + Lipschitz 接口均不改变。新版本解决三个问题：两个切分点对异构节点的影响不应被视为相同；未执行过的 arm 不再被强制逐一探索；Lipschitz policy 不读取 A/B/C 请求类型或其他 context。
+本小节只记录 `BANDIT_POLICY=lipschitz` 的独立设计；普通 UCB 的当前行为以同日上方“UCB算法重设计”为准。Contextual Bandit 和预留的 Contextual + Lipschitz 接口不受本小节影响。Lipschitz 版本解决三个问题：两个切分点对异构节点的影响不应被视为相同；未执行过的 arm 不再被强制逐一探索；Lipschitz policy 不读取 A/B/C 请求类型或其他 context。
 
 #### 1. 加权 arm 距离
 

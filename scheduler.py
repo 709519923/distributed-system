@@ -122,6 +122,7 @@ CONTEXT_VECTOR_SIZE = 4
 # Number of mandatory observations for every actual arm under each request type.
 # Change this value to adjust contextual warmup without hard-coding an arm count.
 CONTEXT_WARMUP_PULLS = 1
+UCB_EXPLORATION_WEIGHT = 0.01
 
 # Lipschitz distance uses two online-learned effective slopes. Initializing
 # both to 0.5 preserves the old penalty 0.5 * (|dp1| + |dp2|) / total_layers.
@@ -278,7 +279,7 @@ def add_outer_product_in_place(matrix, vector):
 
 
 class LayerBanditPolicy:
-    """Small UCB-style policy for choosing 3-rank layer split arms.
+    """Plain UCB policy for choosing 3-rank layer split arms.
 
     An arm is represented as (p1, p2), which maps to:
 
@@ -286,10 +287,9 @@ class LayerBanditPolicy:
         rank1: [p1, p2)
         rank2: [p2, total_layers)
 
-    The policy evaluates one arm for six completed batches. The first batch is
-    treated as warmup, and the following five batches are used to update the
-    arm reward. This keeps model reload, CUDA warmup, and communication setup
-    noise from dominating the online decision.
+    Only the first completed batch of the whole run is treated as warmup. Every
+    later batch immediately replaces the selected arm's reward with the latest
+    observation and then selects the arm for the next batch.
     """
 
     def __init__(
@@ -299,7 +299,7 @@ class LayerBanditPolicy:
         world_size,
         window_size=2,
         warmup_skip=1,
-        exploration_weight=0.01,
+        exploration_weight=UCB_EXPLORATION_WEIGHT,
     ):
         self.total_layers = int(total_layers)
         self.default_boundaries = [int(value) for value in default_boundaries]
@@ -312,6 +312,8 @@ class LayerBanditPolicy:
         self.active_batches = []
         self.total_pulls = 0
         self.reward_scale_ms = 100.0
+        self.global_warmup_complete = False
+        self.last_batch_was_warmup = False
 
         self.arms = self._build_candidate_arms()
         if self.enabled and self.current_arm not in self.arms:
@@ -340,7 +342,7 @@ class LayerBanditPolicy:
         return self.current_arm
 
     def update_after_batch(self, batch, batch_summary_history):
-        """Observe one completed batch and update the policy state."""
+        """Skip the first global batch, then update UCB after every batch."""
         if not self.enabled:
             return None
 
@@ -354,8 +356,36 @@ class LayerBanditPolicy:
             return None
         self._ensure_arm(completed_arm)
 
-        # If a manual row or a different policy changes the split, treat it as
-        # the active arm and start a fresh measurement window.
+        self.current_arm = completed_arm
+        if not self.global_warmup_complete:
+            self.global_warmup_complete = True
+            self.last_batch_was_warmup = True
+            return self.current_arm
+
+        self.last_batch_was_warmup = False
+        arm_cost = self._cost_per_token(summary)
+        if arm_cost is None:
+            return self.current_arm
+        self._update_latest_arm_cost(self.current_arm, arm_cost)
+
+        self.current_arm = self._select_next_arm()
+        return self.current_arm
+
+    def _update_windowed_after_batch(self, batch, batch_summary_history):
+        """Preserve the previous warmup-window update for structured policies."""
+        if not self.enabled:
+            return None
+
+        batch = int(batch)
+        summary = batch_summary_history.get(batch)
+        if not summary:
+            return None
+
+        completed_arm = self._completed_arm_from_summary(summary)
+        if completed_arm is None:
+            return None
+        self._ensure_arm(completed_arm)
+
         if completed_arm != self.current_arm:
             self.current_arm = completed_arm
             self.active_batches = []
@@ -444,12 +474,22 @@ class LayerBanditPolicy:
         return sum(costs) / len(costs)
 
     def _update_arm_cost(self, arm, cost):
+        """Update a running mean cost for policies that still need averaging."""
         stats = self.stats[arm]
         pulls = int(stats["pulls"])
         stats["mean_cost"] = (float(stats["mean_cost"]) * pulls + float(cost)) / (pulls + 1)
         stats["last_cost"] = float(cost)
         stats["reward"] = self._reward_from_cost(float(stats["mean_cost"]))
         stats["pulls"] = pulls + 1
+        self.total_pulls += 1
+
+    def _update_latest_arm_cost(self, arm, cost):
+        """Replace plain UCB reward with the most recent batch observation."""
+        stats = self.stats[arm]
+        stats["mean_cost"] = float(cost)
+        stats["last_cost"] = float(cost)
+        stats["reward"] = self._reward_from_cost(float(cost))
+        stats["pulls"] = int(stats["pulls"]) + 1
         self.total_pulls += 1
 
     def _cost_per_token(self, summary):
@@ -490,15 +530,20 @@ class LayerBanditPolicy:
             stats = self.stats[arm]
             pulls = int(stats["pulls"])
             reward = float(stats["reward"])
-            if pulls == 0:
+            if self.last_batch_was_warmup:
+                reward_text = ""
+                score = ""
+            elif pulls == 0:
+                reward_text = f"{reward:.6f}"
                 score = "untried"
             else:
+                reward_text = f"{reward:.6f}"
                 score_value = reward + self.exploration_weight * math.sqrt(log_total / pulls)
                 score = f"{score_value:.6f}"
             rows.append(
                 {
                     "arm": self._format_arm(arm),
-                    "reward": f"{reward:.6f}",
+                    "reward": reward_text,
                     "score": score,
                     "selected": 1 if arm == selected_arm else 0,
                 }
@@ -728,7 +773,7 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
     def update_after_batch(self, batch, batch_summary_history):
         """Clear the audit marker before observing the next completed batch."""
         self.last_pull_audit = None
-        return super().update_after_batch(batch, batch_summary_history)
+        return self._update_windowed_after_batch(batch, batch_summary_history)
 
     def _ensure_arm(self, arm):
         """Keep manually introduced valid arms visible to the active set."""
