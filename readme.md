@@ -24,6 +24,7 @@ PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
 SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
+BANDIT_POLICY=${BANDIT_POLICY:-ucb}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
 COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
@@ -41,6 +42,7 @@ PREFILL_MODE      distributed 或 cloud-base
 BATCH_SIZE        每个 batch 的 prompt 数量
 SPLIT_LAYERS      默认 transformer 层切分点，例如 5,15
 SCHEDULER_CSV     Rank 0 使用的调度文件，不存在时自动创建
+BANDIT_POLICY     ucb、contextual、contextual_controlled、lipschitz 等调度策略
 INIT_METHOD       torch.distributed rendezvous 地址
 COMPUTE_DEVICE    Rank 0 的计算设备，cuda 或 cpu
 MODEL_DIR         TinyLlama 模型目录
@@ -57,6 +59,47 @@ FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
 ```
 
 该参数对应命令行 `--force-decode-steps 128`。它会忽略 EOS，强制执行 128 次 prefill 之后的 decode forward。prefill 直接得到的 first token 不计入这 128 步。
+
+## Contextual Controlled Policy
+
+`contextual_controlled` 专用于 `contextual_bandit_test_tinyllama_labeled.csv` 的受控学习/评估实验。Rank 0 的 `run.sh` 配置为：
+
+```bash
+BANDIT_POLICY=${BANDIT_POLICY:-contextual_controlled}
+BATCH_SIZE=${BATCH_SIZE:-1}
+INPUT_CSV=${INPUT_CSV:-./dataset/contextual_bandit_test_tinyllama_labeled.csv}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
+```
+
+输入 CSV 必须包含：
+
+```text
+prompt,scenario,request_type,phase
+```
+
+该 policy 要求正好 900 行和 20 个互不重复的实际有效 arm。默认 split 必须已经包含在 `CANDIDATE_ARMS` 中，避免 Scheduler 额外插入第 21 个 arm。
+
+前 600 个 batch 是 learning 阶段，数据按 A/B/C 循环。每个 arm 在每种 request type 下学习 10 次：
+
+```text
+A / long_input_short_output    -> 强制保存 80 个 token ID
+B / short_input_long_output    -> 强制保存 386 个 token ID
+C / medium_input_medium_output -> 强制保存 256 个 token ID
+```
+
+Label 只控制 learning 阶段的输出 token 数，Context 特征仍由 prompt 的实际 token 长度生成。强制输出时忽略 EOS；prefill first token 计入目标总数，因此 `decode_step_count=target_output_tokens-1`。
+
+Batch 601-900 是 evaluation 阶段：
+
+```text
+不读取 scenario/request_type label 参与决策
+根据 prompt token 长度构造 Context
+使用前 600 批学到的 LinUCB 模型选臂
+冻结每个 arm 的 A/b，不再更新模型
+按 EOS 自然停止，最大输出仍为 --max-new-tokens（默认 512）
+```
+
+`contextual_controlled` 不能与 `--force-decode-steps` 同时使用，并且必须启用 `--allocation-csv`、`--csv-has-header` 和 `--batch-size 1`。
 
 ## Scheduler
 

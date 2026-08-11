@@ -1,5 +1,110 @@
 # Version Log
 
+## 2026-08-11
+
+### Contextual Controlled Policy
+
+#### 实验目标
+
+新增 `BANDIT_POLICY=contextual_controlled`，用于 `contextual_bandit_test_tinyllama_labeled.csv` 的两阶段实验。该文件固定为 900 行：前 600 行是 A/B/C 交替的受控学习数据，后 300 行是 100A、100B、100C 的无标签决策评估数据。
+
+新 policy 继承现有 `ContextualBanditPolicy` 的 LinUCB 模型，但不改变原来的 `contextual` policy。学习阶段使用 label 只控制输出长度；评估阶段不允许 label 进入 Context 或选臂逻辑，并冻结前 600 批学到的模型。
+
+#### 学习阶段：Batch 1-600
+
+场景及固定输出 token ID 数：
+
+| Scenario | Request type | Target output tokens |
+|---|---|---:|
+| A | `long_input_short_output` | 80 |
+| B | `short_input_long_output` | 386 |
+| C | `medium_input_medium_output` | 256 |
+
+Rank 0 仍然先 tokenize 当前 prompt，并由实际输入 token 长度构造 Context：
+
+$$
+x_t=\left[1,\frac{L_t^{in}}{1500},\frac{\hat L_t^{out}}{512},\frac{B_t}{128}\right]
+$$
+
+其中 $\hat L_t^{out}$ 使用推断 request type 对应的 `80/386/256`。CSV label 不直接作为特征；代码会核对 prompt 长度推断的 request type 与 label 是否一致，避免错误标签污染实验。
+
+学习阶段设置：
+
+```text
+CONTROLLED_LEARNING_BATCHES = 600
+CONTROLLED_EXPECTED_ARM_COUNT = 20
+CONTROLLED_CONTEXT_WARMUP_PULLS = 10
+BATCH_SIZE = 1
+```
+
+在 A/B/C 逐行交替的数据顺序下，每个 arm 会得到：
+
+$$
+10A+10B+10C=30\text{ batches}
+$$
+
+20 个 arm 共计：
+
+$$
+20\times30=600\text{ learning batches}
+$$
+
+启动时会检查实际有效 arm 必须为 20 个且彼此不重复。若默认 split 不在 `CANDIDATE_ARMS`，Scheduler 自动插入后会得到 21 个 arm；若候选表存在重复组合，也会直接报错，防止训练覆盖和顺序悄悄偏移。
+
+#### 精确输出控制
+
+`generate_rows_for_prompts()` 和 `generate_rows_for_prompts_cloud_base()` 新增内部参数 `forced_output_tokens`。该参数只由 `contextual_controlled` 的 learning batch 设置，不修改旧 `--force-decode-steps` 的语义。
+
+目标 $N$ 表示最终保存的 token ID 总数，prefill 产生的 first token 计入其中：
+
+$$
+\text{generated token IDs}=N,\qquad
+\text{decode\_step\_count}=N-1
+$$
+
+受控阶段忽略 EOS并保持 batch 中所有行 active。生成结束后逐行检查 `len(generated_tokens)==N`，数量不符时立即报错。输出文本仍使用 `skip_special_tokens=True`，因此特殊 token 不一定显示在 `generated_text` 中，但内部 token ID 数量严格受控。
+
+#### 评估阶段：Batch 601-900
+
+阶段切换只根据固定 batch 边界完成。Batch 601 起不读取 CSV 的 `scenario`、`request_type` 或 `phase` 作为决策信息：
+
+1. 仅从当前 prompt 的实际 token 长度推断 request type。
+2. 构造 Context，并为所有 arm 计算 LinUCB score。
+3. 选择当前 Context 下 score 最大的 arm。
+4. 不设置 `forced_output_tokens`，恢复 EOS 或 `--max-new-tokens` 停止规则；默认上限仍为 512。
+5. 冻结各 arm 的 $A_a,b_a$、pulls 和 reward，不再用评估数据更新模型。
+
+第一次进入 evaluation 时，会确认 20 个 arm 在三种 request type 下都至少完成 10 次学习观测；未完成则拒绝继续评估。
+
+#### 防止 Label 泄漏
+
+- Learning：label 只决定固定输出长度；选臂特征来自真实 prompt token 长度。
+- Evaluation：Context 中 `scenario` 为空、`label_used=0`、`target_output_tokens=None`；CSV label 字段不参与类型推断、score 或选臂。
+- `ContextualControlledBanditPolicy.select_arm()` 在 evaluation 中直接计算 LinUCB score，绕开 contextual warmup 的未完成 arm 搜索。
+- `ContextualControlledBanditPolicy.update_after_batch()` 在 evaluation 中不修改任何线性模型参数。
+
+#### arm_details 审计字段
+
+`arm_details` 新增以下通用列；非 `contextual_controlled` policy 保持为空：
+
+| 字段 | 含义 |
+|---|---|
+| `phase` | `learning` 或 `evaluation` |
+| `label_used` | learning 为 1，evaluation 为 0 |
+| `scenario` | learning 为 A/B/C，evaluation 为空 |
+| `inferred_request_type` | 根据 prompt token 长度推断的请求类型 |
+| `target_output_tokens` | learning 为 80/386/256，evaluation 为 `natural(max=512)` |
+| `model_updated` | learning 为 1，evaluation 为 0 |
+
+#### 文件改动
+
+- `csv_io.py`：新增 labeled CSV 读取和必需列检查。
+- `scheduler.py`：新增受控场景配置、Context 构造与 `ContextualControlledBanditPolicy`。
+- `inference_loops.py`：接入 per-batch 固定输出、900行/Batch Size/参数检查，以及 evaluation 自然生成。
+- `config.py`：新增 `contextual_controlled` policy 选项。
+- `readme.md`：新增运行配置、数据格式和两阶段行为说明。
+- `log.md`：记录本次设计、公式、阶段隔离和审计字段。
+
 ## 2026-08-10
 
 ### Environment 取消通信限制并保留变化点

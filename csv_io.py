@@ -42,6 +42,39 @@ def read_prompts(csv_path, has_header, prompt_column):
     return prompts
 
 
+def read_contextual_controlled_rows(csv_path, prompt_column):
+    """Read the labeled 600-learning/300-evaluation contextual dataset."""
+    records = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("contextual_controlled requires a CSV header.")
+
+        prompt_key = prompt_column or reader.fieldnames[0]
+        required = {prompt_key, "scenario", "request_type", "phase"}
+        missing = sorted(required.difference(reader.fieldnames))
+        if missing:
+            raise ValueError(
+                "contextual_controlled CSV is missing columns: " + ", ".join(missing)
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            prompt = (row.get(prompt_key) or "").strip()
+            if not prompt:
+                raise ValueError(
+                    f"contextual_controlled CSV row {row_number} has an empty prompt."
+                )
+            records.append(
+                {
+                    "prompt": prompt,
+                    "scenario": (row.get("scenario") or "").strip(),
+                    "request_type": (row.get("request_type") or "").strip(),
+                    "phase": (row.get("phase") or "").strip().lower(),
+                }
+            )
+    return records
+
+
 def chunk_items(items, batch_size):
     """Yield (batch_number, start_index, chunk) for dynamic prompt batching.
 

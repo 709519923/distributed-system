@@ -12,7 +12,12 @@ import torch
 import torch.distributed as dist
 
 from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_from_boundaries
-from csv_io import chunk_items, read_prompts, write_output_rows
+from csv_io import (
+    chunk_items,
+    read_contextual_controlled_rows,
+    read_prompts,
+    write_output_rows,
+)
 from distributed_env import broadcast_environment
 from experiment_report import (
     append_experiment_log,
@@ -51,7 +56,12 @@ from pipeline_comm import (
     send_token,
     stop_boundaries,
 )
-from scheduler import Scheduler, build_prompt_batch_contexts
+from scheduler import (
+    CONTROLLED_TOTAL_BATCHES,
+    Scheduler,
+    build_contextual_controlled_context,
+    build_prompt_batch_contexts,
+)
 
 
 def cloud_base_kv_transfer_has_effect(environment, src_rank, world_size):
@@ -201,16 +211,40 @@ def force_decode_enabled(args):
     return getattr(args, "force_decode_steps", None) is not None
 
 
-def decode_iteration_limit(args):
+def decode_iteration_limit(args, forced_output_tokens=None):
     """Return Rank 0 loop iterations needed for normal or forced decoding.
 
     The token immediately available after prefill is appended before the first
     decode forward. Therefore N forced decode forwards require N+1 loop
-    iterations: one to append the prefill token, then N decode sends.
+    iterations: one to append the prefill token, then N decode sends. A
+    contextual-controlled output target counts final token IDs instead, so it
+    directly uses N loop iterations.
     """
+    if forced_output_tokens is not None:
+        forced_output_tokens = int(forced_output_tokens)
+        if forced_output_tokens <= 0:
+            raise ValueError("forced_output_tokens must be a positive integer.")
+        return forced_output_tokens
     if force_decode_enabled(args):
         return int(args.force_decode_steps) + 1
     return int(args.max_new_tokens)
+
+
+def validate_forced_output_lengths(generated_tokens, forced_output_tokens, batch_number):
+    """Fail loudly if controlled learning did not produce exactly N token IDs."""
+    if forced_output_tokens is None:
+        return
+    expected = int(forced_output_tokens)
+    invalid = [
+        row_index
+        for row_index, token_ids in enumerate(generated_tokens)
+        if len(token_ids) != expected
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"Batch {batch_number} controlled output expected {expected} token IDs "
+            f"per prompt; invalid row indexes={invalid}."
+        )
 
 
 def generate_rows_for_prompts(
@@ -227,6 +261,7 @@ def generate_rows_for_prompts(
     comm_device=None,
     comm_dtype=None,
     environment=None,
+    forced_output_tokens=None,
     start_index=0,
     total_count=None,
 ):
@@ -322,8 +357,9 @@ def generate_rows_for_prompts(
         rank0_decode_comp_time_ms = 0.0
         rank0_decode_transfer_time_ms = 0.0
         rank0_decode_step_count = 0
-        force_decode = force_decode_enabled(args)
-        for token_index in range(decode_iteration_limit(args)):
+        controlled_output = forced_output_tokens is not None
+        force_decode = controlled_output or force_decode_enabled(args)
+        for token_index in range(decode_iteration_limit(args, forced_output_tokens)):
             synchronize_cuda()
             rank0_decode_compute_start_time = time.perf_counter()
             if force_decode:
@@ -345,7 +381,9 @@ def generate_rows_for_prompts(
                         finished[row_index] = True
 
             attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
-            if force_decode:
+            if controlled_output:
+                should_stop = token_index == int(forced_output_tokens) - 1
+            elif force_decode:
                 should_stop = rank0_decode_step_count >= int(args.force_decode_steps)
             else:
                 should_stop = bool(finished.all().item()) or token_index == args.max_new_tokens - 1
@@ -382,6 +420,12 @@ def generate_rows_for_prompts(
             rank0_decode_transfer_time_ms,
         )
 
+    validate_forced_output_lengths(
+        generated_tokens,
+        forced_output_tokens,
+        batch_number,
+    )
+
     rows = []
     for local_index, prompt in enumerate(prompts, start=1):
         global_index = start_index + local_index
@@ -414,6 +458,7 @@ def generate_rows_for_prompts_cloud_base(
     comm_device,
     comm_dtype,
     environment=None,
+    forced_output_tokens=None,
     start_index=0,
     total_count=None,
 ):
@@ -529,8 +574,9 @@ def generate_rows_for_prompts_cloud_base(
     rank0_decode_step_count = 0
 
     with torch.inference_mode():
-        force_decode = force_decode_enabled(args)
-        for token_index in range(decode_iteration_limit(args)):
+        controlled_output = forced_output_tokens is not None
+        force_decode = controlled_output or force_decode_enabled(args)
+        for token_index in range(decode_iteration_limit(args, forced_output_tokens)):
             synchronize_cuda()
             rank0_decode_compute_start_time = time.perf_counter()
             if force_decode:
@@ -552,7 +598,9 @@ def generate_rows_for_prompts_cloud_base(
                         finished[row_index] = True
 
             attention_mask_2d = torch.cat([attention_mask_2d, mask_to_append], dim=1)
-            if force_decode:
+            if controlled_output:
+                should_stop = token_index == int(forced_output_tokens) - 1
+            elif force_decode:
                 should_stop = rank0_decode_step_count >= int(args.force_decode_steps)
             else:
                 should_stop = bool(finished.all().item()) or token_index == args.max_new_tokens - 1
@@ -586,6 +634,12 @@ def generate_rows_for_prompts_cloud_base(
         rank0_decode_step_count,
         rank0_decode_comp_time_ms,
         rank0_decode_transfer_time_ms,
+    )
+
+    validate_forced_output_lengths(
+        generated_tokens,
+        forced_output_tokens,
+        batch_number,
     )
 
     rows = []
@@ -900,7 +954,30 @@ def rank0_generate_dynamic(
     """
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
-    prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
+    controlled_rows = None
+    if args.bandit_policy == "contextual_controlled":
+        if not args.csv_has_header:
+            raise ValueError("contextual_controlled requires --csv-has-header.")
+        if not args.allocation_csv:
+            raise ValueError("contextual_controlled requires --allocation-csv.")
+        if int(args.batch_size) != 1:
+            raise ValueError("contextual_controlled requires --batch-size 1.")
+        if args.force_decode_steps is not None:
+            raise ValueError(
+                "contextual_controlled cannot be combined with --force-decode-steps."
+            )
+        controlled_rows = read_contextual_controlled_rows(
+            args.input_csv,
+            args.prompt_column,
+        )
+        if len(controlled_rows) != CONTROLLED_TOTAL_BATCHES:
+            raise ValueError(
+                f"contextual_controlled expects {CONTROLLED_TOTAL_BATCHES} CSV rows; "
+                f"got {len(controlled_rows)}."
+            )
+        prompts = [row["prompt"] for row in controlled_rows]
+    else:
+        prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
     if not prompts:
         print(f"[Rank 0] No prompts found in {args.input_csv}")
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
@@ -924,6 +1001,14 @@ def rank0_generate_dynamic(
             batch_size=args.batch_size,
             max_input_tokens=args.max_input_tokens,
         )
+        if controlled_rows is not None:
+            for batch_number, labeled_row in enumerate(controlled_rows, start=1):
+                batch_contexts[batch_number] = build_contextual_controlled_context(
+                    batch=batch_number,
+                    base_context=batch_contexts.get(batch_number),
+                    labeled_row=labeled_row,
+                )
+                batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
 
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
@@ -935,6 +1020,9 @@ def rank0_generate_dynamic(
     try:
         for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
             batch_context = batch_contexts.get(batch_number)
+            forced_output_tokens = None
+            if args.bandit_policy == "contextual_controlled" and batch_context is not None:
+                forced_output_tokens = batch_context.get("target_output_tokens")
             if scheduler is not None:
                 selected_arm = scheduler.select_arm_before_batch(
                     batch=batch_number,
@@ -974,6 +1062,19 @@ def rank0_generate_dynamic(
                 f"[Rank 0] Batch {batch_number}: {interval_text}; "
                 f"prompts={len(prompt_batch)}"
             )
+            if args.bandit_policy == "contextual_controlled":
+                target_text = (
+                    str(forced_output_tokens)
+                    if forced_output_tokens is not None
+                    else f"natural(max={args.max_new_tokens})"
+                )
+                print(
+                    f"[Rank 0] Batch {batch_number}: controlled_phase="
+                    f"{batch_context['phase']}; inferred_request_type="
+                    f"{batch_context['inferred_request_type']}; "
+                    f"output_tokens={target_text}; label_used="
+                    f"{batch_context['label_used']}"
+                )
 
             print(
                 f"[Rank 0] Batch {batch_number}: broadcasting boundaries "
@@ -1054,6 +1155,7 @@ def rank0_generate_dynamic(
                     comm_device=comm_device,
                     comm_dtype=comm_dtype,
                     environment=environment,
+                    forced_output_tokens=forced_output_tokens,
                 )
             else:
                 rows, records = generate_rows_for_prompts(
@@ -1072,6 +1174,7 @@ def rank0_generate_dynamic(
                     comm_device=comm_device,
                     comm_dtype=comm_dtype,
                     environment=environment,
+                    forced_output_tokens=forced_output_tokens,
                 )
             all_rows.extend(rows)
 
