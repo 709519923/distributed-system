@@ -1,5 +1,89 @@
 # Version Log
 
+## 2026-08-14
+
+### 经典 UCB1 累计平均 Reward
+
+#### 修改范围
+
+本次只修改 `BANDIT_POLICY=ucb` 的 reward 更新与 score 计算。`contextual`、`contextual_controlled`、`lipschitz` 和 `contextual_lipschitz` 均保持原有行为，`UCB_EXPLORATION_WEIGHT=0.01` 及 `self.exploration_weight` 参数传递方式不变。
+
+#### 修改前
+
+普通 UCB 每次使用最新 batch 覆盖该 arm 的 reward：
+
+$$
+R_a\leftarrow r_t
+$$
+
+因此旧观测不会保留在 reward 中，score 的中心值只代表最后一次执行结果。
+
+#### 单次观测
+
+每个有效 batch 仍先计算三个 Rank 中瓶颈节点的每 decode step 耗时：
+
+$$
+C_t=
+\frac{\max(T_{0,t},T_{1,t},T_{2,t})}
+{\max(1,\mathrm{decode\_step\_count}_t)}
+$$
+
+再将 cost 映射为区间 $(0,1]$ 内、越大越好的单次 reward：
+
+$$
+r_t=\frac{1}{1+C_t/100}
+$$
+
+#### 累计平均 Reward
+
+arm $a$ 完成第 $n$ 次有效 pull 后，使用经典样本均值更新：
+
+$$
+\bar R_{a,n}=
+\frac{(n-1)\bar R_{a,n-1}+r_t}{n}
+$$
+
+代码中的 `stats["reward"]` 现在表示 $\bar R_{a,n}$。初始 `reward=0.5` 在 `pulls=0` 时不会进入第一次平均；第一次有效观测后有 $\bar R_{a,1}=r_1$。
+
+`stats["mean_cost"]` 同步保存累计平均 cost，`stats["last_cost"]` 保存最新 cost，但 UCB1 选臂使用的是累计平均 reward。由于 reward 映射是非线性的，代码采用“逐批先计算 reward，再平均 reward”，而不是由平均 cost 反推 reward：
+
+$$
+\frac{1}{n}\sum_{i=1}^{n}\frac{1}{1+C_i/100}
+\neq
+\frac{1}{1+\bar C/100}
+$$
+
+#### UCB1 Score
+
+所有 arm 至少获得一次有效观测后，score 使用经典 UCB1 形式：
+
+$$
+\operatorname{Score}_a=
+\bar R_a+
+c\sqrt{\frac{2\ln N}{N_a}}
+$$
+
+其中 $N$ 是所有 arm 的有效 pull 总数，$N_a$ 是 arm $a$ 的有效 pull 数，探索强度继续读取原有变量：
+
+$$
+c=\texttt{self.exploration\_weight}=0.01
+$$
+
+实际选臂与 `arm_details.score` 共用 `_ucb1_exploration_bonus()`，避免运行决策和日志审计采用不同公式。
+
+#### 初始化与冷启动
+
+- 若存在 `pulls=0` 的 arm，继续按 `CANDIDATE_ARMS` 顺序优先执行未观测 arm；全部 arm 至少完成一次有效 pull 后才比较 UCB1 score。
+- 整次运行的第一个完成 batch 仍作为系统冷启动，不增加 `pulls`，不更新 reward，也不参与 score；第二个 batch 继续使用相同 arm，并形成第一个有效 UCB1 样本。
+- 普通 UCB1 仍不包含 elimination，所有候选 arm 后续都可能因探索项而再次被选择。
+
+#### 代码改动
+
+- `scheduler.py`：将普通 UCB 的 `_update_latest_arm_cost()` 替换为 `_update_ucb_arm_reward()`，累计更新平均 reward。
+- `scheduler.py`：新增 `_ucb1_exploration_bonus()`，统一实现 $0.01\sqrt{2\ln N/N_a}$。
+- `scheduler.py`：实际选臂和 `arm_details.score` 均改为使用同一个 UCB1 探索项函数。
+- `log.md`：记录累计平均 reward、UCB1 score、冷启动和未探索 arm 规则。
+
 ## 2026-08-11
 
 ### Contextual Controlled Policy

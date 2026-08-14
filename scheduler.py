@@ -394,8 +394,8 @@ class LayerBanditPolicy:
         rank2: [p2, total_layers)
 
     Only the first completed batch of the whole run is treated as warmup. Every
-    later batch immediately replaces the selected arm's reward with the latest
-    observation and then selects the arm for the next batch.
+    later batch updates the selected arm's cumulative mean reward, then selects
+    the arm for the next batch with the classic UCB1 score.
     """
 
     def __init__(
@@ -472,7 +472,7 @@ class LayerBanditPolicy:
         arm_cost = self._cost_per_token(summary)
         if arm_cost is None:
             return self.current_arm
-        self._update_latest_arm_cost(self.current_arm, arm_cost)
+        self._update_ucb_arm_reward(self.current_arm, arm_cost)
 
         self.current_arm = self._select_next_arm()
         return self.current_arm
@@ -589,13 +589,23 @@ class LayerBanditPolicy:
         stats["pulls"] = pulls + 1
         self.total_pulls += 1
 
-    def _update_latest_arm_cost(self, arm, cost):
-        """Replace plain UCB reward with the most recent batch observation."""
+    def _update_ucb_arm_reward(self, arm, cost):
+        """Update plain UCB with the cumulative mean of per-batch rewards."""
         stats = self.stats[arm]
-        stats["mean_cost"] = float(cost)
-        stats["last_cost"] = float(cost)
-        stats["reward"] = self._reward_from_cost(float(cost))
-        stats["pulls"] = int(stats["pulls"]) + 1
+        pulls = int(stats["pulls"])
+        cost = float(cost)
+        latest_reward = self._reward_from_cost(cost)
+
+        # UCB1 estimates each arm's expected reward with its sample mean. The
+        # initial reward=0.5 is ignored naturally when pulls is zero.
+        stats["mean_cost"] = (
+            float(stats["mean_cost"]) * pulls + cost
+        ) / (pulls + 1)
+        stats["last_cost"] = cost
+        stats["reward"] = (
+            float(stats["reward"]) * pulls + latest_reward
+        ) / (pulls + 1)
+        stats["pulls"] = pulls + 1
         self.total_pulls += 1
 
     def _cost_per_token(self, summary):
@@ -609,19 +619,26 @@ class LayerBanditPolicy:
     def _reward_from_cost(self, cost_per_token_ms):
         return 1.0 / (1.0 + (float(cost_per_token_ms) / self.reward_scale_ms))
 
+    def _ucb1_exploration_bonus(self, pulls):
+        """Return c * sqrt(2 ln(N) / N_a) using the configured weight c."""
+        pulls = int(pulls)
+        if pulls <= 0:
+            return float("inf")
+        log_total = math.log(max(self.total_pulls, 2))
+        return self.exploration_weight * math.sqrt(2.0 * log_total / pulls)
+
     def _select_next_arm(self):
         """Choose the next arm with UCB, testing unseen arms first."""
         for arm in self.arms:
             if int(self.stats[arm]["pulls"]) == 0:
                 return arm
 
-        log_total = math.log(max(self.total_pulls, 2))
         best_arm = self.arms[0]
         best_score = None
         for arm in self.arms:
             stats = self.stats[arm]
             pulls = int(stats["pulls"])
-            score = float(stats["reward"]) + self.exploration_weight * math.sqrt(log_total / pulls)
+            score = float(stats["reward"]) + self._ucb1_exploration_bonus(pulls)
             if best_score is None or score > best_score:
                 best_arm = arm
                 best_score = score
@@ -631,7 +648,6 @@ class LayerBanditPolicy:
         """Return compact per-arm reward/score rows for logging."""
         selected_arm = tuple(selected_arm) if selected_arm is not None else None
         rows = []
-        log_total = math.log(max(self.total_pulls, 2))
         for arm in self.arms:
             stats = self.stats[arm]
             pulls = int(stats["pulls"])
@@ -644,7 +660,7 @@ class LayerBanditPolicy:
                 score = "untried"
             else:
                 reward_text = f"{reward:.6f}"
-                score_value = reward + self.exploration_weight * math.sqrt(log_total / pulls)
+                score_value = reward + self._ucb1_exploration_bonus(pulls)
                 score = f"{score_value:.6f}"
             rows.append(
                 {
