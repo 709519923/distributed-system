@@ -30,6 +30,7 @@ from experiment_report import (
     send_metric_record,
     send_metric_tensor,
 )
+from ground_truth_experiment import GroundTruthExperiment, read_ground_truth_rows
 from kv_cache_transfer import (
     cache_batch_seq_len,
     recv_kv_cache,
@@ -955,7 +956,22 @@ def rank0_generate_dynamic(
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
     controlled_rows = None
-    if args.bandit_policy == "contextual_controlled":
+    ground_truth_rows = None
+    if args.bandit_policy == "ground_truth":
+        if not args.csv_has_header:
+            raise ValueError("ground_truth requires --csv-has-header.")
+        if not args.allocation_csv:
+            raise ValueError("ground_truth requires --allocation-csv.")
+        if int(args.batch_size) != 1:
+            raise ValueError("ground_truth requires --batch-size 1.")
+        if args.force_decode_steps is not None:
+            raise ValueError("ground_truth cannot be combined with --force-decode-steps.")
+        ground_truth_rows = read_ground_truth_rows(
+            args.input_csv,
+            args.prompt_column,
+        )
+        prompts = [row["prompt"] for row in ground_truth_rows]
+    elif args.bandit_policy == "contextual_controlled":
         if not args.csv_has_header:
             raise ValueError("contextual_controlled requires --csv-has-header.")
         if not args.allocation_csv:
@@ -986,6 +1002,7 @@ def rank0_generate_dynamic(
     total_layers = get_total_layers_from_config(args.model_dir)
     default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
     scheduler = None
+    ground_truth_experiment = None
     batch_contexts = {}
     if args.allocation_csv:
         scheduler = Scheduler(
@@ -1009,6 +1026,34 @@ def rank0_generate_dynamic(
                     labeled_row=labeled_row,
                 )
                 batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
+        if ground_truth_rows is not None:
+            ground_truth_experiment = GroundTruthExperiment(
+                dataset_rows=ground_truth_rows,
+                candidate_arms=scheduler.bandit.arms,
+                total_layers=total_layers,
+                world_size=world_size,
+                log_directory=scheduler.bandit_log_dir,
+                run_timestamp=scheduler.run_timestamp,
+            )
+            for dataset_batch, labeled_row in enumerate(ground_truth_rows, start=1):
+                context = batch_contexts.get(dataset_batch)
+                if context is None:
+                    raise ValueError(
+                        f"Missing prompt context for ground-truth dataset batch "
+                        f"{dataset_batch}."
+                    )
+                context["scenario"] = labeled_row["scenario"]
+                context["request_type_label"] = labeled_row["request_type"]
+                context["target_output_tokens"] = int(
+                    labeled_row["target_output_tokens"]
+                )
+            print(
+                f"[Rank 0] Ground-truth plan: logical_batches="
+                f"{ground_truth_experiment.logical_batch_count}; arms="
+                f"{ground_truth_experiment.arm_count}; execution_batches="
+                f"{ground_truth_experiment.execution_batch_count}; results="
+                f"{ground_truth_experiment.log_path}"
+            )
 
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
@@ -1018,16 +1063,49 @@ def rank0_generate_dynamic(
     current_stage = None
 
     try:
-        for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
-            batch_context = batch_contexts.get(batch_number)
+        if ground_truth_experiment is None:
+            batch_iterator = (
+                (batch_number, start_index, prompt_batch, None)
+                for batch_number, start_index, prompt_batch in chunk_items(
+                    prompts,
+                    args.batch_size,
+                )
+            )
+        else:
+            batch_iterator = (
+                (
+                    trial.execution_batch,
+                    trial.dataset_batch - 1,
+                    [trial.prompt],
+                    trial,
+                )
+                for trial in ground_truth_experiment.iter_trials()
+            )
+
+        for batch_number, start_index, prompt_batch, ground_truth_trial in batch_iterator:
+            logical_batch_number = (
+                ground_truth_trial.dataset_batch
+                if ground_truth_trial is not None
+                else batch_number
+            )
+            batch_context = batch_contexts.get(logical_batch_number)
             forced_output_tokens = None
             if args.bandit_policy == "contextual_controlled" and batch_context is not None:
                 forced_output_tokens = batch_context.get("target_output_tokens")
-            if scheduler is not None:
-                selected_arm = scheduler.select_arm_before_batch(
-                    batch=batch_number,
-                    context=batch_context,
+            elif ground_truth_trial is not None:
+                forced_output_tokens = ground_truth_trial.target_output_tokens
+                ground_truth_experiment.validate_input_length(
+                    ground_truth_trial,
+                    batch_context["input_tokens_max"],
                 )
+            if scheduler is not None:
+                if ground_truth_trial is not None:
+                    selected_arm = ground_truth_trial.arm
+                else:
+                    selected_arm = scheduler.select_arm_before_batch(
+                        batch=batch_number,
+                        context=batch_context,
+                    )
                 if selected_arm is None:
                     boundaries, allocation = boundaries_for_batch(
                         args,
@@ -1062,6 +1140,18 @@ def rank0_generate_dynamic(
                 f"[Rank 0] Batch {batch_number}: {interval_text}; "
                 f"prompts={len(prompt_batch)}"
             )
+            if ground_truth_trial is not None:
+                print(
+                    f"[Rank 0] Ground truth: dataset_batch="
+                    f"{ground_truth_trial.dataset_batch}/"
+                    f"{ground_truth_experiment.logical_batch_count}; arm="
+                    f"{ground_truth_trial.arm_index}/"
+                    f"{ground_truth_experiment.arm_count} "
+                    f"{ground_truth_trial.arm}; execution_order="
+                    f"{ground_truth_trial.execution_order}; scenario="
+                    f"{ground_truth_trial.scenario}; output_tokens="
+                    f"{forced_output_tokens}"
+                )
             if args.bandit_policy == "contextual_controlled":
                 target_text = (
                     str(forced_output_tokens)
@@ -1082,7 +1172,9 @@ def rank0_generate_dynamic(
             )
             broadcast_boundaries(boundaries, world_size, comm_device, rank=0)
             if environment is not None:
-                environment.apply_batch(batch_number)
+                # Every arm of one logical request sees the same scheduled
+                # network state, even though each arm has its own execution batch.
+                environment.apply_batch(logical_batch_number)
                 environment = broadcast_environment(environment, rank=0, device=comm_device)
                 print(f"[Rank 0] Batch {batch_number}: environment={environment.describe()}")
             if model is None:
@@ -1176,7 +1268,15 @@ def rank0_generate_dynamic(
                     environment=environment,
                     forced_output_tokens=forced_output_tokens,
                 )
-            all_rows.extend(rows)
+            if ground_truth_trial is None:
+                all_rows.extend(rows)
+            else:
+                all_rows.extend(
+                    ground_truth_experiment.enrich_output_rows(
+                        ground_truth_trial,
+                        rows,
+                    )
+                )
 
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
@@ -1189,7 +1289,19 @@ def rank0_generate_dynamic(
                     context=batch_context,
                     selected_arm=selected_arm,
                 )
-                scheduler.update_policy_after_batch(batch_number)
+                if ground_truth_trial is None:
+                    scheduler.update_policy_after_batch(batch_number)
+                else:
+                    group_complete = ground_truth_experiment.record_trial(
+                        ground_truth_trial,
+                        records,
+                        args.prefill_mode,
+                    )
+                    if group_complete:
+                        print(
+                            f"[Rank 0] Ground truth dataset batch "
+                            f"{ground_truth_trial.dataset_batch} ranking written."
+                        )
             append_experiment_log(log_path, records)
             append_summary_log(
                 log_path,
@@ -1202,7 +1314,10 @@ def rank0_generate_dynamic(
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
-        write_output_rows(args.output_csv, all_rows)
+        if ground_truth_experiment is None:
+            write_output_rows(args.output_csv, all_rows)
+        else:
+            ground_truth_experiment.write_output_rows(args.output_csv, all_rows)
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
     finally:
         if layer_partition is not None:

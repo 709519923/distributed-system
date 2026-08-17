@@ -14,6 +14,38 @@
 
 建议三台机器都放在各自的 `tmux` 窗口中运行，方便查看状态和日志。
 
+## Ground Truth 全臂实验
+
+当前 `test-groundtruth` 分支的 `run.sh` 默认使用：
+
+```bash
+BANDIT_POLICY=${BANDIT_POLICY:-ground_truth}
+BATCH_SIZE=${BATCH_SIZE:-1}
+INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-test.csv}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
+```
+
+`ground_truth` 会让每个数据集 batch 在 `scheduler.py` 的全部
+`CANDIDATE_ARMS` 上各执行一次。臂数不固定：若列表有 $K$ 个臂、输入有
+$D$ 行，则自动执行 $D\times K$ 个物理 batch。当前 10 个臂和 150 行输入
+对应 1500 次执行。
+
+输入 CSV 字段为：
+
+```text
+prompt,scenario,request_type,target_output_tokens,source_row
+```
+
+结果排名即时写入：
+
+```text
+bandit_logs/arm_details_ground_truth_YYYY-MM-DD-HH-MM.csv
+```
+
+每个逻辑 batch 完成全部臂后写入 $K$ 行，`arm_ranking=1` 表示该请求下
+实测最优臂。三类受控输出为 A=90、B=400、C=256 个最终 token ID；因此
+对应的 `decode_step_count` 通常为 89、399、255。
+
 ## run.sh 配置
 
 常用配置在 `run.sh` 顶部：
@@ -22,15 +54,15 @@
 WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
 PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
-SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
+SPLIT_LAYERS=${SPLIT_LAYERS:-1,15}
 SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
-BANDIT_POLICY=${BANDIT_POLICY:-ucb}
-INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
+BANDIT_POLICY=${BANDIT_POLICY:-ground_truth}
+INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.130:29510}
 COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-test.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
-MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-2000}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 ```
 
@@ -42,7 +74,7 @@ PREFILL_MODE      distributed 或 cloud-base
 BATCH_SIZE        每个 batch 的 prompt 数量
 SPLIT_LAYERS      默认 transformer 层切分点，例如 5,15
 SCHEDULER_CSV     Rank 0 使用的调度文件，不存在时自动创建
-BANDIT_POLICY     ucb、contextual、contextual_controlled、lipschitz 等调度策略
+BANDIT_POLICY     ucb、contextual、contextual_controlled、lipschitz、ground_truth 等策略
 INIT_METHOD       torch.distributed rendezvous 地址
 COMPUTE_DEVICE    Rank 0 的计算设备，cuda 或 cpu
 MODEL_DIR         TinyLlama 模型目录

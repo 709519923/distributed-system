@@ -169,16 +169,6 @@ CANDIDATE_ARMS = [
     (3, 7),
     (3, 11),
     (3, 15),
-    (3, 19),
-    (5, 7),
-    (5, 11),
-    (5, 13),
-    (5, 15),
-    (5, 17),
-    (9, 12),
-    (9, 14),
-    (9, 16),
-    (9, 18),
 ]
 
 
@@ -1247,12 +1237,48 @@ class ContextualLipschitzBanditPolicy(ContextualBanditPolicy):
         return distance / max(float(self.total_layers), 1.0)
 
 
+class GroundTruthBanditPolicy(LayerBanditPolicy):
+    """Non-learning policy used by exhaustive ground-truth collection.
+
+    The Rank 0 experiment driver enumerates ``self.arms`` directly. This class
+    exists so Scheduler can validate the configured arm list without adding a
+    default split, updating rewards, or selecting an extra arm implicitly.
+    """
+
+    policy_name = "ground_truth"
+
+    def __init__(self, total_layers, default_boundaries, world_size, **kwargs):
+        super().__init__(total_layers, default_boundaries, world_size, **kwargs)
+        configured_arms = [tuple(int(value) for value in arm) for arm in CANDIDATE_ARMS]
+        if len(set(configured_arms)) != len(configured_arms):
+            raise ValueError("ground_truth requires unique CANDIDATE_ARMS.")
+        invalid_arms = [arm for arm in configured_arms if not self._valid_arm(arm)]
+        if invalid_arms:
+            raise ValueError(
+                f"ground_truth has invalid CANDIDATE_ARMS for "
+                f"total_layers={self.total_layers}: {invalid_arms}"
+            )
+        self.arms = configured_arms
+        # Ground-truth execution starts from the first explicit candidate arm.
+        # SPLIT_LAYERS remains a valid scheduler fallback but never becomes an
+        # extra experiment arm when it is absent from CANDIDATE_ARMS.
+        self.current_arm = self.arms[0]
+        self.stats = {arm: self._new_stats() for arm in self.arms}
+
+    def update_after_batch(self, batch, batch_summary_history):
+        """Ground-truth enumeration records measurements without online learning."""
+        _ = batch
+        _ = batch_summary_history
+        return self.current_arm
+
+
 BANDIT_POLICY_CLASSES = {
     "ucb": LayerBanditPolicy,
     "contextual": ContextualBanditPolicy,
     "contextual_controlled": ContextualControlledBanditPolicy,
     "lipschitz": LipschitzBanditPolicy,
     "contextual_lipschitz": ContextualLipschitzBanditPolicy,
+    "ground_truth": GroundTruthBanditPolicy,
 }
 
 

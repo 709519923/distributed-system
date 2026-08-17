@@ -153,13 +153,15 @@ def parse_args():
             "contextual_controlled",
             "lipschitz",
             "contextual_lipschitz",
+            "ground_truth",
         ),
         default="ucb",
         help=(
             "Rank 0 scheduler bandit policy. Default: ucb. contextual uses "
             "current-batch prompt context before selecting the current arm. "
             "contextual_controlled uses the labeled 600-batch learning and "
-            "300-batch evaluation protocol."
+            "300-batch evaluation protocol. ground_truth evaluates every "
+            "configured candidate arm for every labeled dataset row."
         ),
     )
     parser.add_argument(

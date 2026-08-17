@@ -1,5 +1,117 @@
 # Version Log
 
+## 2026-08-17
+
+### Ground Truth 全臂枚举实验
+
+#### 实验目标
+
+本次在 `test-groundtruth` 分支新增离线 ground truth 数据采集模式。它不执行
+UCB、Contextual 或 Lipschitz 的在线选臂，也不更新任何 reward；对于输入数据集
+的每一个逻辑 batch，依次使用 `scheduler.py` 中 `CANDIDATE_ARMS` 的全部实际臂
+各推理一次，再根据同一个请求下的实测性能给所有臂排序。
+
+臂数量没有写死为 20。设当前候选列表为
+
+$$
+\mathcal A=\texttt{CANDIDATE\_ARMS},\qquad K=|\mathcal A|,
+$$
+
+数据集共有 $D$ 个逻辑 batch，则总执行次数自动为
+
+$$
+N_{\mathrm{execution}}=D\times K.
+$$
+
+当前分支有 10 个候选臂，数据集有 150 行，因此会执行
+$150\times10=1500$ 个物理 batch。以后只需增删 `CANDIDATE_ARMS`，循环次数、
+日志行数和排名范围都会自动随 $K$ 变化，不需要同步修改其他常量。
+
+#### 逻辑 Batch 与执行 Batch
+
+`dataset_batch` 表示原始数据集的行号，同一条 prompt 在所有臂上保持相同；
+`execution_batch` 是三节点通信、模型切层、`scheduler.csv` 和原始实验日志使用的
+连续物理批次号。二者关系为
+
+$$
+\text{execution\_batch}=(\text{dataset\_batch}-1)K+
+\text{execution\_order}.
+$$
+
+为减小固定先后顺序引入的温度、缓存或后台负载偏差，每个逻辑 batch 会循环
+平移臂执行顺序，但 `arm_index` 始终表示该臂在 `CANDIDATE_ARMS` 中的固定位置。
+同一个逻辑 batch 的全部臂使用同一个 Environment batch 状态，避免模拟带宽或
+时延恰好在臂枚举中间变化。
+
+#### 数据集制作
+
+新增 `C:/Users/smbu/Desktop/lab7/dataset/prepare_ground_truth_dataset.py`。脚本分别
+读取以下文件的前 50 条非空 prompt：
+
+| Scenario | 源文件 | Input token 范围 | 固定输出 token |
+|---|---|---:|---:|
+| A / LISO | `single_scenario_a_500.csv` | 800-1500 | 90 |
+| B / SILO | `single_scenario_b_500.csv` | 10-150 | 400 |
+| C / MIMO | `single_scenario_c_500.csv` | 200-600 | 256 |
+
+输出 `ground-truth-test.csv`，总计 150 行，顺序为
+`A1,B1,C1,A2,B2,C2,...,A50,B50,C50`，字段为
+`prompt,scenario,request_type,target_output_tokens,source_row`。
+
+`ground_truth` 要求 `BATCH_SIZE=1`，并拒绝同时设置
+`--force-decode-steps`。场景目标表示最终保存的 token ID 总数，prefill 得到的
+first token 计入其中，因此
+
+$$
+\text{decode\_step\_count}=\text{target\_output\_tokens}-1.
+$$
+
+#### 实测评分与排名
+
+每个 arm 完成后直接复用现有三节点 record 的模式相关时间。`distributed` 使用
+`Tcompute_plus_Ttransfer_plus_Tcomm_ms`；`cloud-base` 使用
+`Tdecode_plus_Ttransfer_plus_Tcomm_ms`。设三个 Rank 的时间为 $T_{0,t,a}$、
+$T_{1,t,a}$、$T_{2,t,a}$，则瓶颈时间和每 token cost 为
+
+$$
+T^{\max}_{t,a}=\max(T_{0,t,a},T_{1,t,a},T_{2,t,a}),
+$$
+
+$$
+C_{t,a}=\frac{T^{\max}_{t,a}}
+{\max(1,\text{decode\_step\_count}_{t,a})}.
+$$
+
+仅为方便与现有 reward 数值范围对照，再计算不带探索项、不带历史平均的实测
+score：
+
+$$
+S_{t,a}=\frac{1}{1+C_{t,a}/100}.
+$$
+
+同一个 `dataset_batch` 内按 $C_{t,a}$ 从小到大排序，cost 相同时按
+`CANDIDATE_ARMS` 原始顺序打破平局；`arm_ranking=1` 即该请求的 ground truth
+最优臂。
+
+#### 日志与文件
+
+- 新增 `ground_truth_experiment.py`：负责读取带标签数据、按实际 arm list 生成
+  执行计划、校验场景输入长度、计算实测 score、完成组内排名以及写出结果。
+- `bandit_logs/arm_details_ground_truth_YYYY-MM-DD-HH-MM.csv`：每个逻辑 batch
+  完成全部 $K$ 个臂后立即追加 $K$ 行并执行 `flush + fsync`。字段包含逻辑/物理
+  batch、场景、输入/输出长度、臂、三 Rank 时间、瓶颈时间、每 token cost、
+  实测 score 和 ranking。
+- `outputs_kv.csv`：新增逻辑 batch、执行 batch、场景和 arm 标识，避免重复
+  prompt 的生成结果无法追溯到具体臂。
+- `scheduler.py`：新增非学习型 `GroundTruthBanditPolicy`。它严格使用
+  `CANDIDATE_ARMS`，不自动插入默认 `SPLIT_LAYERS`。即使默认 split 不在列表中，
+  ground truth 仍直接从列表第一个臂开始，并且总臂数仍为 $K=|\mathcal A|$。
+- `inference_loops.py`：把每个数据集行展开为 $K$ 次现有分布式推理；模型增量
+  切层、NCCL 数据流、KV cache 和原始计时逻辑均复用，不另建通信协议。
+- `config.py`、`run.sh`：新增并默认选择 `ground_truth`；`run.sh` 保留用户已改的
+  `ground-truth-test.csv`、`BATCH_SIZE=1` 和 `MAX_INPUT_TOKENS=2000`。
+
+
 ## 2026-08-14
 
 ### 经典 UCB1 累计平均 Reward
