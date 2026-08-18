@@ -1,10 +1,40 @@
-# Distributed TinyLlama NCCL Inference
+# TinyLlama Lipschitz 可行性验证
 
-本项目用于 TinyLlama 两节点 / 三节点 NCCL 分布式推理实验。当前统一通过 `run.sh` 启动，实验参数集中写在 `run.sh` 顶部。
+本分支用于穷举 TinyLlama 三节点的全部层切分，验证 arm 距离与推理性能之间是否存在可利用的 Lipschitz 关系。
 
-## 启动方式
+## 实验配置
 
-三台机器分别进入项目目录后运行：
+实验参数统一在 `run.sh` 顶部修改，默认配置为：
+
+```bash
+WORLD_SIZE_VALUE=3
+PREFILL_MODE=distributed
+BATCH_SIZE=1
+SPLIT_LAYERS=5,15
+SCHEDULER_CSV=lipschitz_validation_scheduler.csv
+BANDIT_POLICY=lipschitz_validation
+MODEL_DIR=/home/dingcong/models/TinyLlama
+INPUT_CSV=./dataset/lipschitz_validation_prompts.csv
+OUTPUT_CSV=lipschitz_validation_outputs.csv
+FORCE_DECODE_STEPS=128
+```
+
+`lipschitz_validation` 只支持三节点 TinyLlama。22 个 decoder layer 的所有合法 arm 为：
+
+```text
+0 < p1 < p2 < 22
+rank0=[0,p1)  rank1=[p1,p2)  rank2=[p2,22)
+```
+
+总 arm 数为：
+
+$$
+\binom{21}{2}=210
+$$
+
+## 启动
+
+三台机器同步代码后分别执行：
 
 ```bash
 ./run.sh 0
@@ -12,225 +42,69 @@
 ./run.sh 2
 ```
 
-建议三台机器都放在各自的 `tmux` 窗口中运行，方便查看状态和日志。
+Rank 0 读取 CSV、生成 210 个 arm 的执行计划并广播切分点；Rank 1 和 Rank 2 不读取 scheduler 文件，只接收 Rank 0 的广播。
 
-## run.sh 配置
+## 输入数据
 
-常用配置在 `run.sh` 顶部：
+CSV 只需要 `prompt` 表头：
 
-```bash
-WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
-PREFILL_MODE=${PREFILL_MODE:-distributed}
-BATCH_SIZE=${BATCH_SIZE:-1}
-SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
-SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
-BANDIT_POLICY=${BANDIT_POLICY:-ucb}
-INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
-COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
-MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
-OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
-MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
-FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
+```csv
+prompt
+Your first prompt
+Your second prompt
 ```
 
-含义：
+程序支持任意数量的 prompt。设 prompt 数为 $N$，`BATCH_SIZE` 为 $B$，则逻辑 batch 数和真实三节点执行次数分别为：
+
+$$
+D=\left\lceil\frac{N}{B}\right\rceil,\qquad N_{exec}=210D
+$$
+
+建议使用 `BATCH_SIZE=1`，这样每个逻辑 batch 对应一个 prompt，得到的是 prompt 级 ground truth。`BATCH_SIZE>1` 时，排名表示整个 tensor batch 的性能。
+
+## 输出文件
+
+程序边运行边写文件：
 
 ```text
-WORLD_SIZE_VALUE  节点总数，当前常用 3
-PREFILL_MODE      distributed 或 cloud-base
-BATCH_SIZE        每个 batch 的 prompt 数量
-SPLIT_LAYERS      默认 transformer 层切分点，例如 5,15
-SCHEDULER_CSV     Rank 0 使用的调度文件，不存在时自动创建
-BANDIT_POLICY     ucb、contextual、contextual_controlled、lipschitz 等调度策略
-INIT_METHOD       torch.distributed rendezvous 地址
-COMPUTE_DEVICE    Rank 0 的计算设备，cuda 或 cpu
-MODEL_DIR         TinyLlama 模型目录
-INPUT_CSV         Rank 0 读取的输入 CSV
-OUTPUT_CSV        Rank 0 写出的结果 CSV
-MAX_INPUT_TOKENS  输入 prompt 最大 token 长度
-FORCE_DECODE_STEPS 固定 decode forward 次数；空值表示按 EOS / max_new_tokens 自然停止
-```
-
-如果要固定 decode 阶段执行 128 步，在 `run.sh` 顶部设置：
-
-```bash
-FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
-```
-
-该参数对应命令行 `--force-decode-steps 128`。它会忽略 EOS，强制执行 128 次 prefill 之后的 decode forward。prefill 直接得到的 first token 不计入这 128 步。
-
-## Contextual Controlled Policy
-
-`contextual_controlled` 专用于 `contextual_bandit_test_tinyllama_labeled.csv` 的受控学习/评估实验。Rank 0 的 `run.sh` 配置为：
-
-```bash
-BANDIT_POLICY=${BANDIT_POLICY:-contextual_controlled}
-BATCH_SIZE=${BATCH_SIZE:-1}
-INPUT_CSV=${INPUT_CSV:-./dataset/contextual_bandit_test_tinyllama_labeled.csv}
-FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
-```
-
-输入 CSV 必须包含：
-
-```text
-prompt,scenario,request_type,phase
-```
-
-该 policy 要求正好 900 行和 20 个互不重复的实际有效 arm。默认 split 必须已经包含在 `CANDIDATE_ARMS` 中，避免 Scheduler 额外插入第 21 个 arm。
-
-前 600 个 batch 是 learning 阶段，数据按 A/B/C 循环。每个 arm 在每种 request type 下学习 10 次：
-
-```text
-A / long_input_short_output    -> 强制保存 80 个 token ID
-B / short_input_long_output    -> 强制保存 386 个 token ID
-C / medium_input_medium_output -> 强制保存 256 个 token ID
-```
-
-Label 只控制 learning 阶段的输出 token 数，Context 特征仍由 prompt 的实际 token 长度生成。强制输出时忽略 EOS；prefill first token 计入目标总数，因此 `decode_step_count=target_output_tokens-1`。
-
-Batch 601-900 是 evaluation 阶段：
-
-```text
-不读取 scenario/request_type label 参与决策
-根据 prompt token 长度构造 Context
-使用前 600 批学到的 LinUCB 模型选臂
-冻结每个 arm 的 A/b，不再更新模型
-按 EOS 自然停止，最大输出仍为 --max-new-tokens（默认 512）
-```
-
-`contextual_controlled` 不能与 `--force-decode-steps` 同时使用，并且必须启用 `--allocation-csv`、`--csv-has-header` 和 `--batch-size 1`。
-
-## Scheduler
-
-`scheduler.csv` 由 Rank 0 维护，Rank 1 / Rank 2 不需要传入调度文件。Rank 0 会在每个 batch 开始时广播当前 layer boundaries。
-
-如果 `scheduler.csv` 不存在，Rank 0 会按 `SPLIT_LAYERS` 自动创建：
-
-```text
-batch,rank0,rank1,rank2
-1,"[0,5)","[5,15)","[15,22)"
-```
-
-如果某个 batch 没有明确写入，scheduler 会沿用最近一个已知 batch 的层分配，不会回退到默认分配。
-
-## PREFILL_MODE
-
-`distributed`：
-
-```text
-Rank 0 计算前段层 KV cache
-Rank 1 计算中段层 KV cache
-Rank 2 计算后段层 KV cache
-```
-
-`cloud-base`：
-
-```text
-Rank 0 -> Rank 2: input_ids + attention_mask
-Rank 2: 用完整模型计算全量 KV cache
-Rank 2 -> Rank 0: 分发 Rank 0 所需 KV cache
-Rank 2 -> Rank 1: 分发 Rank 1 所需 KV cache
-Rank 2: 保留自己的 KV cache
-```
-
-`cloud-base` 当前要求：
-
-```text
-WORLD_SIZE_VALUE=3
---dynamic-load
-Rank 2 能够加载完整 TinyLlama
-```
-
-## 数据流
-
-Decode 阶段：
-
-```text
-hidden states: Rank 0 -> Rank 1 -> Rank 2
-next token   : Rank 2 -> Rank 0
-metrics/log  : Rank 2 -> Rank 1 -> Rank 0
-```
-
-非 transformer 层的处理方式：
-
-```text
-Rank 0: input embedding
-最后一个 rank: final norm + lm_head
-```
-
-## Environment Simulation
-
-通信环境不再通过 `run.sh` 参数设置，而是在 `environment.py` 中配置，并由 Rank 0 广播给其他 rank。
-
-五条链路索引：
-
-```text
-Bandwidth[0], time_comm_delay[0] = Rank 0 -> Rank 1
-Bandwidth[1], time_comm_delay[1] = Rank 1 -> Rank 2
-Bandwidth[2], time_comm_delay[2] = Rank 2 -> Rank 0
-Bandwidth[3], time_comm_delay[3] = Rank 0 -> Rank 2
-Bandwidth[4], time_comm_delay[4] = Rank 2 -> Rank 1
-```
-
-默认配置：
-
-```python
-DEFAULT_BANDWIDTH = [None, None, None, None, None]
-DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
-DEFAULT_SCHEDULE = {}
-```
-
-`Bandwidth` 单位是 MB/s，其中 `1 MB = 1024 * 1024 bytes`。`None` 表示该链路不限速。`time_comm_delay` 单位是 ms，表示固定单向通信时延。
-
-## 日志
-
-日志写入：
-
-```text
+lipschitz_validation_outputs.csv
+bandit_logs/lipschitz_validation_raw_YYYY-MM-DD-HH-MM-SS.csv
+bandit_logs/lipschitz_validation_ranked_YYYY-MM-DD-HH-MM-SS.csv
 logs/log_YYYY-MM-DD-HH-MM.txt
 ```
 
-每个 batch 完成后会立刻写入 record 和 summary。summary 只统计当前 batch，不再跨 batch 累加 total。
+- `lipschitz_validation_outputs.csv`：每个 arm 生成的文本，并带逻辑 batch、执行 batch 和 arm 编号。
+- `raw`：每个 arm 完成后立即追加并 `fsync`，中途失败时已完成数据仍然保留。
+- `ranked`：一个逻辑 batch 的 210 个 arm 全部完成后，一次写入完整排名。
+- `logs`：原有逐 rank 性能记录，每个执行 batch 完成后立即写入。
 
-record 主要字段：
+`logical_batch` 表示同一组 prompt；`execution_batch` 是现有分布式通信协议使用的唯一连续编号：
 
-```text
-prefill_param_size_mb              当前 rank 持有的模型参数大小
-kv_cache_size_mb_after_prefill     当前 rank 的 KV cache 大小
+$$
+execution\_batch=(logical\_batch-1)\times210+execution\_order
+$$
 
-distributed parameter:
-prefill_comp_time_ms               prefill 阶段本 rank 计算时间
-prefill_transfer_time_ms           prefill 阶段本 rank 发出数据的传输时间，包含环境模拟时延
-                                  只用于 PREFILL_MODE=distributed；cloud-base 下应为 0.00
+## 排名指标
 
-Cloud-base parameter:
-cloud_prefill_rank2_time_ms        cloud-base 中 Rank 2 完整模型 prefill 时间
-kv_cache_send_time_ms              cloud-base 中 Rank 2 并行发送 KV cache 时间
-kv_cache_recv_time_ms              cloud-base 中 Rank 0 / Rank 1 接收并重建 KV cache 时间
+先按当前 prefill 模式计算每个 rank 的时间 $T_r$，再取最慢节点：
 
-Common parameter:
-decode_step_count                  decode 自回归 forward 次数
-decode_comp_time_ms                decode 阶段本 rank 计算时间
-decode_transfer_time_ms            decode 阶段本 rank 发出数据的传输时间，包含环境模拟时延
-decode_time_per_token_ms           (decode_comp_time_ms + decode_transfer_time_ms) / decode_step_count
-                                  只统计 prefill 之后继续自回归的 decode；cloud-base 的 first token 不计入
-```
+$$
+T_{arm}=\max(T_0,T_1,T_2)
+$$
 
-summary 主要包含：
+固定 decode step 后，单位 step 成本和便于观察的分数为：
 
-```text
-当前 batch 的 PREFILL_MODE
-当前 batch 的 layer_allocation
-当前 batch 的 Environment 带宽和通信时延
-每个 rank 当前 batch 的 Distributed / Cloud-base 汇总时间
-非当前 PREFILL_MODE 的 summary 栏目会写 not applicable
-```
+$$
+C_{arm}=\frac{T_{arm}}{\max(1,N_{decode})},\qquad
+S_{arm}=\frac{1}{1+C_{arm}/100}
+$$
 
-## 排查建议
+排名按 $C_{arm}$ 从小到大。该模式不更新 reward，不执行 UCB 探索，也不淘汰 arm。
 
-1. 三台机器代码必须一致，尤其是 `environment.py`、`inference_loops.py`、`experiment_report.py`、`pipeline_comm.py`、`kv_cache_transfer.py`、`bandwidth_transfer.py`。
-2. 三台机器的 `WORLD_SIZE_VALUE`、`SPLIT_LAYERS`、`INIT_METHOD` 必须一致。
-3. `PREFILL_MODE`、`scheduler.csv` 和 `environment.py` 以 Rank 0 为准。
-4. 如果 NCCL 报网络错误，优先检查 `NCCL_SOCKET_IFNAME` 是否是互通网卡。
-5. 如果 `cloud-base` 显存过高，注意 Rank 2 会同时持有完整 prefill model 和自己的 decode 分区。
+## 注意事项
+
+1. `FORCE_DECODE_STEPS` 必须设置为正整数，默认 128，保证所有 arm 的 decode 工作量一致。
+2. 同一逻辑 batch 的 210 个 arm 使用同一个 Environment batch 状态。
+3. arm 顺序采用固定随机种子并在不同逻辑 batch 间轮转，减少固定执行位置带来的系统偏差。
+4. 程序不暗中增加预热执行，因此总次数严格为 $210D$。首次 CUDA/模型调用的冷启动影响应在离线分析时单独标记。
+5. 三台机器必须同步 `scheduler.py`、`inference_loops.py`、`config.py` 和 `lipschitz_validation_experiment.py`。

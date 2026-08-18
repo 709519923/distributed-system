@@ -1651,3 +1651,117 @@ $$
 - 进一步规避同类 SDPA 内部 mask-layout 问题：模型加载时强制 `attn_implementation=eager`，避免 Transformers 在 `batch_size > 1` 时进入 `scaled_dot_product_attention()` 的非连续 bias 路径。
 - 将上述 eager attention 兜底改回更直接的 shape 修复：进入 `model.model()` 前显式检查 `[B,Q,H]` / `[B,K]` / `[B,Q]` 的一致性，并由项目代码构造连续的 4D attention bias `[B,1,Q,K]`，避免 Transformers 内部从 2D mask 生成非连续 SDPA bias。
 - 根据单节点 `inspect_kv_cache.py` 输出，确认当前 Transformers 返回 `DynamicCache.layers[i].keys / values`。`kv_cache_utils.py` 已补充该结构的统计路径，`kv_cache_size_mb_after_prefill` 后续应能显示非零值。
+## 2026-08-18
+
+### Lipschitz 可行性验证实验
+
+#### 实验目标
+
+本次改动增加独立的 `lipschitz_validation` 模式，用同一个逻辑 prompt batch 穷举三节点 TinyLlama 的所有合法层切分。它用于采集 arm 到真实性能的完整映射，后续再离线判断层切分空间是否满足或近似满足 Lipschitz 条件；该模式本身不运行在线 bandit 学习。
+
+TinyLlama 有 22 个 decoder layer，三节点切分 arm 记作 $a=(p_1,p_2)$：
+
+$$
+0<p_1<p_2<22
+$$
+
+对应的层分配为：
+
+$$
+\text{Rank 0}=[0,p_1),\quad
+\text{Rank 1}=[p_1,p_2),\quad
+\text{Rank 2}=[p_2,22)
+$$
+
+候选 arm 不再手工列出 20 个组合，而是由代码完整生成：
+
+$$
+|\mathcal A|=\binom{21}{2}=210
+$$
+
+启动时会检查 arm 数、重复项和集合完整性。模型层数、节点数或候选集合不符合实验定义时直接报错，避免只运行了部分 arm 却被误认为完整穷举。
+
+#### 逻辑 batch 与执行 batch
+
+原有通信协议要求每次边界广播、模型切换和指标回传使用唯一递增的 batch 编号。为了让一组 prompt 重复运行 210 次，本次引入两级编号：
+
+- `logical_batch`：输入 CSV 按 `BATCH_SIZE` 切分后的 prompt batch。
+- `execution_batch`：某个逻辑 batch 下某个 arm 的真实三节点执行编号。
+
+$$
+execution\_batch=(logical\_batch-1)\times210+execution\_order
+$$
+
+若输入有 $N$ 个 prompt，batch size 为 $B$，则：
+
+$$
+D=\left\lceil\frac{N}{B}\right\rceil
+$$
+
+$$
+N_{exec}=210D
+$$
+
+因此多个 prompt 会连续产生数据：逻辑 batch 1 跑完全部 210 个 arm 并完成排名后，再进入逻辑 batch 2。工作节点不需要知道逻辑 batch，它们继续按原协议处理连续的 `execution_batch`。
+
+#### 公平性处理
+
+- `run.sh` 默认设置 `FORCE_DECODE_STEPS=128`，且验证模式强制检查该参数，避免 EOS 不同造成 arm 工作量不一致。
+- 同一逻辑 batch 的 210 次执行调用同一个 `Environment` batch 状态。即使物理执行编号不同，也不会在 arm 扫描中途切换带宽或固定通信延迟。
+- arm 使用固定随机种子打乱，并按逻辑 batch 轮转执行顺序，降低时间漂移总是作用于同一 arm 的偏差。
+- 不增加隐藏预热轮次，使总执行次数严格等于 $210D$。首次执行可能包含冷启动，结果文件保留 `execution_order`，离线分析时可识别该样本。
+
+#### 性能指标和排名
+
+每个 arm 仍使用项目现有的逐 rank 计时字段。`distributed` 模式下：
+
+$$
+T_r=T_{prefill,comp}+T_{prefill,transfer}+T_{decode,comp}+T_{decode,transfer}
+$$
+
+`cloud-base` 模式下：
+
+$$
+T_r=T_{cloud\_prefill}+T_{kv,send}+T_{kv,recv}+T_{decode,comp}+T_{decode,transfer}
+$$
+
+取三个节点中最慢的一个作为 arm 的瓶颈时间：
+
+$$
+T_a=\max_{r\in\{0,1,2\}}T_r
+$$
+
+单位 decode step 成本和展示分数为：
+
+$$
+C_a=\frac{T_a}{\max(1,N_{decode})}
+$$
+
+$$
+S_a=\frac{1}{1+C_a/100}
+$$
+
+最终 `arm_ranking` 按 $C_a$ 从小到大排列。`measured_score` 仅是 $C_a$ 的单调映射，方便与旧日志比较；它不含探索项，也不会传播到其他 arm。
+
+#### 连续落盘设计
+
+新增 `lipschitz_validation_experiment.py`，将穷举实验从在线 Scheduler 策略中解耦。它负责执行计划、arm 身份、性能计算和结果持久化：
+
+1. 每个 arm 完成后立即追加 `lipschitz_validation_raw_*.csv` 并执行 `flush + fsync`。
+2. 生成文本同时追加到 `lipschitz_validation_outputs.csv`，避免全部实验完成前数据只留在内存。
+3. 同一逻辑 batch 收齐 210 行后，计算完整排名并追加到 `lipschitz_validation_ranked_*.csv`。
+4. 若程序中途失败，raw 和 output 文件保留所有已完成 arm；ranked 文件只包含完整跑完 210 个 arm 的逻辑 batch。
+
+#### 与在线策略的隔离
+
+`lipschitz_validation` 使用独立的非学习 policy。主循环直接按实验计划指定当前 arm，并继续借用 Scheduler 的 `reallocate_layer()` 写边界。每次执行仍收集原有 summary，但不会调用 `update_policy_after_batch()`，因此不会发生 reward 更新、UCB 探索、Lipschitz 邻域传播或 arm elimination。原有 `ucb`、`contextual`、`lipschitz` 的选择和更新公式没有改动，但本验证分支的共享 `CANDIDATE_ARMS` 已扩展为 210 个；依赖固定 20 arm、600-batch 协议的 `contextual_controlled` 不应在本验证分支中运行。
+
+#### 修改文件
+
+- `scheduler.py`：程序化生成 210 个 TinyLlama arm，注册非学习的 `LipschitzValidationPolicy`。
+- `lipschitz_validation_experiment.py`：新增穷举计划、即时原始结果、完整排名和增量输出功能。
+- `inference_loops.py`：增加逻辑 batch / 执行 batch 双层循环，并在验证模式跳过在线 policy 更新。
+- `config.py`：增加 `lipschitz_validation` 策略选项。
+- `run.sh`：默认切换到验证策略、专用 scheduler/输入/输出文件，并固定 128 个 decode step。
+- `dataset/lipschitz_validation_prompts.csv`：提供可直接替换的单列 prompt 示例。
+- `README.md`：重写为本验证分支的运行说明和结果字段说明。

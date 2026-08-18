@@ -152,6 +152,7 @@ def parse_args():
             "contextual",
             "contextual_controlled",
             "lipschitz",
+            "lipschitz_validation",
             "contextual_lipschitz",
         ),
         default="ucb",
@@ -159,7 +160,8 @@ def parse_args():
             "Rank 0 scheduler bandit policy. Default: ucb. contextual uses "
             "current-batch prompt context before selecting the current arm. "
             "contextual_controlled uses the labeled 600-batch learning and "
-            "300-batch evaluation protocol."
+            "300-batch evaluation protocol. lipschitz_validation exhaustively "
+            "runs every valid TinyLlama three-rank split for each prompt batch."
         ),
     )
     parser.add_argument(

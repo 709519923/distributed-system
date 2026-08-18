@@ -6,15 +6,15 @@ WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
 PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
-SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
-BANDIT_POLICY=${BANDIT_POLICY:-contextual_controlled}
+SCHEDULER_CSV=${SCHEDULER_CSV:-lipschitz_validation_scheduler.csv}
+BANDIT_POLICY=${BANDIT_POLICY:-lipschitz_validation}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.130:29510}
 COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/contextual_bandit_test_tinyllama.csv}
-OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/lipschitz_validation_prompts.csv}
+OUTPUT_CSV=${OUTPUT_CSV:-lipschitz_validation_outputs.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
-FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
 
 FORCE_DECODE_STEPS_ARG=""
 if [ -n "$FORCE_DECODE_STEPS" ]; then

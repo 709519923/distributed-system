@@ -44,6 +44,7 @@ from kv_cache_utils import (
     synchronize_cuda,
 )
 from incremental_layer_partition import IncrementalLayerPartition
+from lipschitz_validation_experiment import LipschitzValidationExperiment
 from model_forward import choose_next_token, rank0_forward, rank1_forward_logits, rank_middle_forward
 from model_loader import get_total_layers_from_config, load_full_model_for_prefill, load_model_part
 from pipeline_comm import (
@@ -986,6 +987,7 @@ def rank0_generate_dynamic(
     total_layers = get_total_layers_from_config(args.model_dir)
     default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
     scheduler = None
+    validation_experiment = None
     batch_contexts = {}
     if args.allocation_csv:
         scheduler = Scheduler(
@@ -1010,6 +1012,28 @@ def rank0_generate_dynamic(
                 )
                 batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
 
+    if args.bandit_policy == "lipschitz_validation":
+        if scheduler is None:
+            raise ValueError("lipschitz_validation requires --allocation-csv.")
+        if args.force_decode_steps is None or int(args.force_decode_steps) <= 0:
+            raise ValueError(
+                "lipschitz_validation requires a positive --force-decode-steps "
+                "so every arm performs the same amount of decode work."
+            )
+        validation_experiment = LipschitzValidationExperiment(
+            candidate_arms=scheduler.bandit.arms,
+            total_layers=total_layers,
+            world_size=world_size,
+            output_csv=args.output_csv,
+        )
+        print(
+            "[Rank 0] Lipschitz validation enabled: "
+            f"logical_batches={(len(prompts) + args.batch_size - 1) // args.batch_size}; "
+            f"arms_per_batch={validation_experiment.arm_count}; "
+            f"raw_results={validation_experiment.raw_result_path}; "
+            f"ranked_results={validation_experiment.ranked_result_path}"
+        )
+
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
     all_rows = []
@@ -1018,12 +1042,37 @@ def rank0_generate_dynamic(
     current_stage = None
 
     try:
-        for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
-            batch_context = batch_contexts.get(batch_number)
+        prompt_batches = chunk_items(prompts, args.batch_size)
+        if validation_experiment is not None:
+            execution_plan = (
+                (
+                    trial.logical_batch,
+                    trial.execution_batch,
+                    trial.start_index,
+                    list(trial.prompt_batch),
+                    trial,
+                )
+                for trial in validation_experiment.iter_trials(prompt_batches)
+            )
+        else:
+            execution_plan = (
+                (batch_number, batch_number, start_index, prompt_batch, None)
+                for batch_number, start_index, prompt_batch in prompt_batches
+            )
+
+        for logical_batch, batch_number, start_index, prompt_batch, trial in execution_plan:
+            batch_context = batch_contexts.get(logical_batch)
             forced_output_tokens = None
             if args.bandit_policy == "contextual_controlled" and batch_context is not None:
                 forced_output_tokens = batch_context.get("target_output_tokens")
-            if scheduler is not None:
+            if validation_experiment is not None:
+                selected_arm = trial.arm
+                boundaries = scheduler.reallocate_layer(
+                    batch=batch_number,
+                    arm=selected_arm,
+                )
+                allocation = scheduler.get_or_create(batch_number)
+            elif scheduler is not None:
                 selected_arm = scheduler.select_arm_before_batch(
                     batch=batch_number,
                     context=batch_context,
@@ -1062,6 +1111,13 @@ def rank0_generate_dynamic(
                 f"[Rank 0] Batch {batch_number}: {interval_text}; "
                 f"prompts={len(prompt_batch)}"
             )
+            if validation_experiment is not None:
+                print(
+                    f"[Rank 0] Lipschitz validation logical_batch={logical_batch}; "
+                    f"arm={trial.arm_index}/{validation_experiment.arm_count} "
+                    f"(execution_order={trial.execution_order}, split={trial.arm}); "
+                    f"execution_batch={batch_number}"
+                )
             if args.bandit_policy == "contextual_controlled":
                 target_text = (
                     str(forced_output_tokens)
@@ -1082,7 +1138,9 @@ def rank0_generate_dynamic(
             )
             broadcast_boundaries(boundaries, world_size, comm_device, rank=0)
             if environment is not None:
-                environment.apply_batch(batch_number)
+                # All 210 physical executions of one logical prompt batch must
+                # observe the same simulated network state.
+                environment.apply_batch(logical_batch)
                 environment = broadcast_environment(environment, rank=0, device=comm_device)
                 print(f"[Rank 0] Batch {batch_number}: environment={environment.describe()}")
             if model is None:
@@ -1176,7 +1234,10 @@ def rank0_generate_dynamic(
                     environment=environment,
                     forced_output_tokens=forced_output_tokens,
                 )
-            all_rows.extend(rows)
+            if validation_experiment is not None:
+                validation_experiment.append_generated_rows(trial, rows)
+            else:
+                all_rows.extend(rows)
 
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
@@ -1189,7 +1250,16 @@ def rank0_generate_dynamic(
                     context=batch_context,
                     selected_arm=selected_arm,
                 )
-                scheduler.update_policy_after_batch(batch_number)
+                if validation_experiment is None:
+                    scheduler.update_policy_after_batch(batch_number)
+            best_row = None
+            if validation_experiment is not None:
+                best_row = validation_experiment.record_trial(
+                    trial=trial,
+                    records=records,
+                    prefill_mode=args.prefill_mode,
+                    boundaries=boundaries,
+                )
             append_experiment_log(log_path, records)
             append_summary_log(
                 log_path,
@@ -1201,8 +1271,21 @@ def rank0_generate_dynamic(
             )
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
+            if best_row is not None:
+                print(
+                    f"[Rank 0] Logical batch {logical_batch} ranking complete; "
+                    f"best_arm=({best_row['p1']},{best_row['p2']}); "
+                    "cost_per_decode_step_ms="
+                    f"{best_row['cost_per_decode_step_ms']}."
+                )
 
-        write_output_rows(args.output_csv, all_rows)
+        if validation_experiment is None:
+            write_output_rows(args.output_csv, all_rows)
+        else:
+            print(
+                f"[Rank 0] Validation outputs were written incrementally to "
+                f"{validation_experiment.output_path}"
+            )
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
     finally:
         if layer_partition is not None:

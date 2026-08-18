@@ -158,27 +158,13 @@ LIPSCHITZ_MAX_SLOPE = 10.0
 LIPSCHITZ_SAFETY_FACTOR = 1.1
 LIPSCHITZ_ELIMINATION_MARGIN = 0.0
 
+# TinyLlama has 22 decoder layers. Enumerating all 0 < p1 < p2 < 22
+# produces C(21, 2) = 210 valid three-rank layer allocations.
+TINYLLAMA_TOTAL_LAYERS = 22
 CANDIDATE_ARMS = [
-    (1, 5),
-    (1, 7),
-    (1, 9),
-    (1, 11),
-    (1, 13),
-    (1, 15),
-    (1, 17),
-    (3, 7),
-    (3, 11),
-    (3, 15),
-    (3, 19),
-    (5, 7),
-    (5, 11),
-    (5, 13),
-    (5, 15),
-    (5, 17),
-    (9, 12),
-    (9, 14),
-    (9, 16),
-    (9, 18),
+    (p1, p2)
+    for p1 in range(1, TINYLLAMA_TOTAL_LAYERS)
+    for p2 in range(p1 + 1, TINYLLAMA_TOTAL_LAYERS)
 ]
 
 
@@ -1247,11 +1233,28 @@ class ContextualLipschitzBanditPolicy(ContextualBanditPolicy):
         return distance / max(float(self.total_layers), 1.0)
 
 
+class LipschitzValidationPolicy(LayerBanditPolicy):
+    """Non-learning policy used by the exhaustive Lipschitz experiment.
+
+    The Rank 0 experiment driver chooses every arm explicitly. This policy only
+    exposes the validated candidate-arm list through Scheduler and deliberately
+    performs no UCB/Lipschitz update, exploration, or elimination.
+    """
+
+    policy_name = "lipschitz_validation"
+
+    def update_after_batch(self, batch, batch_summary_history):
+        _ = batch
+        _ = batch_summary_history
+        return self.current_arm
+
+
 BANDIT_POLICY_CLASSES = {
     "ucb": LayerBanditPolicy,
     "contextual": ContextualBanditPolicy,
     "contextual_controlled": ContextualControlledBanditPolicy,
     "lipschitz": LipschitzBanditPolicy,
+    "lipschitz_validation": LipschitzValidationPolicy,
     "contextual_lipschitz": ContextualLipschitzBanditPolicy,
 }
 
