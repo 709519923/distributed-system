@@ -1706,7 +1706,7 @@ $$
 
 #### 公平性处理
 
-- `run.sh` 默认设置 `FORCE_DECODE_STEPS=128`，且验证模式强制检查该参数，避免 EOS 不同造成 arm 工作量不一致。
+- 验证模式不再使用统一的 `FORCE_DECODE_STEPS`。每个逻辑 batch 从 CSV 的 `target_output_tokens` 字段读取受控输出长度，同一 prompt 的全部 210 个 arm 使用同一个目标值，从而保证该场景内部比较公平。
 - 同一逻辑 batch 的 210 次执行调用同一个 `Environment` batch 状态。即使物理执行编号不同，也不会在 arm 扫描中途切换带宽或固定通信延迟。
 - arm 使用固定随机种子打乱，并按逻辑 batch 轮转执行顺序，降低时间漂移总是作用于同一 arm 的偏差。
 - 不增加隐藏预热轮次，使总执行次数严格等于 $210D$。首次执行可能包含冷启动，结果文件保留 `execution_order`，离线分析时可识别该样本。
@@ -1762,6 +1762,26 @@ $$
 - `lipschitz_validation_experiment.py`：新增穷举计划、即时原始结果、完整排名和增量输出功能。
 - `inference_loops.py`：增加逻辑 batch / 执行 batch 双层循环，并在验证模式跳过在线 policy 更新。
 - `config.py`：增加 `lipschitz_validation` 策略选项。
-- `run.sh`：默认切换到验证策略、专用 scheduler/输入/输出文件，并固定 128 个 decode step。
-- `dataset/lipschitz_validation_prompts.csv`：提供可直接替换的单列 prompt 示例。
+- `run.sh`：默认切换到验证策略和专用 scheduler/输入/输出文件；`FORCE_DECODE_STEPS` 保持为空，输出长度由 CSV label 控制。
+- `dataset/lipschitz_validation_prompts.csv`：从 A/B/C 三个单场景数据集各取第一条，写入 `prompt,scenario,request_type,target_output_tokens` 四列。
 - `README.md`：重写为本验证分支的运行说明和结果字段说明。
+
+#### Label 控制的输出长度修正
+
+本实验的三个场景使用 ground-truth 数据准备阶段已经定义的目标输出长度：
+
+| 场景 | request_type | target_output_tokens |
+|---|---|---:|
+| A | `long_input_short_output` | 90 |
+| B | `short_input_long_output` | 400 |
+| C | `medium_input_medium_output` | 256 |
+
+`csv_io.py` 新增验证数据读取与字段检查。`inference_loops.py` 根据当前逻辑 batch 的 label 设置 `forced_output_tokens`，而不是使用一个全局固定 step。`lipschitz_validation_experiment.py` 将场景、请求类型和目标输出长度同步写入 raw、ranked 和生成文本结果，方便按场景分析。
+
+由于 prefill 已经生成首个 token，`target_output_tokens=N` 表示最终保存 $N$ 个 token ID，而需要执行的 decode forward 次数为：
+
+$$
+N_{decode}=N_{target\_output}-1
+$$
+
+验证模式要求 `BATCH_SIZE=1`，并拒绝同时设置 `--force-decode-steps`，防止全局参数和行级 label 出现两套互相冲突的控制来源。

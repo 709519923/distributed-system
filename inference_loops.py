@@ -15,6 +15,7 @@ from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_f
 from csv_io import (
     chunk_items,
     read_contextual_controlled_rows,
+    read_lipschitz_validation_rows,
     read_prompts,
     write_output_rows,
 )
@@ -956,6 +957,7 @@ def rank0_generate_dynamic(
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
     controlled_rows = None
+    validation_rows = None
     if args.bandit_policy == "contextual_controlled":
         if not args.csv_has_header:
             raise ValueError("contextual_controlled requires --csv-has-header.")
@@ -977,6 +979,21 @@ def rank0_generate_dynamic(
                 f"got {len(controlled_rows)}."
             )
         prompts = [row["prompt"] for row in controlled_rows]
+    elif args.bandit_policy == "lipschitz_validation":
+        if not args.csv_has_header:
+            raise ValueError("lipschitz_validation requires --csv-has-header.")
+        if int(args.batch_size) != 1:
+            raise ValueError("lipschitz_validation requires --batch-size 1.")
+        if args.force_decode_steps is not None:
+            raise ValueError(
+                "lipschitz_validation reads target_output_tokens from CSV and "
+                "cannot be combined with --force-decode-steps."
+            )
+        validation_rows = read_lipschitz_validation_rows(
+            args.input_csv,
+            args.prompt_column,
+        )
+        prompts = [row["prompt"] for row in validation_rows]
     else:
         prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
     if not prompts:
@@ -1015,16 +1032,12 @@ def rank0_generate_dynamic(
     if args.bandit_policy == "lipschitz_validation":
         if scheduler is None:
             raise ValueError("lipschitz_validation requires --allocation-csv.")
-        if args.force_decode_steps is None or int(args.force_decode_steps) <= 0:
-            raise ValueError(
-                "lipschitz_validation requires a positive --force-decode-steps "
-                "so every arm performs the same amount of decode work."
-            )
         validation_experiment = LipschitzValidationExperiment(
             candidate_arms=scheduler.bandit.arms,
             total_layers=total_layers,
             world_size=world_size,
             output_csv=args.output_csv,
+            labeled_rows=validation_rows,
         )
         print(
             "[Rank 0] Lipschitz validation enabled: "
@@ -1063,7 +1076,9 @@ def rank0_generate_dynamic(
         for logical_batch, batch_number, start_index, prompt_batch, trial in execution_plan:
             batch_context = batch_contexts.get(logical_batch)
             forced_output_tokens = None
-            if args.bandit_policy == "contextual_controlled" and batch_context is not None:
+            if validation_experiment is not None:
+                forced_output_tokens = trial.target_output_tokens
+            elif args.bandit_policy == "contextual_controlled" and batch_context is not None:
                 forced_output_tokens = batch_context.get("target_output_tokens")
             if validation_experiment is not None:
                 selected_arm = trial.arm
@@ -1116,7 +1131,8 @@ def rank0_generate_dynamic(
                     f"[Rank 0] Lipschitz validation logical_batch={logical_batch}; "
                     f"arm={trial.arm_index}/{validation_experiment.arm_count} "
                     f"(execution_order={trial.execution_order}, split={trial.arm}); "
-                    f"execution_batch={batch_number}"
+                    f"execution_batch={batch_number}; scenario={trial.scenario}; "
+                    f"target_output_tokens={trial.target_output_tokens}"
                 )
             if args.bandit_policy == "contextual_controlled":
                 target_text = (

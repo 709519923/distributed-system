@@ -75,6 +75,63 @@ def read_contextual_controlled_rows(csv_path, prompt_column):
     return records
 
 
+def read_lipschitz_validation_rows(csv_path, prompt_column):
+    """Read label-controlled rows for exhaustive Lipschitz validation."""
+    records = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("lipschitz_validation requires a CSV header.")
+
+        prompt_key = prompt_column or reader.fieldnames[0]
+        required = {
+            prompt_key,
+            "scenario",
+            "request_type",
+            "target_output_tokens",
+        }
+        missing = sorted(required.difference(reader.fieldnames))
+        if missing:
+            raise ValueError(
+                "lipschitz_validation CSV is missing columns: "
+                + ", ".join(missing)
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            prompt = (row.get(prompt_key) or "").strip()
+            scenario = (row.get("scenario") or "").strip().upper()
+            request_type = (row.get("request_type") or "").strip()
+            if not prompt:
+                raise ValueError(
+                    f"lipschitz_validation CSV row {row_number} has an empty prompt."
+                )
+            if not scenario or not request_type:
+                raise ValueError(
+                    f"lipschitz_validation CSV row {row_number} has an empty label."
+                )
+            try:
+                target_output_tokens = int(row.get("target_output_tokens", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "lipschitz_validation CSV row "
+                    f"{row_number} has invalid target_output_tokens."
+                ) from exc
+            if target_output_tokens <= 0:
+                raise ValueError(
+                    "lipschitz_validation CSV row "
+                    f"{row_number} target_output_tokens must be positive."
+                )
+            records.append(
+                {
+                    "prompt": prompt,
+                    "scenario": scenario,
+                    "request_type": request_type,
+                    "target_output_tokens": target_output_tokens,
+                }
+            )
+    return records
+
+
 def chunk_items(items, batch_size):
     """Yield (batch_number, start_index, chunk) for dynamic prompt batching.
 

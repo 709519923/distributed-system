@@ -14,7 +14,7 @@ MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/lipschitz_validation_prompts.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-lipschitz_validation_outputs.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
-FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
+FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 
 FORCE_DECODE_STEPS_ARG=""
 if [ -n "$FORCE_DECODE_STEPS" ]; then

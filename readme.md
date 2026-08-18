@@ -16,7 +16,7 @@ BANDIT_POLICY=lipschitz_validation
 MODEL_DIR=/home/dingcong/models/TinyLlama
 INPUT_CSV=./dataset/lipschitz_validation_prompts.csv
 OUTPUT_CSV=lipschitz_validation_outputs.csv
-FORCE_DECODE_STEPS=128
+FORCE_DECODE_STEPS=
 ```
 
 `lipschitz_validation` 只支持三节点 TinyLlama。22 个 decoder layer 的所有合法 arm 为：
@@ -46,21 +46,30 @@ Rank 0 读取 CSV、生成 210 个 arm 的执行计划并广播切分点；Rank 
 
 ## 输入数据
 
-CSV 只需要 `prompt` 表头：
+验证 CSV 必须包含 label 和目标输出 token 数：
 
 ```csv
-prompt
-Your first prompt
-Your second prompt
+prompt,scenario,request_type,target_output_tokens
+...,A,long_input_short_output,90
+...,B,short_input_long_output,400
+...,C,medium_input_medium_output,256
 ```
 
-程序支持任意数量的 prompt。设 prompt 数为 $N$，`BATCH_SIZE` 为 $B$，则逻辑 batch 数和真实三节点执行次数分别为：
+当前 `lipschitz_validation_prompts.csv` 从 `single_scenario_a/b/c_500.csv` 各取第一条，共三个逻辑 batch。验证模式要求 `BATCH_SIZE=1`，每个逻辑 batch 的全部 210 个 arm 都使用该行的 `target_output_tokens`。因此本数据集总共执行 $3\times210=630$ 次三节点推理。
+
+`target_output_tokens` 表示最终保存的 token ID 总数，包含 prefill 后直接得到的首 token。因此对应的实际 `decode_step_count` 通常为：
+
+```text
+A: target_output_tokens=90  -> decode_step_count=89
+B: target_output_tokens=400 -> decode_step_count=399
+C: target_output_tokens=256 -> decode_step_count=255
+```
+
+若以后换成包含 $N$ 行 label 数据的 CSV，则逻辑 batch 数和真实三节点执行次数为：
 
 $$
-D=\left\lceil\frac{N}{B}\right\rceil,\qquad N_{exec}=210D
+D=N,\qquad N_{exec}=210N
 $$
-
-建议使用 `BATCH_SIZE=1`，这样每个逻辑 batch 对应一个 prompt，得到的是 prompt 级 ground truth。`BATCH_SIZE>1` 时，排名表示整个 tensor batch 的性能。
 
 ## 输出文件
 
@@ -92,7 +101,7 @@ $$
 T_{arm}=\max(T_0,T_1,T_2)
 $$
 
-固定 decode step 后，单位 step 成本和便于观察的分数为：
+由 label 控制输出长度后，单位 decode step 成本和便于观察的分数为：
 
 $$
 C_{arm}=\frac{T_{arm}}{\max(1,N_{decode})},\qquad
@@ -103,7 +112,7 @@ $$
 
 ## 注意事项
 
-1. `FORCE_DECODE_STEPS` 必须设置为正整数，默认 128，保证所有 arm 的 decode 工作量一致。
+1. `FORCE_DECODE_STEPS` 必须保持为空；验证模式从当前 CSV 行读取 `target_output_tokens`，若同时设置固定 step 会直接报错。
 2. 同一逻辑 batch 的 210 个 arm 使用同一个 Environment batch 状态。
 3. arm 顺序采用固定随机种子并在不同逻辑 batch 间轮转，减少固定执行位置带来的系统偏差。
 4. 程序不暗中增加预热执行，因此总次数严格为 $210D$。首次 CUDA/模型调用的冷启动影响应在离线分析时单独标记。

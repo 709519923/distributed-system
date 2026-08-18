@@ -29,6 +29,9 @@ class ValidationTrial:
     arm_index: int
     execution_order: int
     arm: tuple
+    scenario: str
+    request_type: str
+    target_output_tokens: int
 
 
 class LipschitzValidationExperiment:
@@ -37,6 +40,9 @@ class LipschitzValidationExperiment:
     result_fieldnames = [
         "timestamp",
         "prefill_mode",
+        "scenario",
+        "request_type",
+        "target_output_tokens",
         "logical_batch",
         "execution_batch",
         "arm_index",
@@ -66,6 +72,9 @@ class LipschitzValidationExperiment:
         "execution_order",
         "p1",
         "p2",
+        "scenario",
+        "request_type",
+        "target_output_tokens",
         "prompt",
         "generated_text",
         "full_text",
@@ -77,12 +86,16 @@ class LipschitzValidationExperiment:
         total_layers,
         world_size,
         output_csv,
+        labeled_rows,
         result_directory="bandit_logs",
     ):
         self.total_layers = int(total_layers)
         self.world_size = int(world_size)
         self.candidate_arms = [tuple(int(value) for value in arm) for arm in candidate_arms]
         self._validate_candidate_arms()
+        self.labeled_rows = [dict(row) for row in labeled_rows]
+        if not self.labeled_rows:
+            raise ValueError("lipschitz_validation requires at least one labeled row")
 
         self.arm_to_index = {
             arm: index for index, arm in enumerate(self.candidate_arms, start=1)
@@ -114,6 +127,12 @@ class LipschitzValidationExperiment:
         """Yield every arm for every logical batch with unique execution IDs."""
         execution_batch = 0
         for logical_batch, start_index, prompt_batch in prompt_batches:
+            label_index = int(logical_batch) - 1
+            if label_index >= len(self.labeled_rows):
+                raise ValueError(
+                    f"logical_batch={logical_batch} has no matching labeled CSV row"
+                )
+            label = self.labeled_rows[label_index]
             # Rotate the deterministic shuffle so chronological drift does not
             # always affect the same arm at the same position in every batch.
             rotation = (int(logical_batch) - 1) % self.arm_count
@@ -130,6 +149,9 @@ class LipschitzValidationExperiment:
                     arm_index=self.arm_to_index[arm],
                     execution_order=execution_order,
                     arm=arm,
+                    scenario=str(label["scenario"]),
+                    request_type=str(label["request_type"]),
+                    target_output_tokens=int(label["target_output_tokens"]),
                 )
 
     def append_generated_rows(self, trial, rows):
@@ -144,6 +166,9 @@ class LipschitzValidationExperiment:
                     "execution_order": trial.execution_order,
                     "p1": trial.arm[0],
                     "p2": trial.arm[1],
+                    "scenario": trial.scenario,
+                    "request_type": trial.request_type,
+                    "target_output_tokens": trial.target_output_tokens,
                     "prompt": row.get("prompt", ""),
                     "generated_text": row.get("generated_text", ""),
                     "full_text": row.get("full_text", ""),
@@ -176,6 +201,9 @@ class LipschitzValidationExperiment:
         row = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "prefill_mode": prefill_mode,
+            "scenario": trial.scenario,
+            "request_type": trial.request_type,
+            "target_output_tokens": trial.target_output_tokens,
             "logical_batch": trial.logical_batch,
             "execution_batch": trial.execution_batch,
             "arm_index": trial.arm_index,
