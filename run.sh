@@ -11,8 +11,8 @@ BANDIT_POLICY=${BANDIT_POLICY:-ground_truth}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.130:29510}
 COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-test.csv}
-OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-def-slice001-050.csv}
+OUTPUT_CSV=${OUTPUT_CSV:-outputs_ground_truth_def_slice001_050.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-2000}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 

@@ -21,14 +21,16 @@
 ```bash
 BANDIT_POLICY=${BANDIT_POLICY:-ground_truth}
 BATCH_SIZE=${BATCH_SIZE:-1}
-INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-test.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/ground-truth-def-slice001-050.csv}
+OUTPUT_CSV=${OUTPUT_CSV:-outputs_ground_truth_def_slice001_050.csv}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 ```
 
 `ground_truth` 会让每个数据集 batch 在 `scheduler.py` 的全部
 `CANDIDATE_ARMS` 上各执行一次。臂数不固定：若列表有 $K$ 个臂、输入有
 $D$ 行，则自动执行 $D\times K$ 个物理 batch。当前 10 个臂和 150 行输入
-对应 1500 次执行。
+对应 1500 次执行。完整 D/E/F 数据集按每种场景 50 行拆成 10 个 slice；建议
+逐片运行，并为后续 slice 同时覆盖 `INPUT_CSV` 和 `OUTPUT_CSV`，避免覆盖已完成结果。
 
 输入 CSV 字段为：
 
@@ -43,8 +45,8 @@ bandit_logs/arm_details_ground_truth_YYYY-MM-DD-HH-MM.csv
 ```
 
 每个逻辑 batch 完成全部臂后写入 $K$ 行，`arm_ranking=1` 表示该请求下
-实测最优臂。三类受控输出为 A=90、B=400、C=256 个最终 token ID；因此
-对应的 `decode_step_count` 通常为 89、399、255。
+实测最优臂。当前三类差异化受控输出为 D=32、E=768、F=512 个最终 token ID；
+对应的 `decode_step_count` 通常为 31、767、511。旧 A/B/C 数据仍受代码兼容。
 
 ## run.sh 配置
 

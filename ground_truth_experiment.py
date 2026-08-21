@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+GROUND_TRUTH_CONTEXT_LIMIT = 2048
+GROUND_TRUTH_SPECIAL_TOKEN_HEADROOM = 1
+
+
 GROUND_TRUTH_SCENARIOS = {
     "A": {
         "request_type": "long_input_short_output",
@@ -29,6 +33,24 @@ GROUND_TRUTH_SCENARIOS = {
         "input_min": 200,
         "input_max": 600,
         "target_output_tokens": 256,
+    },
+    "D": {
+        "request_type": "extreme_prefill",
+        "input_min": 1500,
+        "input_max": 1800,
+        "target_output_tokens": 32,
+    },
+    "E": {
+        "request_type": "extreme_decode",
+        "input_min": 10,
+        "input_max": 64,
+        "target_output_tokens": 768,
+    },
+    "F": {
+        "request_type": "long_context_decode",
+        "input_min": 800,
+        "input_max": 1100,
+        "target_output_tokens": 512,
     },
 }
 
@@ -230,6 +252,17 @@ class GroundTruthExperiment:
                 f"Dataset batch {trial.dataset_batch} scenario {trial.scenario} has "
                 f"input_token_length={input_token_length}; expected "
                 f"[{spec['input_min']},{spec['input_max']}]."
+            )
+        required_context = (
+            input_token_length
+            + int(trial.target_output_tokens)
+            + GROUND_TRUTH_SPECIAL_TOKEN_HEADROOM
+        )
+        if required_context > GROUND_TRUTH_CONTEXT_LIMIT:
+            raise ValueError(
+                f"Dataset batch {trial.dataset_batch} scenario {trial.scenario} "
+                f"requires {required_context} context tokens; limit is "
+                f"{GROUND_TRUTH_CONTEXT_LIMIT}."
             )
 
     def record_trial(self, trial, records, prefill_mode):

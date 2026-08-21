@@ -1,5 +1,122 @@
 # Version Log
 
+## 2026-08-21
+
+### Ground Truth D/E/F 差异化场景与数据集
+
+#### 设计动机
+
+对本机已有的 6 份 ground-truth 结果进行汇总后，每种旧场景覆盖 300 个逻辑
+batch。A 的 best/second-best 相对 cost 差距中位数只有 0.63%，并且 300 次中有
+299 次由 Rank 0 构成瓶颈；`(1,11)`、`(1,13)`、`(1,15)`、`(1,17)` 的平均
+cost 分别为 12.552、12.538、12.537、12.552 ms/token。由于这些 arm 给 Rank 0
+分配的层数完全相同，当 Rank 0 已经决定流水线吞吐时，改变第二个切分点不会改变
+`max(rank_time)`，因此它们形成真实的近似等价平台，而不只是样本量不足。
+
+B 和 C 已开始集中到 `(1,13)`、`(1,15)`，但 best/second-best 差距中位数仍只有
+0.86% 和 0.54%。已有 900 个逻辑 batch 中 `(3,x)` 没有成为过 best arm，说明
+同一硬件条件下第一个切分点的粗粒度候选也是当前可分性的限制之一。
+
+新实验先保持三台机器、计时定义和 `CANDIDATE_ARMS` 不变，只放大请求 workload
+的差异，以便把场景影响与 arm-list 影响分开：
+
+| Scenario | Request type | Input token | 固定输出 token | 目的 |
+|---|---|---:|---:|---|
+| D | `extreme_prefill` | 1500-1800 | 32 | 极端 prefill 对照，验证 `(1,x)` 平台是否由 Rank 0 瓶颈造成 |
+| E | `extreme_decode` | 10-64 | 768 | 放大 decode 占比，观察 Rank 1/2 平衡点是否更明确 |
+| F | `long_context_decode` | 800-1100 | 512 | 同时增加 KV 上下文与 decode 计算，观察第二切分点是否迁移 |
+
+D 不预设必须得到唯一 best arm；如果它仍产生宽平台，同时 E/F 的 top-arm 更集中，
+这本身就是“固定 Rank 0 瓶颈”与“可由第二切分点平衡的 decode workload”之间的有效
+区分。后续分析除唯一排名外，还应报告 1%/3% epsilon-optimal arm 集合。
+
+#### 上下文预算
+
+运行模型 TinyLlama 的 `max_position_embeddings=2048`。数据准备和运行时校验都使用
+同一个保守约束：
+
+$$
+L_{in}+L_{out}+1\le 2048,
+$$
+
+其中额外的 1 个 token 给 BOS/特殊 token 留余量。三个场景最坏预算分别为
+D=1833、E=833、F=1613，均不依赖截断才能运行。`MAX_INPUT_TOKENS=2000` 也不会
+截断 D/F 的合法 prompt。
+
+#### 单场景数据构建
+
+更新 `C:/Users/smbu/Desktop/lab7/prepare_dataset/build_single_scenario_dataset.py`：
+
+- 保留 A/B/C collector，同时新增 D/E/F，并改为可重复调用的命令行参数
+  `--scenario`、`--target-rows`、`--output-csv`、`--tokenizer-dir`。
+- 默认 tokenizer 改为运行时一致的 `/home/dingcong/models/TinyLlama`；所有筛选
+  长度均使用 `add_special_tokens=False`，与 scheduler/ground-truth 的上下文长度
+  口径一致。
+- D 从 CNN/DailyMail 中筛选 1500-1800 token 的文章，使用极短摘要请求。
+- E 从 WritingPrompts 中筛选 10-64 token 的写作 prompt，并要求参考 story 至少
+  768 token，避免用短答案语义模拟长输出。
+- F 使用 WritingPrompts 的 story 构造续写任务。脚本用 tokenizer 对 story 前缀
+  做二分截取，使最终 prompt 严格落在 800-1100 token，并保留至少 512 个参考
+  continuation token。目标输入长度使用与 301 个可选长度互质的步长 73 遍历，避免
+  500 条样本集中在区间下半部。
+- collector 对 prompt 去重；输出仍是只有 `prompt` 一列的 CSV，方便复用现有读取
+  逻辑。
+
+生成文件位于 `C:/Users/smbu/Desktop/lab7/dataset`：
+
+- `single_scenario_d_500.csv`
+- `single_scenario_e_500.csv`
+- `single_scenario_f_500.csv`
+
+使用 TinyLlama tokenizer 对写出的 1500 条 prompt 再次独立校验，结果为：
+
+| Scenario | 行数 | 实测 min | Q1 | median | mean | Q3 | max | 最小上下文余量 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| D | 500 | 1500 | 1547.0 | 1609.0 | 1624.54 | 1695.2 | 1799 | 216 |
+| E | 500 | 12 | 29.0 | 39.0 | 38.87 | 49.0 | 64 | 1215 |
+| F | 500 | 800 | 874.0 | 948.5 | 947.43 | 1020.2 | 1100 | 435 |
+
+每个场景内部无重复 prompt，D/E/F 之间也无交叉重复。
+
+#### 交错集、切片与 HTML 报告
+
+重构 `C:/Users/smbu/Desktop/lab7/dataset/prepare_ground_truth_dataset.py`。脚本支持
+`--scenario-set ABC|DEF`，会加载实际 TinyLlama tokenizer，重新校验行数、唯一性、
+输入范围、输出标签和上下文预算，然后生成：
+
+- `ground-truth-def.csv`：1500 个逻辑 batch，顺序为
+  `D1,E1,F1,D2,E2,F2,...,D500,E500,F500`；当前 10 arms 会展开为 15000 个物理
+  batch。
+- `ground-truth-def-slice001-050.csv` 至
+  `ground-truth-def-slice451-500.csv`：10 个可独立运行/恢复的切片；每片包含每种
+  scenario 50 行，共 150 个逻辑 batch，对应 1500 个物理 batch。
+- `single_scenario_d_500_report.html`、`single_scenario_e_500_report.html`、
+  `single_scenario_f_500_report.html`：包含校验状态、token 统计、12 档分布图、上下文
+  余量、源 CSV SHA-256 和 prompt 样例。
+- `ground-truth-def-report.html`：包含三场景对比、逻辑/物理 batch 数、全部切片的
+  行数、文件大小和 SHA-256。
+
+所有 HTML 都是自包含静态文件，不依赖外部 JavaScript/CSS。总报告和 F 单场景报告
+已在本地浏览器进行渲染检查，表格、统计卡片、长 hash 和 token 分布均正常显示。
+
+#### 运行时代码同步
+
+`ground_truth_experiment.py` 保留 A/B/C 并新增 D/E/F 的 request type、输入范围和
+固定输出 token 校验。`validate_input_length()` 还会在真实推理前执行与数据准备脚本
+一致的 2048-token 总上下文检查，防止手工修改 CSV 后在 decode 中途才出现越界。
+
+`run.sh` 的默认输入切换为 `./dataset/ground-truth-def-slice001-050.csv`，默认输出
+切换为 `outputs_ground_truth_def_slice001_050.csv`；`readme.md` 同步记录 D/E/F 的
+输出长度、decode step 数和逐 slice 运行方式。同步三节点时需要同时复制更新后的
+代码和计划运行的 DEF slice 到各节点项目的 `dataset/` 目录。
+
+新增 `.gitattributes` 强制所有 shell 脚本保持 LF 行尾；`run.sh` 已规范化并通过
+`bash -n`。这样从 Windows 工作区同步到 Linux 节点时，不会因 CRLF 破坏反斜杠续行。
+
+本次只完成数据、报告和运行时代码准备，尚未启动新的三节点 ground-truth。建议先
+运行 `ground-truth-def-slice001-050.csv`，确认 E/F 的 top-2 gap 与瓶颈 Rank 分布
+符合预期后，再顺序运行剩余九个切片。
+
 ## 2026-08-17
 
 ### Ground Truth 全臂枚举实验
