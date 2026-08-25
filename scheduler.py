@@ -24,6 +24,7 @@ allocation at all.
 import csv
 import math
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -99,7 +100,7 @@ REQUEST_TYPE_SPECS = (
         "name": "short_input_long_output",
         "input_min": 10.0,
         "input_max": 150.0,
-        "output_estimate": 384.0,
+        "output_estimate": 400.0,
     },
     {
         "name": "medium_input_medium_output",
@@ -111,7 +112,7 @@ REQUEST_TYPE_SPECS = (
         "name": "long_input_short_output",
         "input_min": 800.0,
         "input_max": 1500.0,
-        "output_estimate": 72.0,
+        "output_estimate": 90.0,
     },
 )
 
@@ -131,15 +132,39 @@ CONTROLLED_CONTEXT_WARMUP_PULLS = 10
 CONTROLLED_SCENARIO_SPECS = {
     "A": {
         "request_type": "long_input_short_output",
-        "output_tokens": 80,
+        "input_min": 800,
+        "input_max": 1500,
+        "output_tokens": 90,
     },
     "B": {
         "request_type": "short_input_long_output",
-        "output_tokens": 386,
+        "input_min": 10,
+        "input_max": 150,
+        "output_tokens": 400,
     },
     "C": {
         "request_type": "medium_input_medium_output",
+        "input_min": 200,
+        "input_max": 600,
         "output_tokens": 256,
+    },
+    "D": {
+        "request_type": "extreme_prefill",
+        "input_min": 1500,
+        "input_max": 1800,
+        "output_tokens": 32,
+    },
+    "E": {
+        "request_type": "extreme_decode",
+        "input_min": 10,
+        "input_max": 64,
+        "output_tokens": 768,
+    },
+    "F": {
+        "request_type": "long_context_decode",
+        "input_min": 800,
+        "input_max": 1100,
+        "output_tokens": 512,
     },
 }
 CONTROLLED_OUTPUT_BY_REQUEST_TYPE = {
@@ -158,29 +183,217 @@ LIPSCHITZ_MAX_SLOPE = 10.0
 LIPSCHITZ_SAFETY_FACTOR = 1.1
 LIPSCHITZ_ELIMINATION_MARGIN = 0.0
 
-CANDIDATE_ARMS = [
-    (1, 5),
-    (1, 7),
-    (1, 9),
-    (1, 11),
-    (1, 13),
-    (1, 15),
-    (1, 17),
-    (3, 7),
-    (3, 11),
-    (3, 15),
-    (3, 19),
-    (5, 7),
-    (5, 11),
-    (5, 13),
-    (5, 15),
-    (5, 17),
-    (9, 12),
-    (9, 14),
-    (9, 16),
-    (9, 18),
-]
+# CANDIDATE_ARMS = [
+#     (1, 5),
+#     (1, 7),
+#     (1, 9),
+#     (1, 11),
+#     (1, 13),
+#     (1, 15),
+#     (1, 17),
+#     (3, 7),
+#     (3, 11),
+#     (3, 15),
+#     (3, 19),
+#     (5, 7),
+#     (5, 11),
+#     (5, 13),
+#     (5, 15),
+#     (5, 17),
+#     (9, 12),
+#     (9, 14),
+#     (9, 16),
+#     (9, 18),
+# ]
 
+CANDIDATE_ARMS = [
+    # p1 = 1
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (1, 5),
+    (1, 6),
+    (1, 7),
+    (1, 8),
+    (1, 9),
+    (1, 10),
+    (1, 11),
+    (1, 12),
+    (1, 13),
+    (1, 14),
+    (1, 15),
+    (1, 16),
+    (1, 17),
+    (1, 18),
+    (1, 19),
+    (1, 20),
+    (1, 21),
+
+    # p1 = 2
+    (2, 3),
+    (2, 4),
+    (2, 5),
+    (2, 6),
+    (2, 7),
+    (2, 8),
+    (2, 9),
+    (2, 10),
+    (2, 11),
+    (2, 12),
+    (2, 13),
+    (2, 14),
+    (2, 15),
+    (2, 16),
+    (2, 17),
+    (2, 18),
+    (2, 19),
+    (2, 20),
+    (2, 21),
+
+    # p1 = 3
+    (3, 4),
+    (3, 5),
+    (3, 6),
+    (3, 7),
+    (3, 8),
+    (3, 9),
+    (3, 10),
+    (3, 11),
+    (3, 12),
+    (3, 13),
+    (3, 14),
+    (3, 15),
+    (3, 16),
+    (3, 17),
+    (3, 18),
+    (3, 19),
+    (3, 20),
+    (3, 21),
+
+    # p1 = 4
+    (4, 5),
+    (4, 6),
+    (4, 7),
+    (4, 8),
+    (4, 9),
+    (4, 10),
+    (4, 11),
+    (4, 12),
+    (4, 13),
+    (4, 14),
+    (4, 15),
+    (4, 16),
+    (4, 17),
+    (4, 18),
+    (4, 19),
+    (4, 20),
+    (4, 21),
+
+    # p1 = 5
+    (5, 6),
+    (5, 7),
+    (5, 8),
+    (5, 9),
+    (5, 10),
+    (5, 11),
+    (5, 12),
+    (5, 13),
+    (5, 14),
+    (5, 15),
+    (5, 16),
+    (5, 17),
+    (5, 18),
+    (5, 19),
+    (5, 20),
+    (5, 21),
+
+    # p1 = 6
+    (6, 7),
+    (6, 8),
+    (6, 9),
+    (6, 10),
+    (6, 11),
+    (6, 12),
+    (6, 13),
+    (6, 14),
+    (6, 15),
+    (6, 16),
+    (6, 17),
+    (6, 18),
+    (6, 19),
+    (6, 20),
+    (6, 21),
+
+    # p1 = 7
+    (7, 8),
+    (7, 9),
+    (7, 10),
+    (7, 11),
+    (7, 12),
+    (7, 13),
+    (7, 14),
+    (7, 15),
+    (7, 16),
+    (7, 17),
+    (7, 18),
+    (7, 19),
+    (7, 20),
+    (7, 21),
+
+    # p1 = 8
+    (8, 9),
+    (8, 10),
+    (8, 11),
+    (8, 12),
+    (8, 13),
+    (8, 14),
+    (8, 15),
+    (8, 16),
+    (8, 17),
+    (8, 18),
+    (8, 19),
+    (8, 20),
+    (8, 21),
+
+    # p1 = 9
+    (9, 10),
+    (9, 11),
+    (9, 12),
+    (9, 13),
+    (9, 14),
+    (9, 15),
+    (9, 16),
+    (9, 17),
+    (9, 18),
+    (9, 19),
+    (9, 20),
+    (9, 21),
+
+    # p1 = 10
+    (10, 11),
+    (10, 12),
+    (10, 13),
+    (10, 14),
+    (10, 15),
+    (10, 16),
+    (10, 17),
+    (10, 18),
+    (10, 19),
+    (10, 20),
+    (10, 21),
+
+    # p1 = 11
+    (11, 12),
+    (11, 13),
+    (11, 14),
+    (11, 15),
+    (11, 16),
+    (11, 17),
+    (11, 18),
+    (11, 19),
+    (11, 20),
+    (11, 21),
+]
 
 def clamp01(value):
     """Clamp a numeric feature into [0, 1]."""
@@ -262,6 +475,41 @@ def build_prompt_batch_contexts(prompts, tokenizer, batch_size, max_input_tokens
         context["input_tokens_max"] = int(input_tokens_max)
         contexts[batch_number] = context
     return contexts
+
+
+def build_single_scenario_context(batch, base_context, scenario):
+    """Attach one explicit A-F scenario without exposing it to arm selection."""
+    batch = int(batch)
+    if not base_context:
+        raise ValueError(f"Missing prompt context for single-scenario batch {batch}.")
+
+    scenario = str(scenario or "").strip().upper()
+    scenario_spec = CONTROLLED_SCENARIO_SPECS.get(scenario)
+    if scenario_spec is None:
+        raise ValueError(f"Batch {batch} has unsupported scenario={scenario!r}.")
+
+    input_tokens = int(base_context.get("input_tokens_max", 0))
+    input_min = int(scenario_spec["input_min"])
+    input_max = int(scenario_spec["input_max"])
+    if not input_min <= input_tokens <= input_max:
+        raise ValueError(
+            f"Batch {batch} scenario {scenario} has input_tokens={input_tokens}; "
+            f"expected [{input_min}, {input_max}]."
+        )
+
+    context = dict(base_context)
+    context.update(
+        {
+            "phase": "single_scenario",
+            "label_used": 0,
+            "scenario": scenario,
+            "request_type": scenario_spec["request_type"],
+            "inferred_request_type": scenario_spec["request_type"],
+            "estimated_output_tokens": float(scenario_spec["output_tokens"]),
+            "target_output_tokens": int(scenario_spec["output_tokens"]),
+        }
+    )
+    return context
 
 
 def build_contextual_controlled_context(batch, base_context, labeled_row):
@@ -580,12 +828,16 @@ class LayerBanditPolicy:
         return sum(costs) / len(costs)
 
     def _update_arm_cost(self, arm, cost):
-        """Update a running mean cost for policies that still need averaging."""
+        """Update cumulative mean cost and cumulative mean per-batch reward."""
         stats = self.stats[arm]
         pulls = int(stats["pulls"])
-        stats["mean_cost"] = (float(stats["mean_cost"]) * pulls + float(cost)) / (pulls + 1)
-        stats["last_cost"] = float(cost)
-        stats["reward"] = self._reward_from_cost(float(stats["mean_cost"]))
+        cost = float(cost)
+        latest_reward = self._reward_from_cost(cost)
+        stats["mean_cost"] = (float(stats["mean_cost"]) * pulls + cost) / (pulls + 1)
+        stats["last_cost"] = cost
+        stats["reward"] = (
+            float(stats["reward"]) * pulls + latest_reward
+        ) / (pulls + 1)
         stats["pulls"] = pulls + 1
         self.total_pulls += 1
 
@@ -991,9 +1243,34 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
         self.last_pull_audit = None
 
     def update_after_batch(self, batch, batch_summary_history):
-        """Clear the audit marker before observing the next completed batch."""
+        """Use the same one-global-warmup, per-batch observation cadence as UCB1."""
         self.last_pull_audit = None
-        return self._update_windowed_after_batch(batch, batch_summary_history)
+        if not self.enabled:
+            return None
+
+        batch = int(batch)
+        summary = batch_summary_history.get(batch)
+        if not summary:
+            return None
+
+        completed_arm = self._completed_arm_from_summary(summary)
+        if completed_arm is None:
+            return None
+        self._ensure_arm(completed_arm)
+        self.current_arm = completed_arm
+
+        if not self.global_warmup_complete:
+            self.global_warmup_complete = True
+            self.last_batch_was_warmup = True
+            return self.current_arm
+
+        self.last_batch_was_warmup = False
+        arm_cost = self._cost_per_token(summary)
+        if arm_cost is None:
+            return self.current_arm
+        self._update_arm_cost(self.current_arm, arm_cost)
+        self.current_arm = self._select_next_arm()
+        return self.current_arm
 
     def _ensure_arm(self, arm):
         """Keep manually introduced valid arms visible to the active set."""
@@ -1291,16 +1568,27 @@ class Scheduler:
         default_boundaries,
         world_size,
         bandit_policy="ucb",
+        experiment_scenario=None,
     ):
         self.path = Path(allocation_csv)
         self.total_layers = int(total_layers)
         self.world_size = int(world_size)
         self.default_boundaries = [int(value) for value in default_boundaries]
         self.fieldnames = ["batch"] + [f"rank{rank}" for rank in range(self.world_size)]
-        self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+        self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
+        self.experiment_scenario = str(experiment_scenario or "").strip().upper()
+        self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        self.run_id = self.run_timestamp
         self.bandit_log_dir = self.path.parent / "bandit_logs"
         self.summary_path = self.bandit_log_dir / f"scheduler_summary_{self.run_timestamp}.csv"
         self.arm_details_path = self.bandit_log_dir / f"arm_details_{self.run_timestamp}.csv"
+        experiment_label = self.experiment_scenario or "mixed"
+        self.batch_metrics_path = self.bandit_log_dir / (
+            f"batch_metrics_{self.bandit_policy_name}_{experiment_label}_{self.run_timestamp}.csv"
+        )
+        self.run_summary_path = self.bandit_log_dir / (
+            f"run_summary_{self.bandit_policy_name}_{experiment_label}_{self.run_timestamp}.csv"
+        )
         self.summary_fieldnames = [
             "batch",
             "prefill_mode",
@@ -1346,6 +1634,55 @@ class Scheduler:
             "selected",
             "next_selected",
         ]
+        self.batch_metrics_fieldnames = [
+            "run_id",
+            "policy",
+            "scenario",
+            "batch",
+            "prompt_index",
+            "input_tokens",
+            "target_output_tokens",
+            "decode_step_count",
+            "used_arm",
+            "next_arm",
+            "pull_completed",
+            "bottleneck_time_ms",
+            "cost_ms_per_step",
+            "observed_reward",
+            "cumulative_reward",
+            "scheduler_select_ms",
+            "scheduler_update_ms",
+            "scheduler_algorithm_ms",
+            "scheduler_algorithm_cumulative_ms",
+            "partition_transition_wall_ms",
+            "rank0_layer_switch_ms",
+            "inference_wall_ms",
+            "inference_cumulative_ms",
+            "batch_total_wall_ms",
+        ]
+        self.run_summary_fieldnames = [
+            "run_id",
+            "policy",
+            "scenario",
+            "status",
+            "total_batches",
+            "measured_batches",
+            "total_target_output_tokens",
+            "total_decode_steps",
+            "total_observed_reward",
+            "mean_observed_reward",
+            "total_scheduler_select_ms",
+            "total_scheduler_update_ms",
+            "total_scheduler_algorithm_ms",
+            "total_partition_transition_ms",
+            "total_inference_wall_ms",
+            "measured_inference_wall_ms",
+            "total_batch_wall_ms",
+            "mean_inference_wall_ms",
+            "p50_inference_wall_ms",
+            "p95_inference_wall_ms",
+            "algorithm_overhead_percent",
+        ]
         self.allocations = {}
         # These fields keep online data in memory so adaptive policies do not
         # need to parse scheduler_summary.csv during the running experiment.
@@ -1357,10 +1694,14 @@ class Scheduler:
         self.environment_data = None
         self.environment_history = {}
         self.batch_summary_history = {}
+        self.algorithm_timing_history = {}
+        self.batch_metric_history = []
+        self.cumulative_algorithm_ms = 0.0
+        self.cumulative_inference_ms = 0.0
+        self.cumulative_reward = 0.0
 
         self._validate_boundaries(self.default_boundaries)
         self._load_existing_file()
-        self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
         self.bandit = create_bandit_policy(
             policy_name=self.bandit_policy_name,
             total_layers=self.total_layers,
@@ -1478,27 +1819,46 @@ class Scheduler:
             "time_label": time_label,
             "rank_times": rank_times,
         }
-        self.save_summary_history()
 
     def select_arm_before_batch(self, batch, context=None):
         """Select the layer-allocation arm for the current batch."""
-        _ = batch
-        return self.bandit.select_arm(context=context, batch=batch)
+        batch = int(batch)
+        started_ns = time.perf_counter_ns()
+        selected_arm = self.bandit.select_arm(context=context, batch=batch)
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        self.algorithm_timing_history.setdefault(batch, {})["select_ms"] = elapsed_ms
+        return selected_arm
 
     def update_policy_after_batch(self, batch):
         """Update the active policy from the completed batch summary."""
+        batch = int(batch)
+        pulls_before = int(self.bandit.total_pulls)
+        started_ns = time.perf_counter_ns()
         selected_arm = self.bandit.update_after_batch(
             batch=batch,
             batch_summary_history=self.batch_summary_history,
         )
-        summary = self.batch_summary_history.get(int(batch), {})
-        used_arm = summary.get("arm", selected_arm)
-        self.append_arm_details(batch, used_arm)
+        update_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        timing = self.algorithm_timing_history.setdefault(batch, {})
+        timing["update_ms"] = update_ms
+        timing["algorithm_ms"] = float(timing.get("select_ms", 0.0)) + update_ms
+        timing["pull_completed"] = int(self.bandit.total_pulls) > pulls_before
+        self.cumulative_algorithm_ms += timing["algorithm_ms"]
+        timing["algorithm_cumulative_ms"] = self.cumulative_algorithm_ms
         return selected_arm
 
     def run_bandit_after_batch(self, batch):
         """Backward-compatible wrapper for the previous after-batch hook."""
-        return self.update_policy_after_batch(batch)
+        selected_arm = self.update_policy_after_batch(batch)
+        self.write_batch_audit(batch)
+        return selected_arm
+
+    def write_batch_audit(self, batch):
+        """Persist existing scheduler summaries and per-arm audit rows."""
+        summary = self.batch_summary_history.get(int(batch), {})
+        used_arm = summary.get("arm", self.bandit.current_arm)
+        self.append_arm_details(batch, used_arm)
+        self.save_summary_history()
 
     def reallocate_layer(self, batch=None, arm=None, rank_metrics=None):
         """Write the selected current-batch layer allocation to scheduler.csv.
@@ -1554,6 +1914,147 @@ class Scheduler:
                         }
                     )
 
+    def append_batch_metrics(
+        self,
+        batch,
+        prompt_index,
+        partition_transition_wall_ms,
+        rank0_layer_switch_ms,
+        inference_wall_ms,
+        batch_total_wall_ms,
+    ):
+        """Append one plot-ready timing and reward row for a completed batch."""
+        batch = int(batch)
+        summary = self.batch_summary_history.get(batch, {})
+        context = summary.get("context") or {}
+        timing = self.algorithm_timing_history.get(batch, {})
+        rank_times = summary.get("rank_times") or {}
+        bottleneck_time_ms = max(rank_times.values()) if rank_times else None
+        cost_ms_per_step = self.bandit._cost_per_token(summary)
+        observed_reward = (
+            self.bandit._reward_from_cost(cost_ms_per_step)
+            if cost_ms_per_step is not None
+            else None
+        )
+        pull_completed = bool(timing.get("pull_completed", False))
+        if pull_completed and observed_reward is not None:
+            self.cumulative_reward += observed_reward
+        self.cumulative_inference_ms += float(inference_wall_ms)
+
+        used_arm = summary.get("arm")
+        next_arm = self.bandit.current_arm
+        raw_row = {
+            "run_id": self.run_id,
+            "policy": self.bandit_policy_name,
+            "scenario": context.get("scenario", self.experiment_scenario),
+            "batch": batch,
+            "prompt_index": int(prompt_index),
+            "input_tokens": int(context.get("input_tokens_max", 0)),
+            "target_output_tokens": context.get("target_output_tokens", ""),
+            "decode_step_count": int(summary.get("decode_step_count", 0)),
+            "used_arm": self.bandit._format_arm(used_arm) if used_arm is not None else "",
+            "next_arm": self.bandit._format_arm(next_arm) if next_arm is not None else "",
+            "pull_completed": int(pull_completed),
+            "bottleneck_time_ms": bottleneck_time_ms,
+            "cost_ms_per_step": cost_ms_per_step,
+            "observed_reward": observed_reward,
+            "cumulative_reward": self.cumulative_reward,
+            "scheduler_select_ms": float(timing.get("select_ms", 0.0)),
+            "scheduler_update_ms": float(timing.get("update_ms", 0.0)),
+            "scheduler_algorithm_ms": float(timing.get("algorithm_ms", 0.0)),
+            "scheduler_algorithm_cumulative_ms": float(
+                timing.get("algorithm_cumulative_ms", self.cumulative_algorithm_ms)
+            ),
+            "partition_transition_wall_ms": float(partition_transition_wall_ms),
+            "rank0_layer_switch_ms": float(rank0_layer_switch_ms),
+            "inference_wall_ms": float(inference_wall_ms),
+            "inference_cumulative_ms": self.cumulative_inference_ms,
+            "batch_total_wall_ms": float(batch_total_wall_ms),
+        }
+        self.batch_metric_history.append(raw_row)
+
+        self.batch_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = self.batch_metrics_path.exists()
+        output = {}
+        for field in self.batch_metrics_fieldnames:
+            value = raw_row.get(field, "")
+            output[field] = f"{value:.6f}" if isinstance(value, float) else value
+        with open(self.batch_metrics_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.batch_metrics_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(output)
+
+    def write_run_summary(self, status):
+        """Write one aggregate row for the current experiment run."""
+        rows = list(self.batch_metric_history)
+        measured_rows = [row for row in rows if int(row["pull_completed"]) == 1]
+        inference_values = sorted(float(row["inference_wall_ms"]) for row in measured_rows)
+
+        def percentile(values, fraction):
+            if not values:
+                return 0.0
+            index = max(0, math.ceil(len(values) * fraction) - 1)
+            return float(values[index])
+
+        total_algorithm_ms = sum(float(row["scheduler_algorithm_ms"]) for row in rows)
+        total_inference_ms = sum(float(row["inference_wall_ms"]) for row in rows)
+        measured_inference_ms = sum(
+            float(row["inference_wall_ms"]) for row in measured_rows
+        )
+        overhead_denominator = total_algorithm_ms + total_inference_ms
+        summary = {
+            "run_id": self.run_id,
+            "policy": self.bandit_policy_name,
+            "scenario": self.experiment_scenario,
+            "status": status,
+            "total_batches": len(rows),
+            "measured_batches": len(measured_rows),
+            "total_target_output_tokens": sum(
+                int(row["target_output_tokens"])
+                for row in rows
+                if row["target_output_tokens"] != ""
+            ),
+            "total_decode_steps": sum(int(row["decode_step_count"]) for row in rows),
+            "total_observed_reward": self.cumulative_reward,
+            "mean_observed_reward": (
+                self.cumulative_reward / len(measured_rows) if measured_rows else 0.0
+            ),
+            "total_scheduler_select_ms": sum(
+                float(row["scheduler_select_ms"]) for row in rows
+            ),
+            "total_scheduler_update_ms": sum(
+                float(row["scheduler_update_ms"]) for row in rows
+            ),
+            "total_scheduler_algorithm_ms": total_algorithm_ms,
+            "total_partition_transition_ms": sum(
+                float(row["partition_transition_wall_ms"]) for row in rows
+            ),
+            "total_inference_wall_ms": total_inference_ms,
+            "measured_inference_wall_ms": measured_inference_ms,
+            "total_batch_wall_ms": sum(float(row["batch_total_wall_ms"]) for row in rows),
+            "mean_inference_wall_ms": (
+                measured_inference_ms / len(measured_rows) if measured_rows else 0.0
+            ),
+            "p50_inference_wall_ms": percentile(inference_values, 0.50),
+            "p95_inference_wall_ms": percentile(inference_values, 0.95),
+            "algorithm_overhead_percent": (
+                total_algorithm_ms / overhead_denominator * 100.0
+                if overhead_denominator > 0.0
+                else 0.0
+            ),
+        }
+
+        self.run_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        output = {}
+        for field in self.run_summary_fieldnames:
+            value = summary.get(field, "")
+            output[field] = f"{value:.6f}" if isinstance(value, float) else value
+        with open(self.run_summary_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.run_summary_fieldnames)
+            writer.writeheader()
+            writer.writerow(output)
+
     def append_arm_details(self, batch, selected_arm):
         """Append one policy-state snapshot for every candidate arm."""
         self.arm_details_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1569,7 +2070,7 @@ class Scheduler:
                 output = {field: row.get(field, "") for field in self.arm_details_fieldnames}
                 output["batch"] = int(batch)
                 output["policy"] = self.bandit_policy_name
-                if controlled_policy:
+                if context:
                     output["phase"] = context.get("phase", "")
                     output["label_used"] = context.get("label_used", "")
                     output["scenario"] = context.get("scenario", "")
@@ -1583,6 +2084,7 @@ class Scheduler:
                         if target_output_tokens is not None
                         else f"natural(max={context.get('max_new_tokens', 512)})"
                     )
+                if controlled_policy:
                     output["model_updated"] = int(
                         bool(getattr(self.bandit, "last_model_updated", False))
                     )

@@ -1,5 +1,142 @@
 # Version Log
 
+## 2026-08-25
+
+### 单场景 Lipschitz-UCB / UCB1 收益与耗时对比实验
+
+#### 实验范围
+
+本次在 `test` 分支为普通 `BANDIT_POLICY=ucb` 和
+`BANDIT_POLICY=lipschitz` 增加单场景受控实验入口。每次运行只加载一个
+场景的数据集，两个 policy 使用相同 prompt 顺序、相同固定输出长度、相同
+cost/reward 定义和相同逐批更新节奏。scenario 只控制输出长度和日志标签，
+不会作为 UCB1 或 Lipschitz 的选臂输入。
+
+本次没有新增 max-decode-step 参数，也没有修改 `CANDIDATE_ARMS` 的构建、
+过滤或默认 arm 插入逻辑；decode 上限仍由实验者使用现有参数手动配置。
+
+#### A-F 场景
+
+| Scenario | Request type | Input tokens | Target output token IDs | Decode steps |
+|---|---|---:|---:|---:|
+| A | `long_input_short_output` | 800-1500 | 90 | 89 |
+| B | `short_input_long_output` | 10-150 | 400 | 399 |
+| C | `medium_input_medium_output` | 200-600 | 256 | 255 |
+| D | `extreme_prefill` | 1500-1800 | 32 | 31 |
+| E | `extreme_decode` | 10-64 | 768 | 767 |
+| F | `long_context_decode` | 800-1100 | 512 | 511 |
+
+目标输出数包含 prefill 直接产生的 first token，因此固定生成 $N$ 个 token ID
+时有：
+
+$$
+\mathrm{decode\_step\_count}=N-1
+$$
+
+`run.sh` 新增可选变量 `EXPERIMENT_SCENARIO`，只传给 Rank 0：
+
+```bash
+BANDIT_POLICY=ucb
+EXPERIMENT_SCENARIO=D
+BATCH_SIZE=1
+INPUT_CSV=./dataset/single_scenario_d_500.csv
+```
+
+将 `BANDIT_POLICY` 改为 `lipschitz` 即可在同一场景上运行另一组。单场景
+模式要求 `--allocation-csv`、`--batch-size 1`，并且不能同时设置现有
+`--force-decode-steps`。输入 CSV 只需要 `prompt` 列；启动时根据显式指定的
+scenario 检查 tokenized prompt 长度，并为每批设置 `forced_output_tokens`。
+`MAX_INPUT_TOKENS` 默认值提高到 1800，避免 D 场景及较长 A/F prompt 被提前截断。
+
+#### UCB1 与 Lipschitz 的统一观测口径
+
+两个 policy 都只跳过整个运行的第一个完成 batch。Batch 2 起，每个完成
+batch 形成一次有效 pull，不再为 Lipschitz 使用两批窗口或每次切臂后的额外
+warmup。
+
+每批统一计算瓶颈 Rank 的每 decode step cost：
+
+$$
+C_t=\frac{\max(T_{0,t},T_{1,t},T_{2,t})}
+{\max(1,\mathrm{decode\_step\_count}_t)}
+$$
+
+再先把本批 cost 转成 reward：
+
+$$
+r_t=\frac{1}{1+C_t/100}
+$$
+
+两个 policy 的 arm 直接 reward 都使用逐批 reward 的累计样本均值：
+
+$$
+\bar R_{a,n}=\frac{(n-1)\bar R_{a,n-1}+r_t}{n}
+$$
+
+`mean_cost` 继续作为审计数据累计，但不再由平均 cost 反推 Lipschitz reward。
+Lipschitz 与 UCB1 的区别保留在 Lipschitz 距离、`q1/q2`、置信界、
+`active_arms` 和最终 score/选臂规则中。
+
+#### 每批收益与计时日志
+
+新增一批一行的文件：
+
+```text
+bandit_logs/batch_metrics_{policy}_{scenario}_{timestamp}.csv
+```
+
+主要字段：
+
+| 字段 | 含义 |
+|---|---|
+| `used_arm`, `next_arm`, `pull_completed` | 本批使用的 arm、下一批 arm、是否形成有效 pull |
+| `bottleneck_time_ms`, `cost_ms_per_step` | 瓶颈 Rank 总时间与统一 cost |
+| `observed_reward`, `cumulative_reward` | 本批统一 reward 与排除全局 warmup 后的累计 reward |
+| `scheduler_select_ms` | 仅 `bandit.select_arm()` 的 CPU 墙钟耗时 |
+| `scheduler_update_ms` | 仅 reward/model/score 更新及下一 arm 决策耗时 |
+| `scheduler_algorithm_ms` | `select_ms + update_ms` |
+| `scheduler_algorithm_cumulative_ms` | scheduler 算法累计耗时 |
+| `partition_transition_wall_ms` | 广播 boundaries 到全部 Rank 模型分片就绪的墙钟时间 |
+| `rank0_layer_switch_ms` | Rank 0 本地增量切层耗时 |
+| `inference_wall_ms` | 分片就绪后到 Rank 0 收齐全部 Rank metric 的推理墙钟时间 |
+| `batch_total_wall_ms` | 本批选臂开始到 policy 更新结束的墙钟时间 |
+
+算法计时使用 `time.perf_counter_ns()`。`arm_score_snapshot()`、
+`scheduler_summary.csv`、`arm_details.csv`、`batch_metrics.csv` 和文本日志的
+写盘都在算法及 batch 计时停止后执行，不计入 `scheduler_algorithm_ms` 或
+`inference_wall_ms`。
+
+#### 运行汇总
+
+每次运行结束或中断时写入：
+
+```text
+bandit_logs/run_summary_{policy}_{scenario}_{timestamp}.csv
+```
+
+汇总包含完成 batch 数、有效 batch 数、累计/平均 reward、select/update/算法
+累计耗时、分片切换累计耗时、全部及排除 warmup 后的推理耗时、推理
+mean/p50/p95、总 batch 墙钟时间，以及：
+
+$$
+\mathrm{algorithm\_overhead\_percent}=
+\frac{\sum T_{algorithm}}
+{\sum T_{algorithm}+\sum T_{inference}}\times100\%
+$$
+
+`scheduler_summary_*.csv` 和 `arm_details_*.csv` 继续保留原有逐 Rank 与逐 arm
+审计用途；绘制“算法耗时 + 推理耗时”、累计收益和累计耗时对比图时直接读取
+新的 `batch_metrics` 与 `run_summary`。
+
+#### 修改文件
+
+- `config.py`：增加 `--experiment-scenario A-F`。
+- `run.sh`：增加 `EXPERIMENT_SCENARIO`，并把 `MAX_INPUT_TOKENS` 默认值改为 1800。
+- `scheduler.py`：增加 A-F 配置、单场景 Context、统一 reward/更新节奏及两类实验 CSV。
+- `inference_loops.py`：接入单场景固定输出和 Rank 0 墙钟计时。
+- `readme.md`：补充单场景运行方法和新增日志。
+- `log.md`：记录本次完整实验设计与计时口径。
+
 ## 2026-08-14
 
 ### 经典 UCB1 累计平均 Reward

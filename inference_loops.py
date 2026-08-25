@@ -61,6 +61,7 @@ from scheduler import (
     Scheduler,
     build_contextual_controlled_context,
     build_prompt_batch_contexts,
+    build_single_scenario_context,
 )
 
 
@@ -955,6 +956,18 @@ def rank0_generate_dynamic(
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
     controlled_rows = None
+    experiment_scenario = getattr(args, "experiment_scenario", None)
+    if experiment_scenario is not None:
+        if args.bandit_policy not in {"ucb", "lipschitz"}:
+            raise ValueError("--experiment-scenario requires --bandit-policy ucb or lipschitz.")
+        if not args.allocation_csv:
+            raise ValueError("--experiment-scenario requires --allocation-csv.")
+        if int(args.batch_size) != 1:
+            raise ValueError("--experiment-scenario requires --batch-size 1.")
+        if args.force_decode_steps is not None:
+            raise ValueError(
+                "--experiment-scenario cannot be combined with --force-decode-steps."
+            )
     if args.bandit_policy == "contextual_controlled":
         if not args.csv_has_header:
             raise ValueError("contextual_controlled requires --csv-has-header.")
@@ -994,6 +1007,7 @@ def rank0_generate_dynamic(
             default_boundaries,
             world_size,
             bandit_policy=args.bandit_policy,
+            experiment_scenario=experiment_scenario,
         )
         batch_contexts = build_prompt_batch_contexts(
             prompts=prompts,
@@ -1009,6 +1023,13 @@ def rank0_generate_dynamic(
                     labeled_row=labeled_row,
                 )
                 batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
+        elif experiment_scenario is not None:
+            for batch_number in sorted(batch_contexts):
+                batch_contexts[batch_number] = build_single_scenario_context(
+                    batch=batch_number,
+                    base_context=batch_contexts[batch_number],
+                    scenario=experiment_scenario,
+                )
 
     log_path = make_log_path()
     print(f"[Rank 0] KV-cache experiment log: {log_path}")
@@ -1016,12 +1037,17 @@ def rank0_generate_dynamic(
     model = None
     layer_partition = None
     current_stage = None
+    run_completed = False
 
     try:
         for batch_number, start_index, prompt_batch in chunk_items(prompts, args.batch_size):
+            batch_started_ns = time.perf_counter_ns()
             batch_context = batch_contexts.get(batch_number)
             forced_output_tokens = None
-            if args.bandit_policy == "contextual_controlled" and batch_context is not None:
+            if (
+                args.bandit_policy == "contextual_controlled"
+                or experiment_scenario is not None
+            ) and batch_context is not None:
                 forced_output_tokens = batch_context.get("target_output_tokens")
             if scheduler is not None:
                 selected_arm = scheduler.select_arm_before_batch(
@@ -1075,7 +1101,15 @@ def rank0_generate_dynamic(
                     f"output_tokens={target_text}; label_used="
                     f"{batch_context['label_used']}"
                 )
+            elif experiment_scenario is not None:
+                print(
+                    f"[Rank 0] Batch {batch_number}: scenario={experiment_scenario}; "
+                    f"request_type={batch_context['request_type']}; "
+                    f"output_tokens={forced_output_tokens}"
+                )
 
+            partition_started_ns = time.perf_counter_ns()
+            rank0_layer_switch_ms = 0.0
             print(
                 f"[Rank 0] Batch {batch_number}: broadcasting boundaries "
                 f"{boundaries}; prefill_mode={args.prefill_mode}"
@@ -1120,6 +1154,7 @@ def rank0_generate_dynamic(
                 )
                 model = layer_partition.model
                 current_stage = next_stage
+                rank0_layer_switch_ms = float(switch_result.elapsed_ms)
                 print(
                     f"[Rank 0] Batch {batch_number}: incremental split "
                     f"{switch_result.old_stage}->{switch_result.new_stage}; "
@@ -1137,7 +1172,11 @@ def rank0_generate_dynamic(
                 )
 
             wait_for_all_model_partitions(0, batch_number, comm_device)
+            partition_transition_wall_ms = (
+                time.perf_counter_ns() - partition_started_ns
+            ) / 1_000_000.0
 
+            inference_started_ns = time.perf_counter_ns()
             if args.prefill_mode == "cloud-base":
                 rows, records = generate_rows_for_prompts_cloud_base(
                     args,
@@ -1180,6 +1219,9 @@ def rank0_generate_dynamic(
 
             send_batch_done(comm_device)
             records.extend(recv_metric_records(world_size, comm_device, str(comm_dtype)))
+            inference_wall_ms = (
+                time.perf_counter_ns() - inference_started_ns
+            ) / 1_000_000.0
             if scheduler is not None:
                 scheduler.collect_batch_summary(
                     batch=batch_number,
@@ -1190,6 +1232,18 @@ def rank0_generate_dynamic(
                     selected_arm=selected_arm,
                 )
                 scheduler.update_policy_after_batch(batch_number)
+                batch_total_wall_ms = (
+                    time.perf_counter_ns() - batch_started_ns
+                ) / 1_000_000.0
+                scheduler.append_batch_metrics(
+                    batch=batch_number,
+                    prompt_index=start_index + 1,
+                    partition_transition_wall_ms=partition_transition_wall_ms,
+                    rank0_layer_switch_ms=rank0_layer_switch_ms,
+                    inference_wall_ms=inference_wall_ms,
+                    batch_total_wall_ms=batch_total_wall_ms,
+                )
+                scheduler.write_batch_audit(batch_number)
             append_experiment_log(log_path, records)
             append_summary_log(
                 log_path,
@@ -1202,9 +1256,12 @@ def rank0_generate_dynamic(
             print(f"[Rank 0] Batch {batch_number} log written to {log_path}")
             print(f"[Rank 0] Batch {batch_number} complete.")
 
+        run_completed = True
         write_output_rows(args.output_csv, all_rows)
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
     finally:
+        if scheduler is not None:
+            scheduler.write_run_summary("complete" if run_completed else "interrupted")
         if layer_partition is not None:
             layer_partition.release()
             model = None

@@ -163,6 +163,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--experiment-scenario",
+        type=lambda value: value.strip().upper(),
+        choices=("A", "B", "C", "D", "E", "F"),
+        default=None,
+        help=(
+            "Single-scenario controlled run for ucb or lipschitz. The selected "
+            "A-F scenario fixes the generated token count for every prompt."
+        ),
+    )
+    parser.add_argument(
         "--cuda-device",
         default="0",
         help="CUDA device index used by this process. Default: 0",

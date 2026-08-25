@@ -30,7 +30,8 @@ COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
 INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
 OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
-MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1000}
+MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1800}
+EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 ```
 
@@ -49,6 +50,7 @@ MODEL_DIR         TinyLlama 模型目录
 INPUT_CSV         Rank 0 读取的输入 CSV
 OUTPUT_CSV        Rank 0 写出的结果 CSV
 MAX_INPUT_TOKENS  输入 prompt 最大 token 长度
+EXPERIMENT_SCENARIO 单场景 UCB1/Lipschitz 实验；可选 A、B、C、D、E、F
 FORCE_DECODE_STEPS 固定 decode forward 次数；空值表示按 EOS / max_new_tokens 自然停止
 ```
 
@@ -59,6 +61,37 @@ FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
 ```
 
 该参数对应命令行 `--force-decode-steps 128`。它会忽略 EOS，强制执行 128 次 prefill 之后的 decode forward。prefill 直接得到的 first token 不计入这 128 步。
+
+## 单场景 UCB1 / Lipschitz 对比
+
+单场景 CSV 只需包含 `prompt` 列。每次显式指定一个场景，并分别运行两个 policy：
+
+```bash
+BANDIT_POLICY=${BANDIT_POLICY:-ucb}
+EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-D}
+BATCH_SIZE=${BATCH_SIZE:-1}
+INPUT_CSV=${INPUT_CSV:-./dataset/single_scenario_d_500.csv}
+```
+
+第二组只需把 `BANDIT_POLICY` 改为 `lipschitz`。场景固定输出为：
+
+```text
+A=90  B=400  C=256  D=32  E=768  F=512 token IDs
+```
+
+prefill first token 计入目标总数，所以实际 `decode_step_count=target_output_tokens-1`。
+scenario 只控制输出长度与日志标签，不参与 UCB1/Lipschitz 选臂。该模式不能与
+`FORCE_DECODE_STEPS` 同时使用；decode 参数仍由实验者使用现有配置手动调整。
+
+每次运行新增：
+
+```text
+bandit_logs/batch_metrics_{policy}_{scenario}_{timestamp}.csv
+bandit_logs/run_summary_{policy}_{scenario}_{timestamp}.csv
+```
+
+前者每个 batch 一行，记录统一 reward、累计 reward、scheduler select/update
+耗时、推理墙钟时间和切层时间；后者记录整次运行汇总。
 
 ## Contextual Controlled Policy
 
@@ -82,8 +115,8 @@ prompt,scenario,request_type,phase
 前 600 个 batch 是 learning 阶段，数据按 A/B/C 循环。每个 arm 在每种 request type 下学习 10 次：
 
 ```text
-A / long_input_short_output    -> 强制保存 80 个 token ID
-B / short_input_long_output    -> 强制保存 386 个 token ID
+A / long_input_short_output    -> 强制保存 90 个 token ID
+B / short_input_long_output    -> 强制保存 400 个 token ID
 C / medium_input_medium_output -> 强制保存 256 个 token ID
 ```
 
