@@ -1241,6 +1241,12 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
         self.elimination_margin = float(LIPSCHITZ_ELIMINATION_MARGIN)
         self.active_arms = list(self.arms)
         self.last_pull_audit = None
+        self.conflicting_arms = []
+        self.conflict_probe_queue = []
+        self.active_conflict_probe = None
+        self.conflict_probe_cycle_active = False
+        self.q1_probe_floor = self.min_slope
+        self.q2_probe_floor = self.min_slope
 
     def update_after_batch(self, batch, batch_summary_history):
         """Use the same one-global-warmup, per-batch observation cadence as UCB1."""
@@ -1287,6 +1293,8 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
 
         super()._update_arm_cost(arm, cost)
         self._update_effective_slopes(arm)
+        probe_correction = self._apply_coordinate_probe_correction(arm)
+        self._enforce_probe_slope_floors()
         self._refresh_active_arms()
 
         after_state = self._audit_state()
@@ -1297,12 +1305,28 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
             "q2_before": q2_before,
             "q1_after": self.q1,
             "q2_after": self.q2,
+            "probe_correction": probe_correction,
             "before": before_state,
             "after": after_state,
         }
 
     def _select_next_arm(self):
-        """Choose the largest optimistic bound without mandatory arm sweeps."""
+        """Run at most two conflict probes, then use the optimistic bound."""
+        probe_arm = self._take_next_conflict_probe()
+        if probe_arm is not None:
+            return probe_arm
+
+        if not self.conflicting_arms:
+            self.conflict_probe_cycle_active = False
+        elif not self.conflict_probe_cycle_active:
+            self.conflict_probe_queue = self._build_conflict_probe_queue(
+                self.current_arm
+            )
+            self.conflict_probe_cycle_active = True
+            probe_arm = self._take_next_conflict_probe()
+            if probe_arm is not None:
+                return probe_arm
+
         candidates = self.active_arms or self.arms
         if not candidates:
             return self.current_arm
@@ -1315,6 +1339,122 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
                 best_arm = arm
                 best_score = score
         return best_arm
+
+    def _build_conflict_probe_queue(self, anchor_arm):
+        """Choose nearest unseen arms that isolate q1, then q2."""
+        if anchor_arm is None or int(self.stats[anchor_arm]["pulls"]) <= 0:
+            return []
+
+        anchor = tuple(anchor_arm)
+        arm_order = {arm: index for index, arm in enumerate(self.arms)}
+        conflicting_unseen = {
+            arm
+            for arm in self.conflicting_arms
+            if int(self.stats[arm]["pulls"]) == 0
+        }
+        all_unseen = {
+            arm for arm in self.arms if int(self.stats[arm]["pulls"]) == 0
+        }
+        probes = []
+
+        for axis in ("q1", "q2"):
+            def isolates_axis(arm):
+                if axis == "q1":
+                    return arm[1] == anchor[1] and arm[0] != anchor[0]
+                return arm[0] == anchor[0] and arm[1] != anchor[1]
+
+            candidates = [
+                arm for arm in conflicting_unseen if isolates_axis(arm)
+            ]
+            if not candidates:
+                candidates = [arm for arm in all_unseen if isolates_axis(arm)]
+            if not candidates:
+                continue
+
+            coordinate = 0 if axis == "q1" else 1
+            probe_arm = min(
+                candidates,
+                key=lambda arm: (
+                    abs(arm[coordinate] - anchor[coordinate]),
+                    arm_order[arm],
+                ),
+            )
+            probes.append(
+                {
+                    "axis": axis,
+                    "anchor_arm": anchor,
+                    "probe_arm": probe_arm,
+                }
+            )
+
+        return probes
+
+    def _take_next_conflict_probe(self):
+        """Return the next still-unseen coordinate probe, if one is queued."""
+        while self.conflict_probe_queue:
+            probe = self.conflict_probe_queue.pop(0)
+            probe_arm = probe["probe_arm"]
+            if int(self.stats[probe_arm]["pulls"]) > 0:
+                continue
+            self.active_conflict_probe = probe
+            return probe_arm
+        return None
+
+    def _apply_coordinate_probe_correction(self, updated_arm):
+        """Raise the isolated slope floor from a completed conflict probe."""
+        probe = self.active_conflict_probe
+        self.active_conflict_probe = None
+        if probe is None or tuple(updated_arm) != tuple(probe["probe_arm"]):
+            return None
+
+        anchor_arm = tuple(probe["anchor_arm"])
+        if int(self.stats[anchor_arm]["pulls"]) <= 0:
+            return None
+
+        axis = probe["axis"]
+        x1, x2 = self._distance_components(updated_arm, anchor_arm)
+        axis_distance = x1 if axis == "q1" else x2
+        if axis_distance <= 0.0:
+            return None
+
+        probe_reward = float(self.stats[updated_arm]["reward"])
+        anchor_reward = float(self.stats[anchor_arm]["reward"])
+        uncertainty = (
+            self._confidence_radius(updated_arm)
+            + self._confidence_radius(anchor_arm)
+        )
+        effective_gap = max(
+            abs(probe_reward - anchor_reward) - uncertainty,
+            0.0,
+        )
+        required_slope = self._clamp_slope(
+            self.safety_factor * effective_gap / axis_distance
+        )
+
+        slope_before = self.q1 if axis == "q1" else self.q2
+        if axis == "q1":
+            self.q1_probe_floor = max(self.q1_probe_floor, required_slope)
+            self.q1 = max(self.q1, self.q1_probe_floor)
+            slope_after = self.q1
+        else:
+            self.q2_probe_floor = max(self.q2_probe_floor, required_slope)
+            self.q2 = max(self.q2, self.q2_probe_floor)
+            slope_after = self.q2
+
+        return {
+            "axis": axis,
+            "anchor_arm": anchor_arm,
+            "probe_arm": tuple(updated_arm),
+            "effective_gap": effective_gap,
+            "required_slope": required_slope,
+            "slope_before": slope_before,
+            "slope_after": slope_after,
+        }
+
+    def _enforce_probe_slope_floors(self):
+        """Keep completed probe constraints valid during later online updates."""
+        self.q1 = self._clamp_slope(max(self.q1, self.q1_probe_floor))
+        self.q2 = self._clamp_slope(max(self.q2, self.q2_probe_floor))
 
     def arm_score_snapshot(self, selected_arm):
         """Return per-arm before/after changes and current Lipschitz state."""
@@ -1437,8 +1577,8 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
         log_total = math.log(max(self.total_pulls, 2))
         return self.exploration_weight * math.sqrt(log_total / pulls)
 
-    def _confidence_bounds(self, arm):
-        """Infer a reward interval from all observed arms and weighted distance."""
+    def _raw_confidence_bounds(self, arm):
+        """Infer bounds before applying the safe conflict fallback."""
         observed_arms = self._observed_arms()
         if not observed_arms:
             return 0.0, 1.0
@@ -1454,14 +1594,42 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
 
         lower = max(0.0, min(lower, 1.0))
         upper = max(0.0, min(upper, 1.0))
-        if lower > upper:
-            midpoint = max(0.0, min((lower + upper) / 2.0, 1.0))
-            return midpoint, midpoint
         return lower, upper
+
+    def _resolve_confidence_bounds(self, arm, lower, upper):
+        """Use direct evidence instead of false certainty on a conflict."""
+        if lower > upper:
+            stats = self.stats[arm]
+            if int(stats["pulls"]) == 0:
+                return 0.0, 1.0
+
+            reward = float(stats["reward"])
+            radius = self._confidence_radius(arm)
+            return (
+                max(0.0, reward - radius),
+                min(1.0, reward + radius),
+            )
+        return lower, upper
+
+    def _confidence_bounds(self, arm):
+        """Infer a reward interval with the safe conflict fallback."""
+        lower, upper = self._raw_confidence_bounds(arm)
+        return self._resolve_confidence_bounds(arm, lower, upper)
 
     def _refresh_active_arms(self):
         """Recompute confidence-based candidates; removed arms may reactivate."""
-        bounds = {arm: self._confidence_bounds(arm) for arm in self.arms}
+        raw_bounds = {
+            arm: self._raw_confidence_bounds(arm) for arm in self.arms
+        }
+        self.conflicting_arms = [
+            arm
+            for arm, (lower, upper) in raw_bounds.items()
+            if lower > upper
+        ]
+        bounds = {
+            arm: self._resolve_confidence_bounds(arm, *raw_bounds[arm])
+            for arm in self.arms
+        }
         best_lower = max(lower for lower, _ in bounds.values())
         self.active_arms = [
             arm

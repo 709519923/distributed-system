@@ -1,5 +1,53 @@
 # Version Log
 
+## 2026-08-26
+
+### Lipschitz 置信区间冲突回退
+
+根据场景 D 的 500 批运行日志，原实现会在多个观测 arm 推导出的置信区间
+出现 `lower > upper` 时，把冲突区间压缩为中点零宽区间。这会制造虚假的
+确定性，并可能让 active set 过早缩减到单个 arm。
+
+第一步修改 `LipschitzBanditPolicy._confidence_bounds()` 的冲突回退：
+
+- 未观测 arm 回退为 `[0, 1]`，保留其探索可能性；
+- 已观测 arm 回退为该 arm 自身的直接 reward 置信区间；
+- 不再用冲突上下界的中点构造零宽区间。
+
+#### 冲突触发的 q1/q2 定向探测
+
+为避免所有冲突的未观测 arm 都以 `[0, 1]` 并列参与普通选臂，增加一次轻量的
+坐标定向探测。每段连续冲突最多安排两个未观测 arm，并在两次探测后恢复
+普通 Lipschitz-UCB 选臂：
+
+1. 以检测到冲突时的当前已观测 arm 为锚点；
+2. 优先选择与锚点 `p2` 相同、只改变 `p1` 的最近 arm，用于隔离 `q1`；
+3. 再选择与锚点 `p1` 相同、只改变 `p2` 的最近 arm，用于隔离 `q2`；
+4. 优先从发生原始区间冲突的未观测 arm 中选择；没有合适项时才从其余未观测
+   arm 中选择；
+5. 即使第一次探测后冲突暂时消失，已经排入队列的第二个坐标探测仍会完成；
+6. 两个探测完成后不继续强制遍历候选表，后续仍按 active arm 的 Lipschitz
+   上界选臂。
+
+探测完成后，使用锚点与探测 arm 的累计平均 reward 计算对应坐标的有效差异：
+
+```text
+effective_gap = max(
+    abs(probe_reward - anchor_reward)
+    - probe_confidence_radius
+    - anchor_confidence_radius,
+    0,
+)
+
+required_q = safety_factor * effective_gap / coordinate_distance
+```
+
+`q1` 探测只提高 `q1` 下限，`q2` 探测只提高 `q2` 下限；探测形成的下限在本次
+运行后续在线更新中保留。`LIPSCHITZ_SAFETY_FACTOR` 继续使用现有 `1.1`。
+
+本次没有修改 `exploration_weight=0.01`、通用 `q1/q2` 在线学习公式、active
+arm 淘汰条件、`CANDIDATE_ARMS`、decode step 或 UCB1 行为。
+
 ## 2026-08-25
 
 ### 单场景 Lipschitz-UCB / UCB1 收益与耗时对比实验
