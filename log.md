@@ -1,5 +1,26 @@
 # Version Log
 
+## 2026-08-27
+
+### 1. 独立 exploration weight
+
+- UCB1 和 Lipschitz 不再共用同一个 exploration weight。UCB1 固定使用
+  `UCB_EXPLORATION_WEIGHT=0.01`，Lipschitz 固定使用
+  `LIPSCHITZ_EXPLORATION_WEIGHT=0.05`。
+- policy factory 会按 policy 类型显式传入对应参数，避免 Lipschitz 继续继承
+  UCB1 的默认值。`batch_metrics` 和 `run_summary` 增加
+  `exploration_weight`，用于确认每次运行的实际配置。
+
+### 2. arm list 支持固定随机种子
+
+- Rank 0 scheduler 从环境变量 `BANDIT_ARM_SHUFFLE_SEED` 读取可选整数种子，
+  使用局部 `random.Random(seed)` 对 policy 自己的 candidate-arm 副本执行一次
+  shuffle，不修改全局 `CANDIDATE_ARMS`，也不在 batch 之间重新打乱。
+- 相同 seed 和相同候选集会为 UCB1、Lipschitz 生成相同排列；未设置 seed 时
+  保留原始 arm list 顺序，非整数 seed 会在启动时给出明确错误。
+- `batch_metrics` 和 `run_summary` 增加 `arm_shuffle_seed`；`run_summary` 额外记录
+  `candidate_arm_order`，便于后续确认运行所用的完整排列。
+
 ## 2026-08-26
 
 ### Lipschitz 置信区间冲突回退

@@ -23,6 +23,8 @@ allocation at all.
 
 import csv
 import math
+import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -124,6 +126,7 @@ CONTEXT_VECTOR_SIZE = 4
 # Change this value to adjust contextual warmup without hard-coding an arm count.
 CONTEXT_WARMUP_PULLS = 1
 UCB_EXPLORATION_WEIGHT = 0.01
+LIPSCHITZ_EXPLORATION_WEIGHT = 0.05
 
 CONTROLLED_LEARNING_BATCHES = 600
 CONTROLLED_TOTAL_BATCHES = 900
@@ -171,6 +174,20 @@ CONTROLLED_OUTPUT_BY_REQUEST_TYPE = {
     spec["request_type"]: int(spec["output_tokens"])
     for spec in CONTROLLED_SCENARIO_SPECS.values()
 }
+
+
+def read_arm_shuffle_seed():
+    """Return the optional fixed candidate-arm shuffle seed from the environment."""
+    raw_seed = os.getenv("BANDIT_ARM_SHUFFLE_SEED")
+    if raw_seed is None or not raw_seed.strip():
+        return None
+    try:
+        return int(raw_seed)
+    except ValueError as exc:
+        raise ValueError(
+            "BANDIT_ARM_SHUFFLE_SEED must be an integer; "
+            f"got {raw_seed!r}."
+        ) from exc
 
 # Lipschitz distance uses two online-learned effective slopes. Initializing
 # both to 0.5 preserves the old penalty 0.5 * (|dp1| + |dp2|) / total_layers.
@@ -654,6 +671,7 @@ class LayerBanditPolicy:
         window_size=2,
         warmup_skip=1,
         exploration_weight=UCB_EXPLORATION_WEIGHT,
+        arm_shuffle_seed=None,
     ):
         self.total_layers = int(total_layers)
         self.default_boundaries = [int(value) for value in default_boundaries]
@@ -661,6 +679,9 @@ class LayerBanditPolicy:
         self.window_size = int(window_size)
         self.warmup_skip = int(warmup_skip)
         self.exploration_weight = float(exploration_weight)
+        self.arm_shuffle_seed = (
+            None if arm_shuffle_seed is None else int(arm_shuffle_seed)
+        )
         self.enabled = self.world_size == 3
         self.current_arm = self.boundaries_to_arm(self.default_boundaries)
         self.active_batches = []
@@ -670,6 +691,8 @@ class LayerBanditPolicy:
         self.last_batch_was_warmup = False
 
         self.arms = self._build_candidate_arms()
+        if self.arm_shuffle_seed is not None:
+            random.Random(self.arm_shuffle_seed).shuffle(self.arms)
         if self.enabled and self.current_arm not in self.arms:
             self.arms.insert(0, self.current_arm)
         self.stats = {arm: self._new_stats() for arm in self.arms}
@@ -1230,6 +1253,7 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
     policy_name = "lipschitz"
 
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("exploration_weight", LIPSCHITZ_EXPLORATION_WEIGHT)
         super().__init__(*args, **kwargs)
         self.q1 = float(LIPSCHITZ_INITIAL_Q1)
         self.q2 = float(LIPSCHITZ_INITIAL_Q2)
@@ -1707,17 +1731,35 @@ def normalize_bandit_policy_name(name):
     return (name or "ucb").strip().lower().replace("-", "_")
 
 
-def create_bandit_policy(policy_name, total_layers, default_boundaries, world_size):
+def create_bandit_policy(
+    policy_name,
+    total_layers,
+    default_boundaries,
+    world_size,
+    arm_shuffle_seed=None,
+):
     """Create a bandit policy while keeping UCB as the default behavior."""
     normalized_name = normalize_bandit_policy_name(policy_name)
     policy_class = BANDIT_POLICY_CLASSES.get(normalized_name)
     if policy_class is None:
         valid_names = ", ".join(sorted(BANDIT_POLICY_CLASSES))
         raise ValueError(f"Unknown bandit_policy={policy_name!r}; valid values: {valid_names}")
+    policy_kwargs = {}
+    if normalized_name == "ucb":
+        policy_kwargs.update(
+            exploration_weight=UCB_EXPLORATION_WEIGHT,
+            arm_shuffle_seed=arm_shuffle_seed,
+        )
+    elif normalized_name == "lipschitz":
+        policy_kwargs.update(
+            exploration_weight=LIPSCHITZ_EXPLORATION_WEIGHT,
+            arm_shuffle_seed=arm_shuffle_seed,
+        )
     return policy_class(
         total_layers=total_layers,
         default_boundaries=default_boundaries,
         world_size=world_size,
+        **policy_kwargs,
     )
 
 
@@ -1744,6 +1786,7 @@ class Scheduler:
         self.default_boundaries = [int(value) for value in default_boundaries]
         self.fieldnames = ["batch"] + [f"rank{rank}" for rank in range(self.world_size)]
         self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
+        self.arm_shuffle_seed = read_arm_shuffle_seed()
         self.experiment_scenario = str(experiment_scenario or "").strip().upper()
         self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         self.run_id = self.run_timestamp
@@ -1806,6 +1849,8 @@ class Scheduler:
             "run_id",
             "policy",
             "scenario",
+            "arm_shuffle_seed",
+            "exploration_weight",
             "batch",
             "prompt_index",
             "input_tokens",
@@ -1832,6 +1877,9 @@ class Scheduler:
             "run_id",
             "policy",
             "scenario",
+            "arm_shuffle_seed",
+            "exploration_weight",
+            "candidate_arm_order",
             "status",
             "total_batches",
             "measured_batches",
@@ -1875,6 +1923,7 @@ class Scheduler:
             total_layers=self.total_layers,
             default_boundaries=self.default_boundaries,
             world_size=self.world_size,
+            arm_shuffle_seed=self.arm_shuffle_seed,
         )
 
     def get_or_create(self, batch):
@@ -2115,6 +2164,10 @@ class Scheduler:
             "run_id": self.run_id,
             "policy": self.bandit_policy_name,
             "scenario": context.get("scenario", self.experiment_scenario),
+            "arm_shuffle_seed": (
+                "" if self.bandit.arm_shuffle_seed is None else self.bandit.arm_shuffle_seed
+            ),
+            "exploration_weight": self.bandit.exploration_weight,
             "batch": batch,
             "prompt_index": int(prompt_index),
             "input_tokens": int(context.get("input_tokens_max", 0)),
@@ -2175,6 +2228,13 @@ class Scheduler:
             "run_id": self.run_id,
             "policy": self.bandit_policy_name,
             "scenario": self.experiment_scenario,
+            "arm_shuffle_seed": (
+                "" if self.bandit.arm_shuffle_seed is None else self.bandit.arm_shuffle_seed
+            ),
+            "exploration_weight": self.bandit.exploration_weight,
+            "candidate_arm_order": "|".join(
+                self.bandit._format_arm(arm) for arm in self.bandit.arms
+            ),
             "status": status,
             "total_batches": len(rows),
             "measured_batches": len(measured_rows),
