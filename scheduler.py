@@ -23,7 +23,6 @@ allocation at all.
 
 import csv
 import math
-import os
 import random
 import re
 import time
@@ -127,6 +126,7 @@ CONTEXT_VECTOR_SIZE = 4
 CONTEXT_WARMUP_PULLS = 1
 UCB_EXPLORATION_WEIGHT = 0.01
 LIPSCHITZ_EXPLORATION_WEIGHT = 0.05
+ARM_SHUFFLE_SEED = 42
 
 CONTROLLED_LEARNING_BATCHES = 600
 CONTROLLED_TOTAL_BATCHES = 900
@@ -174,20 +174,6 @@ CONTROLLED_OUTPUT_BY_REQUEST_TYPE = {
     spec["request_type"]: int(spec["output_tokens"])
     for spec in CONTROLLED_SCENARIO_SPECS.values()
 }
-
-
-def read_arm_shuffle_seed():
-    """Return the optional fixed candidate-arm shuffle seed from the environment."""
-    raw_seed = os.getenv("BANDIT_ARM_SHUFFLE_SEED")
-    if raw_seed is None or not raw_seed.strip():
-        return None
-    try:
-        return int(raw_seed)
-    except ValueError as exc:
-        raise ValueError(
-            "BANDIT_ARM_SHUFFLE_SEED must be an integer; "
-            f"got {raw_seed!r}."
-        ) from exc
 
 # Lipschitz distance uses two online-learned effective slopes. Initializing
 # both to 0.5 preserves the old penalty 0.5 * (|dp1| + |dp2|) / total_layers.
@@ -1786,7 +1772,7 @@ class Scheduler:
         self.default_boundaries = [int(value) for value in default_boundaries]
         self.fieldnames = ["batch"] + [f"rank{rank}" for rank in range(self.world_size)]
         self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
-        self.arm_shuffle_seed = read_arm_shuffle_seed()
+        self.arm_shuffle_seed = ARM_SHUFFLE_SEED
         self.experiment_scenario = str(experiment_scenario or "").strip().upper()
         self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         self.run_id = self.run_timestamp

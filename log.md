@@ -13,11 +13,11 @@
 
 ### 2. arm list 支持固定随机种子
 
-- Rank 0 scheduler 从环境变量 `BANDIT_ARM_SHUFFLE_SEED` 读取可选整数种子，
+- Rank 0 scheduler 直接使用代码常量 `ARM_SHUFFLE_SEED` 作为固定随机种子，
   使用局部 `random.Random(seed)` 对 policy 自己的 candidate-arm 副本执行一次
   shuffle，不修改全局 `CANDIDATE_ARMS`，也不在 batch 之间重新打乱。
-- 相同 seed 和相同候选集会为 UCB1、Lipschitz 生成相同排列；未设置 seed 时
-  保留原始 arm list 顺序，非整数 seed 会在启动时给出明确错误。
+- 默认设置为 `ARM_SHUFFLE_SEED=42`；三组重复实验时手动依次改为 `42`、`43`、
+  `44`。相同 seed 和相同候选集会为 UCB1、Lipschitz 生成相同排列。
 - `batch_metrics` 和 `run_summary` 增加 `arm_shuffle_seed`；`run_summary` 额外记录
   `candidate_arm_order`，便于后续确认运行所用的完整排列。
 
