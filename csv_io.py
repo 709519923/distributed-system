@@ -75,6 +75,71 @@ def read_contextual_controlled_rows(csv_path, prompt_column):
     return records
 
 
+def read_def_interleaved_rows(csv_path):
+    """Read and validate the 1,500-row DEF sidecar manifest.
+
+    Prompts remain in the normal input CSV. This sidecar describes the
+    observable request budget for each prompt and provides audit-only D/E/F
+    metadata, so the normal prompt reader remains compatible with older runs.
+    """
+    records = []
+    required = {
+        "batch",
+        "scenario",
+        "request_type",
+        "target_output_tokens",
+        "source_row",
+    }
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("DEF context manifest requires a CSV header.")
+        missing = sorted(required.difference(reader.fieldnames))
+        if missing:
+            raise ValueError("DEF context manifest is missing columns: " + ", ".join(missing))
+
+        for row_number, row in enumerate(reader, start=2):
+            try:
+                batch = int(str(row.get("batch") or "").strip())
+                source_row = int(str(row.get("source_row") or "").strip())
+                target_output_tokens = int(
+                    str(row.get("target_output_tokens") or "").strip()
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"DEF context manifest row {row_number} has invalid numeric fields."
+                ) from exc
+            scenario = str(row.get("scenario") or "").strip().upper()
+            request_type = str(row.get("request_type") or "").strip()
+            expected_batch = len(records) + 1
+            expected_scenario = ("D", "E", "F")[(expected_batch - 1) % 3]
+            expected_source_row = (expected_batch - 1) // 3 + 1
+            if batch != expected_batch:
+                raise ValueError(
+                    f"DEF context manifest row {row_number} must have batch="
+                    f"{expected_batch}, got {batch}."
+                )
+            if scenario != expected_scenario or source_row != expected_source_row:
+                raise ValueError(
+                    f"DEF context manifest row {row_number} must be "
+                    f"{expected_scenario}{expected_source_row}, got {scenario}{source_row}."
+                )
+            if not request_type or target_output_tokens < 1:
+                raise ValueError(
+                    f"DEF context manifest row {row_number} has invalid request settings."
+                )
+            records.append(
+                {
+                    "batch": batch,
+                    "scenario": scenario,
+                    "request_type": request_type,
+                    "target_output_tokens": target_output_tokens,
+                    "source_row": source_row,
+                }
+            )
+    return records
+
+
 def chunk_items(items, batch_size):
     """Yield (batch_number, start_index, chunk) for dynamic prompt batching.
 

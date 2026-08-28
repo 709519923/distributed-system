@@ -119,6 +119,10 @@ REQUEST_TYPE_SPECS = (
 
 CONTEXT_INPUT_TOKEN_SCALE = 1500.0
 CONTEXT_OUTPUT_TOKEN_SCALE = 512.0
+# DEF extends the existing contextual ranges. These scales are intentionally
+# DEF-only so prior A/B/C contextual experiments keep their original features.
+DEF_CONTEXT_INPUT_TOKEN_SCALE = 1800.0
+DEF_CONTEXT_OUTPUT_TOKEN_SCALE = 768.0
 CONTEXT_BATCH_SIZE_SCALE = 128.0
 CONTEXT_VECTOR_SIZE = 4
 # Number of mandatory observations for every actual arm under each request type.
@@ -132,6 +136,7 @@ CONTROLLED_LEARNING_BATCHES = 600
 CONTROLLED_TOTAL_BATCHES = 900
 CONTROLLED_EXPECTED_ARM_COUNT = 20
 CONTROLLED_CONTEXT_WARMUP_PULLS = 10
+DEF_INTERLEAVED_TOTAL_BATCHES = 1500
 CONTROLLED_SCENARIO_SPECS = {
     "A": {
         "request_type": "long_input_short_output",
@@ -510,6 +515,81 @@ def build_single_scenario_context(batch, base_context, scenario):
             "inferred_request_type": scenario_spec["request_type"],
             "estimated_output_tokens": float(scenario_spec["output_tokens"]),
             "target_output_tokens": int(scenario_spec["output_tokens"]),
+        }
+    )
+    return context
+
+
+def build_def_interleaved_context(batch, base_context, manifest_row):
+    """Attach the observable request parameters for one interleaved DEF batch.
+
+    ``scenario`` and ``source_row`` are audit metadata only. The contextual
+    policy receives prompt-length and target-output features, never the D/E/F
+    label itself.
+    """
+    batch = int(batch)
+    if not base_context:
+        raise ValueError(f"Missing prompt context for DEF batch {batch}.")
+
+    scenario = str(manifest_row.get("scenario") or "").strip().upper()
+    scenario_spec = CONTROLLED_SCENARIO_SPECS.get(scenario)
+    if scenario not in {"D", "E", "F"} or scenario_spec is None:
+        raise ValueError(f"Batch {batch} has unsupported DEF scenario={scenario!r}.")
+
+    try:
+        source_row = int(str(manifest_row.get("source_row") or "").strip())
+        target_output_tokens = int(
+            str(manifest_row.get("target_output_tokens") or "").strip()
+        )
+    except ValueError as exc:
+        raise ValueError(f"Batch {batch} has invalid DEF manifest values.") from exc
+    if source_row < 1:
+        raise ValueError(f"Batch {batch} has invalid source_row={source_row}.")
+
+    request_type = str(manifest_row.get("request_type") or "").strip()
+    expected_request_type = str(scenario_spec["request_type"])
+    expected_output_tokens = int(scenario_spec["output_tokens"])
+    if request_type != expected_request_type:
+        raise ValueError(
+            f"Batch {batch} scenario {scenario} requires request_type="
+            f"{expected_request_type!r}, got {request_type!r}."
+        )
+    if target_output_tokens != expected_output_tokens:
+        raise ValueError(
+            f"Batch {batch} scenario {scenario} requires target_output_tokens="
+            f"{expected_output_tokens}, got {target_output_tokens}."
+        )
+
+    input_tokens_max = int(base_context.get("input_tokens_max", 0))
+    input_min = int(scenario_spec["input_min"])
+    input_max = int(scenario_spec["input_max"])
+    if not input_min <= input_tokens_max <= input_max:
+        raise ValueError(
+            f"Batch {batch} scenario {scenario} has input_tokens="
+            f"{input_tokens_max}; expected [{input_min}, {input_max}]."
+        )
+
+    context = dict(base_context)
+    input_request_type = str(context.get("request_type") or "")
+    features = list(context.get("features") or [])
+    if len(features) != CONTEXT_VECTOR_SIZE:
+        raise ValueError(f"Batch {batch} has invalid context features: {features}")
+    features[1] = clamp01(
+        float(context.get("input_tokens", 0.0)) / DEF_CONTEXT_INPUT_TOKEN_SCALE
+    )
+    features[2] = clamp01(target_output_tokens / DEF_CONTEXT_OUTPUT_TOKEN_SCALE)
+    context.update(
+        {
+            "phase": "def_interleaved",
+            "label_used": 0,
+            "scenario": scenario,
+            "source_row": source_row,
+            "input_request_type": input_request_type,
+            "request_type": request_type,
+            "inferred_request_type": input_request_type,
+            "estimated_output_tokens": float(target_output_tokens),
+            "target_output_tokens": target_output_tokens,
+            "features": features,
         }
     )
     return context
@@ -967,6 +1047,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         self.last_context = None
         self.last_context_key = "unknown"
         self.last_features = [1.0, 0.0, 0.0, 0.0]
+        self.last_selection_mode = "uninitialized"
         super().__init__(
             total_layers=total_layers,
             default_boundaries=default_boundaries,
@@ -1005,6 +1086,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         for arm in self.arms:
             if int(context_pulls.get(arm, 0)) < self.context_warmup_pulls:
                 self.current_arm = arm
+                self.last_selection_mode = "context_warmup"
                 return arm
 
         best_arm = self.arms[0]
@@ -1015,6 +1097,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
                 best_arm = arm
                 best_score = score
         self.current_arm = best_arm
+        self.last_selection_mode = "linucb"
         return best_arm
 
     def update_after_batch(self, batch, batch_summary_history):
@@ -1765,6 +1848,7 @@ class Scheduler:
         world_size,
         bandit_policy="ucb",
         experiment_scenario=None,
+        top_k_arms=5,
     ):
         self.path = Path(allocation_csv)
         self.total_layers = int(total_layers)
@@ -1774,12 +1858,18 @@ class Scheduler:
         self.bandit_policy_name = normalize_bandit_policy_name(bandit_policy)
         self.arm_shuffle_seed = ARM_SHUFFLE_SEED
         self.experiment_scenario = str(experiment_scenario or "").strip().upper()
+        self.top_k_arms = int(top_k_arms)
+        if self.top_k_arms < 1:
+            raise ValueError(f"top_k_arms must be positive, got {self.top_k_arms}")
         self.run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         self.run_id = self.run_timestamp
         self.bandit_log_dir = self.path.parent / "bandit_logs"
         self.summary_path = self.bandit_log_dir / f"scheduler_summary_{self.run_timestamp}.csv"
         self.arm_details_path = self.bandit_log_dir / f"arm_details_{self.run_timestamp}.csv"
         experiment_label = self.experiment_scenario or "mixed"
+        self.top_k_path = self.bandit_log_dir / (
+            f"top_k_arms_{self.bandit_policy_name}_{experiment_label}_{self.run_timestamp}.csv"
+        )
         self.batch_metrics_path = self.bandit_log_dir / (
             f"batch_metrics_{self.bandit_policy_name}_{experiment_label}_{self.run_timestamp}.csv"
         )
@@ -1795,11 +1885,17 @@ class Scheduler:
             "time_ms",
         ]
         self.arm_details_fieldnames = [
+            "run_id",
             "batch",
             "policy",
+            "snapshot",
+            "selection_mode",
             "phase",
             "label_used",
             "scenario",
+            "source_row",
+            "input_tokens",
+            "request_type",
             "inferred_request_type",
             "target_output_tokens",
             "model_updated",
@@ -1816,6 +1912,8 @@ class Scheduler:
             "score_before",
             "score",
             "score_delta",
+            "score_rank",
+            "in_top_k",
             "confidence_lower",
             "confidence_upper",
             "confidence_width",
@@ -1830,6 +1928,22 @@ class Scheduler:
             "active_arms",
             "selected",
             "next_selected",
+        ]
+        self.top_k_fieldnames = [
+            "run_id",
+            "policy",
+            "snapshot",
+            "selection_mode",
+            "batch",
+            "scenario",
+            "source_row",
+            "input_tokens",
+            "request_type",
+            "target_output_tokens",
+            "top_k",
+            "top_k_arms",
+            "top_k_scores",
+            "selected_arm",
         ]
         self.batch_metrics_fieldnames = [
             "run_id",
@@ -2060,8 +2174,17 @@ class Scheduler:
         """Persist existing scheduler summaries and per-arm audit rows."""
         summary = self.batch_summary_history.get(int(batch), {})
         used_arm = summary.get("arm", self.bandit.current_arm)
-        self.append_arm_details(batch, used_arm)
+        self.append_arm_details(batch, used_arm, snapshot="post_update")
         self.save_summary_history()
+
+    def write_pre_batch_prediction(self, batch, context, selected_arm):
+        """Persist the ranking used to make a DEF batch allocation decision."""
+        self.append_arm_details(
+            batch,
+            selected_arm,
+            snapshot="pre_update",
+            context=context,
+        )
 
     def reallocate_layer(self, batch=None, arm=None, rank_metrics=None):
         """Write the selected current-batch layer allocation to scheduler.csv.
@@ -2269,25 +2392,36 @@ class Scheduler:
             writer.writeheader()
             writer.writerow(output)
 
-    def append_arm_details(self, batch, selected_arm):
-        """Append one policy-state snapshot for every candidate arm."""
+    def append_arm_details(self, batch, selected_arm, snapshot="post_update", context=None):
+        """Append a ranked policy-state snapshot and its compact Top-K set."""
         self.arm_details_path.parent.mkdir(parents=True, exist_ok=True)
         file_exists = self.arm_details_path.exists()
         summary = self.batch_summary_history.get(int(batch), {})
-        context = summary.get("context") or {}
+        context = context if context is not None else (summary.get("context") or {})
         controlled_policy = self.bandit_policy_name == "contextual_controlled"
+        ranked_rows, top_rows = self._rank_arm_snapshot(
+            self.bandit.arm_score_snapshot(selected_arm)
+        )
         with open(self.arm_details_path, "a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.arm_details_fieldnames)
             if not file_exists:
                 writer.writeheader()
-            for row in self.bandit.arm_score_snapshot(selected_arm):
+            for row in ranked_rows:
                 output = {field: row.get(field, "") for field in self.arm_details_fieldnames}
+                output["run_id"] = self.run_id
                 output["batch"] = int(batch)
                 output["policy"] = self.bandit_policy_name
+                output["snapshot"] = snapshot
+                output["selection_mode"] = getattr(
+                    self.bandit, "last_selection_mode", ""
+                )
                 if context:
                     output["phase"] = context.get("phase", "")
                     output["label_used"] = context.get("label_used", "")
                     output["scenario"] = context.get("scenario", "")
+                    output["source_row"] = context.get("source_row", "")
+                    output["input_tokens"] = context.get("input_tokens_max", "")
+                    output["request_type"] = context.get("request_type", "")
                     output["inferred_request_type"] = context.get(
                         "inferred_request_type",
                         context.get("request_type", ""),
@@ -2303,6 +2437,68 @@ class Scheduler:
                         bool(getattr(self.bandit, "last_model_updated", False))
                     )
                 writer.writerow(output)
+        self._append_top_k_snapshot(
+            batch=batch,
+            context=context,
+            selected_arm=selected_arm,
+            snapshot=snapshot,
+            top_rows=top_rows,
+        )
+
+    def _rank_arm_snapshot(self, rows):
+        """Return stable descending score ranks and the corresponding Top-K rows."""
+        ranked_rows = [dict(row) for row in rows]
+        scored_rows = []
+        for index, row in enumerate(ranked_rows):
+            try:
+                score = float(row.get("score", ""))
+            except (TypeError, ValueError):
+                row["score_rank"] = ""
+                row["in_top_k"] = 0
+                continue
+            scored_rows.append((index, score))
+
+        scored_rows.sort(key=lambda item: (-item[1], item[0]))
+        top_count = min(self.top_k_arms, len(scored_rows))
+        for rank, (index, _score) in enumerate(scored_rows, start=1):
+            ranked_rows[index]["score_rank"] = rank
+            ranked_rows[index]["in_top_k"] = int(rank <= top_count)
+        return ranked_rows, [ranked_rows[index] for index, _ in scored_rows[:top_count]]
+
+    def _append_top_k_snapshot(self, batch, context, selected_arm, snapshot, top_rows):
+        """Append one compact Top-K arm-set row for later set-similarity analysis."""
+        self.top_k_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = self.top_k_path.exists()
+        selected_arm_text = (
+            self.bandit._format_arm(selected_arm) if selected_arm is not None else ""
+        )
+        top_scores = []
+        for row in top_rows:
+            try:
+                top_scores.append(f"{float(row['score']):.6f}")
+            except (KeyError, TypeError, ValueError):
+                top_scores.append("")
+        output = {
+            "run_id": self.run_id,
+            "policy": self.bandit_policy_name,
+            "snapshot": snapshot,
+            "selection_mode": getattr(self.bandit, "last_selection_mode", ""),
+            "batch": int(batch),
+            "scenario": context.get("scenario", ""),
+            "source_row": context.get("source_row", ""),
+            "input_tokens": context.get("input_tokens_max", ""),
+            "request_type": context.get("request_type", ""),
+            "target_output_tokens": context.get("target_output_tokens", ""),
+            "top_k": len(top_rows),
+            "top_k_arms": "|".join(str(row.get("arm", "")) for row in top_rows),
+            "top_k_scores": "|".join(top_scores),
+            "selected_arm": selected_arm_text,
+        }
+        with open(self.top_k_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.top_k_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(output)
 
     def _load_existing_file(self):
         """Load scheduler.csv if it already exists."""

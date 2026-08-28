@@ -15,6 +15,7 @@ from config import STATUS_BATCH_DONE, default_boundaries_for_world_size, stage_f
 from csv_io import (
     chunk_items,
     read_contextual_controlled_rows,
+    read_def_interleaved_rows,
     read_prompts,
     write_output_rows,
 )
@@ -58,8 +59,10 @@ from pipeline_comm import (
 )
 from scheduler import (
     CONTROLLED_TOTAL_BATCHES,
+    DEF_INTERLEAVED_TOTAL_BATCHES,
     Scheduler,
     build_contextual_controlled_context,
+    build_def_interleaved_context,
     build_prompt_batch_contexts,
     build_single_scenario_context,
 )
@@ -956,7 +959,9 @@ def rank0_generate_dynamic(
     comm_device = comm_device or device
     comm_dtype = comm_dtype or dtype
     controlled_rows = None
+    def_rows = None
     experiment_scenario = getattr(args, "experiment_scenario", None)
+    context_manifest = getattr(args, "context_manifest", None)
     if experiment_scenario is not None:
         if args.bandit_policy not in {"ucb", "lipschitz"}:
             raise ValueError("--experiment-scenario requires --bandit-policy ucb or lipschitz.")
@@ -967,6 +972,25 @@ def rank0_generate_dynamic(
         if args.force_decode_steps is not None:
             raise ValueError(
                 "--experiment-scenario cannot be combined with --force-decode-steps."
+            )
+    if context_manifest is not None:
+        if args.bandit_policy != "contextual":
+            raise ValueError("--context-manifest requires --bandit-policy contextual.")
+        if experiment_scenario is not None:
+            raise ValueError("--context-manifest cannot be combined with --experiment-scenario.")
+        if not args.csv_has_header:
+            raise ValueError("--context-manifest requires --csv-has-header.")
+        if not args.allocation_csv:
+            raise ValueError("--context-manifest requires --allocation-csv.")
+        if int(args.batch_size) != 1:
+            raise ValueError("--context-manifest requires --batch-size 1.")
+        if args.force_decode_steps is not None:
+            raise ValueError("--context-manifest cannot be combined with --force-decode-steps.")
+        def_rows = read_def_interleaved_rows(context_manifest)
+        if len(def_rows) != DEF_INTERLEAVED_TOTAL_BATCHES:
+            raise ValueError(
+                f"DEF context manifest expects {DEF_INTERLEAVED_TOTAL_BATCHES} rows; "
+                f"got {len(def_rows)}."
             )
     if args.bandit_policy == "contextual_controlled":
         if not args.csv_has_header:
@@ -991,6 +1015,11 @@ def rank0_generate_dynamic(
         prompts = [row["prompt"] for row in controlled_rows]
     else:
         prompts = read_prompts(args.input_csv, args.csv_has_header, args.prompt_column)
+    if def_rows is not None and len(prompts) != len(def_rows):
+        raise ValueError(
+            f"DEF prompt CSV has {len(prompts)} rows but the context manifest has "
+            f"{len(def_rows)} rows."
+        )
     if not prompts:
         print(f"[Rank 0] No prompts found in {args.input_csv}")
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
@@ -1007,7 +1036,8 @@ def rank0_generate_dynamic(
             default_boundaries,
             world_size,
             bandit_policy=args.bandit_policy,
-            experiment_scenario=experiment_scenario,
+            experiment_scenario="DEF" if def_rows is not None else experiment_scenario,
+            top_k_arms=args.top_k_arms,
         )
         batch_contexts = build_prompt_batch_contexts(
             prompts=prompts,
@@ -1021,6 +1051,14 @@ def rank0_generate_dynamic(
                     batch=batch_number,
                     base_context=batch_contexts.get(batch_number),
                     labeled_row=labeled_row,
+                )
+                batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
+        elif def_rows is not None:
+            for batch_number, manifest_row in enumerate(def_rows, start=1):
+                batch_contexts[batch_number] = build_def_interleaved_context(
+                    batch=batch_number,
+                    base_context=batch_contexts.get(batch_number),
+                    manifest_row=manifest_row,
                 )
                 batch_contexts[batch_number]["max_new_tokens"] = int(args.max_new_tokens)
         elif experiment_scenario is not None:
@@ -1047,6 +1085,7 @@ def rank0_generate_dynamic(
             if (
                 args.bandit_policy == "contextual_controlled"
                 or experiment_scenario is not None
+                or def_rows is not None
             ) and batch_context is not None:
                 forced_output_tokens = batch_context.get("target_output_tokens")
             if scheduler is not None:
@@ -1054,6 +1093,12 @@ def rank0_generate_dynamic(
                     batch=batch_number,
                     context=batch_context,
                 )
+                if def_rows is not None:
+                    scheduler.write_pre_batch_prediction(
+                        batch=batch_number,
+                        context=batch_context,
+                        selected_arm=selected_arm,
+                    )
                 if selected_arm is None:
                     boundaries, allocation = boundaries_for_batch(
                         args,
@@ -1105,6 +1150,14 @@ def rank0_generate_dynamic(
                 print(
                     f"[Rank 0] Batch {batch_number}: scenario={experiment_scenario}; "
                     f"request_type={batch_context['request_type']}; "
+                    f"output_tokens={forced_output_tokens}"
+                )
+            elif def_rows is not None:
+                print(
+                    f"[Rank 0] Batch {batch_number}: DEF scenario="
+                    f"{batch_context['scenario']}; source_row="
+                    f"{batch_context['source_row']}; request_type="
+                    f"{batch_context['request_type']}; "
                     f"output_tokens={forced_output_tokens}"
                 )
 

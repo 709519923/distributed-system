@@ -40,6 +40,14 @@ def parse_args():
         help="CSV file. One row is one prompt. Default: prompts.csv",
     )
     parser.add_argument(
+        "--context-manifest",
+        default=None,
+        help=(
+            "DEF interleaved sidecar CSV with per-batch scenario, request type, "
+            "and target output tokens. Requires --bandit-policy contextual."
+        ),
+    )
+    parser.add_argument(
         "--output-csv",
         default="outputs.csv",
         help="Rank 0 writes generated results here. Default: outputs.csv",
@@ -163,6 +171,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--top-k-arms",
+        type=int,
+        default=5,
+        help=(
+            "Number of highest-scoring arms to store per scheduler snapshot. "
+            "Default: 5."
+        ),
+    )
+    parser.add_argument(
         "--experiment-scenario",
         type=lambda value: value.strip().upper(),
         choices=("A", "B", "C", "D", "E", "F"),
@@ -200,6 +217,8 @@ def parse_args():
     args = parser.parse_args()
     if args.force_decode_steps is not None and args.force_decode_steps < 0:
         parser.error("--force-decode-steps must be a non-negative integer.")
+    if args.top_k_arms < 1:
+        parser.error("--top-k-arms must be a positive integer.")
     return args
 
 
