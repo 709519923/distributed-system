@@ -159,6 +159,7 @@ def parse_args():
             "ucb",
             "contextual",
             "contextual_controlled",
+            "contextual_woscenario",
             "lipschitz",
             "contextual_lipschitz",
         ),
@@ -166,8 +167,9 @@ def parse_args():
         help=(
             "Rank 0 scheduler bandit policy. Default: ucb. contextual uses "
             "current-batch prompt context before selecting the current arm. "
-            "contextual_controlled uses the labeled 600-batch learning and "
-            "300-batch evaluation protocol."
+            "contextual_controlled isolates online models by inferred DEF key. "
+            "contextual_woscenario pools all controlled DEF batches into one "
+            "intercept-only online model."
         ),
     )
     parser.add_argument(

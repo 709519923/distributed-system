@@ -1,5 +1,56 @@
 # Version Log
 
+## 2026-09-07
+
+### 新增 `contextual_woscenario`：不使用输入特征的全局在线策略
+
+在现有 `contextual_controlled` 之外新增
+`BANDIT_POLICY=contextual_woscenario`，用于与“按 DEF context key 隔离参数”的
+实验进行对照。该策略继续读取同一份 900-batch、D/E/F 交替的受控数据，并按
+CSV 的 `target_output_tokens` 固定每批工作负载；但场景、request type、input
+length、output length 和 source row 都只用于工作负载控制与日志审计，不参与
+选臂或模型更新。
+
+#### 选臂模型
+
+- 所有 batch 固定使用特征向量 `phi=[1,0,0,0]`，不再识别或推断输入特征。
+- 所有 D/E/F 数据使用唯一的 `context_key=global` 和同一套 per-arm `A/b`
+  参数；不创建按场景隔离的模型。
+- 每个 arm 因而只学习一个全局截距。其 score 仍沿用 LinUCB：
+
+  ```text
+  theta_a = A_a^-1 b_a
+  score_a = theta_a^T phi + 0.05 * sqrt(phi^T A_a^-1 phi)
+  ```
+
+- 模型在全部 900 个 batch 中持续在线更新，没有验证阶段，也不冻结参数。
+
+#### 全局 warmup
+
+候选集固定为 195 个 arm。全局 warmup 对每个 arm 连续执行 3 次；因为输入顺序
+固定为 D/E/F 交替，同一 arm 会依次观察 D、E、F 各一次，然后才切换到下一个
+arm。因此 warmup 共占 `195 * 3 = 585` 个 batch，batch 586 起按全局 LinUCB
+score 选臂。这里的 3 次只是保证三个工作负载各贡献一次 reward，不会建立三个
+context key，也不会向模型暴露场景信息。
+
+#### 数据与日志
+
+- 复用 `contextual_controlled_def_900.csv`、原有 `arm_details`、Top-K、
+  batch metrics 和 run summary 输出，不增加新的日志格式。
+- `arm_details` 中仍记录 scenario、request type、input/output length 和
+  `model_updated`，便于事后按 D/E/F 分组分析；这些字段不是 policy 输入。
+- `run.sh` 默认切换到 `contextual_woscenario`，保留 Rank 0 CPU、现有网络地址、
+  数据集和 Rank 2 网卡配置，只更换 scheduler/output 文件名以避免覆盖前次实验。
+
+#### 文件改动
+
+- `scheduler.py`：新增全局 intercept-only policy、三次全局 warmup、factory 注册
+  和受控日志支持。
+- `config.py`：新增命令行 policy 选项。
+- `inference_loops.py`：让新 policy 复用现有 900-batch 受控数据和固定输出流程。
+- `run.sh`：默认选择新 policy，并使用独立输出文件名。
+- `log.md`：记录本节设计与实验语义。
+
 ## 2026-08-27
 
 ### 1. 独立 exploration weight

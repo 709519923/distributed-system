@@ -68,6 +68,11 @@ from scheduler import (
 )
 
 
+CONTROLLED_CONTEXTUAL_POLICIES = frozenset(
+    {"contextual_controlled", "contextual_woscenario"}
+)
+
+
 def cloud_base_kv_transfer_has_effect(environment, src_rank, world_size):
     """Return True when any cloud-base KV target link uses Environment simulation."""
     if environment is None:
@@ -992,16 +997,21 @@ def rank0_generate_dynamic(
                 f"DEF context manifest expects {DEF_INTERLEAVED_TOTAL_BATCHES} rows; "
                 f"got {len(def_rows)}."
             )
-    if args.bandit_policy == "contextual_controlled":
+    if args.bandit_policy in CONTROLLED_CONTEXTUAL_POLICIES:
         if not args.csv_has_header:
-            raise ValueError("contextual_controlled requires --csv-has-header.")
+            raise ValueError(
+                f"{args.bandit_policy} requires --csv-has-header."
+            )
         if not args.allocation_csv:
-            raise ValueError("contextual_controlled requires --allocation-csv.")
+            raise ValueError(
+                f"{args.bandit_policy} requires --allocation-csv."
+            )
         if int(args.batch_size) != 1:
-            raise ValueError("contextual_controlled requires --batch-size 1.")
+            raise ValueError(f"{args.bandit_policy} requires --batch-size 1.")
         if args.force_decode_steps is not None:
             raise ValueError(
-                "contextual_controlled cannot be combined with --force-decode-steps."
+                f"{args.bandit_policy} cannot be combined with "
+                "--force-decode-steps."
             )
         controlled_rows = read_contextual_controlled_rows(
             args.input_csv,
@@ -1009,7 +1019,7 @@ def rank0_generate_dynamic(
         )
         if len(controlled_rows) != CONTROLLED_TOTAL_BATCHES:
             raise ValueError(
-                f"contextual_controlled expects {CONTROLLED_TOTAL_BATCHES} CSV rows; "
+                f"{args.bandit_policy} expects {CONTROLLED_TOTAL_BATCHES} CSV rows; "
                 f"got {len(controlled_rows)}."
             )
         prompts = [row["prompt"] for row in controlled_rows]
@@ -1083,7 +1093,7 @@ def rank0_generate_dynamic(
             batch_context = batch_contexts.get(batch_number)
             forced_output_tokens = None
             if (
-                args.bandit_policy == "contextual_controlled"
+                args.bandit_policy in CONTROLLED_CONTEXTUAL_POLICIES
                 or experiment_scenario is not None
                 or def_rows is not None
             ) and batch_context is not None:
@@ -1133,7 +1143,7 @@ def rank0_generate_dynamic(
                 f"[Rank 0] Batch {batch_number}: {interval_text}; "
                 f"prompts={len(prompt_batch)}"
             )
-            if args.bandit_policy == "contextual_controlled":
+            if args.bandit_policy in CONTROLLED_CONTEXTUAL_POLICIES:
                 target_text = (
                     str(forced_output_tokens)
                     if forced_output_tokens is not None

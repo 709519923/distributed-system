@@ -15,21 +15,11 @@ BYTES_PER_MB = 1024 * 1024
 # Index convention:
 # 0: 0->1, 1: 1->2, 2: 2->0, 3: 0->2, 4: 2->1
 DEFAULT_BANDWIDTH = [None, None, None, None, None]
-DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
+DEFAULT_TIME_COMM_DELAY = [10.0, 30.0, 40.0, 0.0, 0.0]
 
 # Optional schedule. A key means "from this batch onward".
 # Example:
-DEFAULT_SCHEDULE = {
-    10: {
-        "Bandwidth": [None, None, None, None, None],
-        "time_comm_delay": [0.0, 0.0, 0.0, 0.0, 0.0],
-    },
-    50: {
-        "Bandwidth": [None, None, None, None, None],
-        "time_comm_delay": [0.0, 0.0, 0.0, 0.0, 0.0],
-    },
-}
-# DEFAULT_SCHEDULE = {}
+DEFAULT_SCHEDULE = {}
 
 
 class Environment:

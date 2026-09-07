@@ -98,22 +98,22 @@ def boundaries_to_intervals(boundaries):
 
 REQUEST_TYPE_SPECS = (
     {
-        "name": "short_input_long_output",
+        "name": "extreme_decode",
         "input_min": 10.0,
-        "input_max": 150.0,
-        "output_estimate": 400.0,
+        "input_max": 64.0,
+        "output_estimate": 768.0,
     },
     {
-        "name": "medium_input_medium_output",
-        "input_min": 200.0,
-        "input_max": 600.0,
-        "output_estimate": 256.0,
-    },
-    {
-        "name": "long_input_short_output",
+        "name": "long_context_decode",
         "input_min": 800.0,
-        "input_max": 1500.0,
-        "output_estimate": 90.0,
+        "input_max": 1100.0,
+        "output_estimate": 512.0,
+    },
+    {
+        "name": "extreme_prefill",
+        "input_min": 1500.0,
+        "input_max": 1800.0,
+        "output_estimate": 32.0,
     },
 )
 
@@ -132,10 +132,14 @@ UCB_EXPLORATION_WEIGHT = 0.01
 LIPSCHITZ_EXPLORATION_WEIGHT = 0.05
 ARM_SHUFFLE_SEED = 42
 
-CONTROLLED_LEARNING_BATCHES = 600
+CONTROLLED_LEARNING_BATCHES = 900
 CONTROLLED_TOTAL_BATCHES = 900
-CONTROLLED_EXPECTED_ARM_COUNT = 20
-CONTROLLED_CONTEXT_WARMUP_PULLS = 10
+CONTROLLED_EXPECTED_ARM_COUNT = 195
+CONTROLLED_CONTEXT_WARMUP_PULLS = 1
+CONTROLLED_SCENARIO_SEQUENCE = ("D", "E", "F")
+# contextual_woscenario uses one global model. Three consecutive warmup pulls
+# let every arm observe D, E, and F once while keeping the DEF input order.
+CONTROLLED_WOSCENARIO_WARMUP_PULLS = len(CONTROLLED_SCENARIO_SEQUENCE)
 DEF_INTERLEAVED_TOTAL_BATCHES = 1500
 CONTROLLED_SCENARIO_SPECS = {
     "A": {
@@ -179,6 +183,31 @@ CONTROLLED_OUTPUT_BY_REQUEST_TYPE = {
     spec["request_type"]: int(spec["output_tokens"])
     for spec in CONTROLLED_SCENARIO_SPECS.values()
 }
+
+
+def infer_def_context_key(input_tokens, target_output_tokens):
+    """Infer the DEF request type from both observable request lengths.
+
+    The scenario label is deliberately not an input.  The controlled DEF
+    ranges do not overlap, so exactly one two-dimensional range must match.
+    """
+    input_tokens = float(input_tokens)
+    target_output_tokens = int(target_output_tokens)
+    matches = []
+    for scenario in ("D", "E", "F"):
+        spec = CONTROLLED_SCENARIO_SPECS[scenario]
+        if (
+            int(spec["input_min"]) <= input_tokens <= int(spec["input_max"])
+            and target_output_tokens == int(spec["output_tokens"])
+        ):
+            matches.append(str(spec["request_type"]))
+    if len(matches) != 1:
+        raise ValueError(
+            "DEF context must match exactly one (input length, output length) "
+            f"range; input_tokens={input_tokens}, "
+            f"target_output_tokens={target_output_tokens}, matches={matches}."
+        )
+    return matches[0]
 
 # Lipschitz distance uses two online-learned effective slopes. Initializing
 # both to 0.5 preserves the old penalty 0.5 * (|dp1| + |dp2|) / total_layers.
@@ -401,6 +430,44 @@ CANDIDATE_ARMS = [
     (11, 19),
     (11, 20),
     (11, 21),
+
+    # p1 = 12
+    (12, 13),
+    (12, 14),
+    (12, 15),
+    (12, 16),
+    (12, 17),
+    (12, 18),
+    (12, 19),
+    (12, 20),
+    (12, 21),
+
+    # p1 = 13
+    (13, 14),
+    (13, 15),
+    (13, 16),
+    (13, 17),
+    (13, 18),
+    (13, 19),
+    (13, 20),
+    (13, 21),
+
+    # p1 = 14
+    (14, 15),
+    (14, 16),
+    (14, 17),
+    (14, 18),
+    (14, 19),
+    (14, 20),
+    (14, 21),
+
+    # p1 = 15
+    (15, 16),
+    (15, 17),
+    (15, 18),
+    (15, 19),
+    (15, 20),
+    (15, 21),
 ]
 
 def clamp01(value):
@@ -596,69 +663,66 @@ def build_def_interleaved_context(batch, base_context, manifest_row):
 
 
 def build_contextual_controlled_context(batch, base_context, labeled_row):
-    """Attach controlled-learning state without leaking labels into evaluation."""
+    """Build a DEF context key from observable input/output lengths only."""
     batch = int(batch)
     if not base_context:
         raise ValueError(f"Missing prompt context for controlled batch {batch}.")
 
     context = dict(base_context)
-    inferred_request_type = str(context.get("request_type") or "")
-    if inferred_request_type not in CONTROLLED_OUTPUT_BY_REQUEST_TYPE:
-        raise ValueError(
-            f"Batch {batch} inferred unsupported request_type={inferred_request_type!r}."
-        )
-
-    estimated_output_tokens = CONTROLLED_OUTPUT_BY_REQUEST_TYPE[inferred_request_type]
+    input_tokens = float(context.get("input_tokens", 0.0))
+    target_output_tokens = int(labeled_row["target_output_tokens"])
+    inferred_request_type = infer_def_context_key(
+        input_tokens=input_tokens,
+        target_output_tokens=target_output_tokens,
+    )
     features = list(context.get("features") or [])
     if len(features) != CONTEXT_VECTOR_SIZE:
         raise ValueError(f"Batch {batch} has invalid context features: {features}")
-    features[2] = clamp01(estimated_output_tokens / CONTEXT_OUTPUT_TOKEN_SCALE)
+    features[1] = clamp01(
+        input_tokens / DEF_CONTEXT_INPUT_TOKEN_SCALE
+    )
+    features[2] = clamp01(
+        target_output_tokens / DEF_CONTEXT_OUTPUT_TOKEN_SCALE
+    )
 
     context["features"] = features
-    context["estimated_output_tokens"] = float(estimated_output_tokens)
+    context["estimated_output_tokens"] = float(target_output_tokens)
+    context["target_output_tokens"] = target_output_tokens
+    context["request_type"] = inferred_request_type
     context["inferred_request_type"] = inferred_request_type
+    context["context_key"] = inferred_request_type
 
-    if batch <= CONTROLLED_LEARNING_BATCHES:
-        expected_scenario = ("A", "B", "C")[(batch - 1) % 3]
-        scenario = str(labeled_row.get("scenario") or "")
-        labeled_request_type = str(labeled_row.get("request_type") or "")
-        labeled_phase = str(labeled_row.get("phase") or "").lower()
-        if labeled_phase != "warmup":
-            raise ValueError(
-                f"Batch {batch} must have phase='warmup'; got {labeled_phase!r}."
-            )
-        if scenario != expected_scenario:
-            raise ValueError(
-                f"Batch {batch} must follow A/B/C order; expected {expected_scenario}, "
-                f"got {scenario!r}."
-            )
-        scenario_spec = CONTROLLED_SCENARIO_SPECS.get(scenario)
-        if scenario_spec is None:
-            raise ValueError(f"Batch {batch} has unsupported scenario={scenario!r}.")
-        expected_request_type = scenario_spec["request_type"]
-        if labeled_request_type != expected_request_type:
-            raise ValueError(
-                f"Batch {batch} label mismatch: scenario {scenario} requires "
-                f"{expected_request_type!r}, got {labeled_request_type!r}."
-            )
-        if inferred_request_type != expected_request_type:
-            raise ValueError(
-                f"Batch {batch} prompt-length context inferred {inferred_request_type!r}, "
-                f"but the learning label is {expected_request_type!r}."
-            )
+    expected_scenario = CONTROLLED_SCENARIO_SEQUENCE[
+        (batch - 1) % len(CONTROLLED_SCENARIO_SEQUENCE)
+    ]
+    labeled_scenario = str(labeled_row.get("scenario") or "")
+    labeled_request_type = str(labeled_row.get("request_type") or "")
+    labeled_phase = str(labeled_row.get("phase") or "").lower()
+    inferred_scenario = next(
+        scenario
+        for scenario in ("D", "E", "F")
+        if CONTROLLED_SCENARIO_SPECS[scenario]["request_type"]
+        == inferred_request_type
+    )
+    if labeled_phase != "warmup":
+        raise ValueError(
+            f"Batch {batch} must have phase='warmup'; got {labeled_phase!r}."
+        )
+    if labeled_scenario != expected_scenario or inferred_scenario != expected_scenario:
+        raise ValueError(
+            f"Batch {batch} must resolve to {expected_scenario}; "
+            f"label={labeled_scenario!r}, inferred={inferred_scenario!r}."
+        )
+    if labeled_request_type != inferred_request_type:
+        raise ValueError(
+            f"Batch {batch} audit request_type={labeled_request_type!r} does not "
+            f"match length-derived key={inferred_request_type!r}."
+        )
 
-        context["phase"] = "learning"
-        context["label_used"] = 1
-        context["scenario"] = scenario
-        context["target_output_tokens"] = int(scenario_spec["output_tokens"])
-    else:
-        # Evaluation deliberately ignores every label column. The phase switch
-        # comes only from the fixed batch boundary, and context comes only from
-        # tokenized prompt length.
-        context["phase"] = "evaluation"
-        context["label_used"] = 0
-        context["scenario"] = ""
-        context["target_output_tokens"] = None
+    context["phase"] = "learning"
+    context["label_used"] = 0
+    context["scenario"] = inferred_scenario
+    context["source_row"] = int(labeled_row["source_row"])
 
     return context
 
@@ -1035,9 +1099,10 @@ class ContextualBanditPolicy(LayerBanditPolicy):
         world_size,
         window_size=2,
         warmup_skip=1,
-        exploration_weight=0.00,
+        exploration_weight=0.05,
         ridge_lambda=1.0,
         reward_scale_ms=100.0,
+        arm_shuffle_seed=None,
     ):
         self.ridge_lambda = float(ridge_lambda)
         self.reward_scale_ms = float(reward_scale_ms)
@@ -1055,6 +1120,7 @@ class ContextualBanditPolicy(LayerBanditPolicy):
             window_size=window_size,
             warmup_skip=warmup_skip,
             exploration_weight=exploration_weight,
+            arm_shuffle_seed=arm_shuffle_seed,
         )
         self.context_arm_pulls = {}
 
@@ -1214,11 +1280,11 @@ class ContextualBanditPolicy(LayerBanditPolicy):
 
 
 class ContextualControlledBanditPolicy(ContextualBanditPolicy):
-    """Contextual policy with labeled learning and label-free evaluation.
+    """Contextual policy with controlled outputs and continuous online updates.
 
-    Batches 1..600 use labels only to choose an exact output-token target. Arm
-    selection still uses prompt-derived context. From batch 601 onward, labels
-    are absent from the policy context and the learned linear models are frozen.
+    Every batch uses prompt-derived context for arm selection, then updates the
+    selected arm's LinUCB state from the observed reward.  There is no frozen
+    evaluation phase in this experiment.
     """
 
     policy_name = "contextual_controlled"
@@ -1227,7 +1293,8 @@ class ContextualControlledBanditPolicy(ContextualBanditPolicy):
         super().__init__(*args, **kwargs)
         self.context_warmup_pulls = int(CONTROLLED_CONTEXT_WARMUP_PULLS)
         self.last_model_updated = False
-        self.learning_completion_checked = False
+        self.context_stats = {}
+        self.active_context_key = None
         unique_arms = list(dict.fromkeys(self.arms))
         if len(unique_arms) != len(self.arms):
             raise ValueError(
@@ -1242,73 +1309,109 @@ class ContextualControlledBanditPolicy(ContextualBanditPolicy):
                 "split is already included in CANDIDATE_ARMS."
             )
 
+    def _activate_context_state(self, context):
+        """Switch to parameters owned exclusively by the current context key."""
+        context_key = self._context_key_from_context(context)
+        if not context_key or context_key == "unknown":
+            raise ValueError("contextual_controlled requires a valid context_key.")
+        if context_key not in self.context_stats:
+            self.context_stats[context_key] = {
+                arm: self._new_stats() for arm in self.arms
+            }
+        self.stats = self.context_stats[context_key]
+        self.active_context_key = context_key
+        return context_key
+
     def select_arm(self, context=None, batch=None):
-        """Use controlled exploration for learning and pure LinUCB for evaluation."""
+        """Use contextual warmup followed by LinUCB for every batch."""
         if not self.enabled:
             return None
         if not context:
             raise ValueError("contextual_controlled requires current-batch context.")
 
         phase = str(context.get("phase") or "")
-        if phase == "learning":
-            return super().select_arm(context=context, batch=batch)
-        if phase != "evaluation":
+        if phase != "learning":
             raise ValueError(f"Unknown contextual_controlled phase={phase!r}.")
-
-        self._validate_learning_complete()
-        features = self._features_from_context(context)
-        self.last_context = context
-        self.last_context_key = self._context_key_from_context(context)
-        self.last_features = features
-
-        best_arm = self.arms[0]
-        best_score = self._score_arm(best_arm, features)
-        for arm in self.arms[1:]:
-            score = self._score_arm(arm, features)
-            if score > best_score:
-                best_arm = arm
-                best_score = score
-        self.current_arm = best_arm
-        return best_arm
+        self._activate_context_state(context)
+        return super().select_arm(context=context, batch=batch)
 
     def update_after_batch(self, batch, batch_summary_history):
-        """Update during learning and freeze all linear models during evaluation."""
+        """Update the selected arm's LinUCB parameters after every batch."""
         summary = batch_summary_history.get(int(batch), {})
         context = summary.get("context") or self.last_context or {}
         phase = str(context.get("phase") or "")
-        if phase == "learning":
-            pulls_before = int(self.total_pulls)
-            completed_arm = super().update_after_batch(batch, batch_summary_history)
-            self.last_model_updated = int(self.total_pulls) > pulls_before
-            return completed_arm
-        if phase != "evaluation":
+        if phase != "learning":
             raise ValueError(f"Unknown contextual_controlled phase={phase!r}.")
-
-        completed_arm = self._completed_arm_from_summary(summary)
-        if completed_arm is not None:
-            self._ensure_arm(completed_arm)
-            self.current_arm = completed_arm
-        self.last_model_updated = False
+        self._activate_context_state(context)
+        pulls_before = int(self.total_pulls)
+        completed_arm = super().update_after_batch(batch, batch_summary_history)
+        self.last_model_updated = int(self.total_pulls) > pulls_before
         return completed_arm
 
-    def _validate_learning_complete(self):
-        """Verify every arm has ten observations under each request type."""
-        if self.learning_completion_checked:
-            return
-        for request_spec in REQUEST_TYPE_SPECS:
-            request_type = request_spec["name"]
-            context_pulls = self._ensure_context_arm_pulls(request_type)
-            incomplete = [
-                arm
-                for arm in self.arms
-                if int(context_pulls.get(arm, 0)) < self.context_warmup_pulls
-            ]
-            if incomplete:
-                raise RuntimeError(
-                    "contextual_controlled reached evaluation before learning "
-                    f"completed for request_type={request_type!r}; incomplete arms={incomplete}."
-                )
-        self.learning_completion_checked = True
+
+class ContextualWithoutScenarioBanditPolicy(ContextualBanditPolicy):
+    """Controlled online LinUCB with no request features or scenario state.
+
+    The DEF labels and lengths remain available to the inference loop for
+    workload control and audit logging only. Arm selection and model updates
+    always use the same intercept-only feature vector and one global parameter
+    table, so D/E/F observations are deliberately pooled together.
+    """
+
+    policy_name = "contextual_woscenario"
+    global_context_key = "global"
+    fixed_features = (1.0, 0.0, 0.0, 0.0)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.context_warmup_pulls = int(CONTROLLED_WOSCENARIO_WARMUP_PULLS)
+        self.last_model_updated = False
+        unique_arms = list(dict.fromkeys(self.arms))
+        if len(unique_arms) != len(self.arms):
+            raise ValueError(
+                "contextual_woscenario requires distinct effective arms; "
+                f"duplicates were found in {self.arms}."
+            )
+        if len(self.arms) != CONTROLLED_EXPECTED_ARM_COUNT:
+            raise ValueError(
+                "contextual_woscenario requires exactly "
+                f"{CONTROLLED_EXPECTED_ARM_COUNT} effective arms, but scheduler "
+                f"constructed {len(self.arms)}: {self.arms}. Ensure the default "
+                "split is already included in CANDIDATE_ARMS."
+            )
+
+    def _features_from_context(self, context):
+        """Ignore all request fields and return an intercept-only feature."""
+        _ = context
+        return list(self.fixed_features)
+
+    def _context_key_from_context(self, context):
+        """Pool every request into one global warmup/model namespace."""
+        _ = context
+        return self.global_context_key
+
+    def select_arm(self, context=None, batch=None):
+        """Run global warmup, then select from one shared LinUCB model."""
+        if not self.enabled:
+            return None
+        if not context:
+            raise ValueError("contextual_woscenario requires controlled batch metadata.")
+        phase = str(context.get("phase") or "")
+        if phase != "learning":
+            raise ValueError(f"Unknown contextual_woscenario phase={phase!r}.")
+        return super().select_arm(context=context, batch=batch)
+
+    def update_after_batch(self, batch, batch_summary_history):
+        """Continuously update the selected arm using pooled DEF rewards."""
+        summary = batch_summary_history.get(int(batch), {})
+        context = summary.get("context") or self.last_context or {}
+        phase = str(context.get("phase") or "")
+        if phase != "learning":
+            raise ValueError(f"Unknown contextual_woscenario phase={phase!r}.")
+        pulls_before = int(self.total_pulls)
+        completed_arm = super().update_after_batch(batch, batch_summary_history)
+        self.last_model_updated = int(self.total_pulls) > pulls_before
+        return completed_arm
 
 
 class LipschitzBanditPolicy(LayerBanditPolicy):
@@ -1789,6 +1892,7 @@ BANDIT_POLICY_CLASSES = {
     "ucb": LayerBanditPolicy,
     "contextual": ContextualBanditPolicy,
     "contextual_controlled": ContextualControlledBanditPolicy,
+    "contextual_woscenario": ContextualWithoutScenarioBanditPolicy,
     "lipschitz": LipschitzBanditPolicy,
     "contextual_lipschitz": ContextualLipschitzBanditPolicy,
 }
@@ -1824,6 +1928,8 @@ def create_bandit_policy(
             exploration_weight=LIPSCHITZ_EXPLORATION_WEIGHT,
             arm_shuffle_seed=arm_shuffle_seed,
         )
+    elif normalized_name in {"contextual_controlled", "contextual_woscenario"}:
+        policy_kwargs.update(arm_shuffle_seed=arm_shuffle_seed)
     return policy_class(
         total_layers=total_layers,
         default_boundaries=default_boundaries,
@@ -2398,7 +2504,10 @@ class Scheduler:
         file_exists = self.arm_details_path.exists()
         summary = self.batch_summary_history.get(int(batch), {})
         context = context if context is not None else (summary.get("context") or {})
-        controlled_policy = self.bandit_policy_name == "contextual_controlled"
+        controlled_policy = self.bandit_policy_name in {
+            "contextual_controlled",
+            "contextual_woscenario",
+        }
         ranked_rows, top_rows = self._rank_arm_snapshot(
             self.bandit.arm_score_snapshot(selected_arm)
         )

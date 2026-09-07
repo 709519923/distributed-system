@@ -6,14 +6,14 @@ WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
 PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
-SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
-BANDIT_POLICY=${BANDIT_POLICY:-contextual_controlled}
+SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler_contextual_woscenario_DEF_global_195arms_a005_seed42_900.csv}
+BANDIT_POLICY=${BANDIT_POLICY:-contextual_woscenario}
 INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.130:29510}
-COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
+COMPUTE_DEVICE=${COMPUTE_DEVICE:-cpu}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/contextual_bandit_test_tinyllama.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/contextual_controlled_def_900.csv}
 CONTEXT_MANIFEST=${CONTEXT_MANIFEST:-}
-OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
+OUTPUT_CSV=${OUTPUT_CSV:-outputs_contextual_woscenario_DEF_global_195arms_a005_seed42_900.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1800}
 EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
@@ -104,7 +104,8 @@ fi
 if [ "$RANK_ARG" = "2" ]; then
     export WORLD_SIZE=$WORLD_SIZE_VALUE
     export RANK=2
-    export NCCL_SOCKET_IFNAME=enp6s18
+#    export NCCL_SOCKET_IFNAME=enp6s18
+    export NCCL_SOCKET_IFNAME=ens12f1np1
     export NCCL_DEBUG=INFO
 
     python distributed_tinyllama_inference.py \

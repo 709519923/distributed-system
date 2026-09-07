@@ -43,7 +43,7 @@ def read_prompts(csv_path, has_header, prompt_column):
 
 
 def read_contextual_controlled_rows(csv_path, prompt_column):
-    """Read the labeled 600-learning/300-evaluation contextual dataset."""
+    """Read observable request lengths plus audit labels for controlled DEF."""
     records = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -51,7 +51,14 @@ def read_contextual_controlled_rows(csv_path, prompt_column):
             raise ValueError("contextual_controlled requires a CSV header.")
 
         prompt_key = prompt_column or reader.fieldnames[0]
-        required = {prompt_key, "scenario", "request_type", "phase"}
+        required = {
+            prompt_key,
+            "scenario",
+            "request_type",
+            "target_output_tokens",
+            "phase",
+            "source_row",
+        }
         missing = sorted(required.difference(reader.fieldnames))
         if missing:
             raise ValueError(
@@ -64,12 +71,29 @@ def read_contextual_controlled_rows(csv_path, prompt_column):
                 raise ValueError(
                     f"contextual_controlled CSV row {row_number} has an empty prompt."
                 )
+            try:
+                target_output_tokens = int(
+                    (row.get("target_output_tokens") or "").strip()
+                )
+                source_row = int((row.get("source_row") or "").strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"contextual_controlled CSV row {row_number} has invalid "
+                    "target_output_tokens/source_row."
+                ) from exc
+            if target_output_tokens < 1 or source_row < 1:
+                raise ValueError(
+                    f"contextual_controlled CSV row {row_number} has non-positive "
+                    "target_output_tokens/source_row."
+                )
             records.append(
                 {
                     "prompt": prompt,
                     "scenario": (row.get("scenario") or "").strip(),
                     "request_type": (row.get("request_type") or "").strip(),
+                    "target_output_tokens": target_output_tokens,
                     "phase": (row.get("phase") or "").strip().lower(),
+                    "source_row": source_row,
                 }
             )
     return records
