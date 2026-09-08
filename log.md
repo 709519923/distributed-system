@@ -1,5 +1,38 @@
 # Version Log
 
+## 2026-09-08
+
+### 单场景 UCB1 / Lipschitz / epsilon-greedy / Thompson Sampling 实验
+
+- `scheduler.py` 新增 `EpsilonGreedyBanditPolicy` 和
+  `ThompsonSamplingBanditPolicy`，并注册为 `epsilon_greedy`、
+  `thompson_sampling`。两个新策略与 UCB1/Lipschitz 共用 195 个 arm、固定
+  arm shuffle seed 42、首批全局 warmup、逐批 cost/reward 定义及更新节奏。
+- epsilon-greedy 固定 `epsilon=0.05`，先按相同固定 arm 顺序完成每臂一次
+  观测，之后按 epsilon 探索，否则选择累计平均 reward 最大的 arm。
+- Thompson Sampling 固定 `Beta(1,1)` 先验和 decision seed 42。由于现有
+  reward 位于 `(0,1]`，每个观测以 `reward` 和 `1-reward` 分别作为分数成功、
+  失败计数更新 posterior，不额外二值化 reward。
+- `batch_metrics` 继续逐 batch 记录 `scheduler_select_ms`、
+  `scheduler_update_ms`、`scheduler_algorithm_ms`；新增策略参数、decision seed
+  和下一 arm 的 selection mode。三条 pipeline 链路的实际 delay 也随 batch
+  写入。Lipschitz 只用于详细输出的前后置信界快照耗时单独写入
+  `scheduler_audit_ms`，不混入算法计算时间。`arm_details` 增加 Thompson
+  posterior 的 alpha/beta/mean。
+- `run_summary` 新增 scheduler 算法耗时 mean/p50/p95/max，原有
+  `algorithm_overhead_percent` 保留，用于判断算法计算相对推理时间的占比。
+- `config.py` 和 `inference_loops.py` 将两个新策略纳入 A-F 单场景实验。输入
+  CSV 不限制行数，`BATCH_SIZE=1` 时有多少行就自然运行多少个 batch。
+- `run.sh` 默认使用 D 场景的 500 行数据集，但 `EXPERIMENT_SCENARIO` 可在 A-F
+  间切换，并自动选择对应标准数据文件；也可用 `INPUT_CSV` 指向任意行数的
+  数据集。scheduler/output 文件名会包含 policy 和场景。`environment.py` 保持
+  `0->1=10 ms, 1->2=30 ms, 2->0=40 ms`。
+- 新增 `extract_bandit_results.py`，通过配套 `run_summary.status=complete` 选取
+  最新完整运行，并要求四种 policy 的 batch 数一致，生成 `4 × N` 行逐批
+  合并表和 4 行对比汇总表。
+- 新增 `test_scheduler_policies.py`，覆盖 factory、epsilon-greedy 初始化与
+  利用、Thompson posterior/随机种子以及逐批/汇总计时 CSV。
+
 ## 2026-09-07
 
 ### 新增 `contextual_woscenario`：不使用输入特征的全局在线策略

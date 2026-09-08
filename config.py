@@ -157,6 +157,8 @@ def parse_args():
         "--bandit-policy",
         choices=(
             "ucb",
+            "epsilon_greedy",
+            "thompson_sampling",
             "contextual",
             "contextual_controlled",
             "contextual_woscenario",
@@ -165,7 +167,8 @@ def parse_args():
         ),
         default="ucb",
         help=(
-            "Rank 0 scheduler bandit policy. Default: ucb. contextual uses "
+            "Rank 0 scheduler bandit policy. Default: ucb. epsilon_greedy and "
+            "thompson_sampling are non-contextual baselines. contextual uses "
             "current-batch prompt context before selecting the current arm. "
             "contextual_controlled isolates online models by inferred DEF key. "
             "contextual_woscenario pools all controlled DEF batches into one "
@@ -187,7 +190,8 @@ def parse_args():
         choices=("A", "B", "C", "D", "E", "F"),
         default=None,
         help=(
-            "Single-scenario controlled run for ucb or lipschitz. The selected "
+            "Single-scenario controlled run for ucb, lipschitz, epsilon_greedy, "
+            "or thompson_sampling. The selected "
             "A-F scenario fixes the generated token count for every prompt."
         ),
     )

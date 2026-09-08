@@ -130,6 +130,9 @@ CONTEXT_VECTOR_SIZE = 4
 CONTEXT_WARMUP_PULLS = 1
 UCB_EXPLORATION_WEIGHT = 0.01
 LIPSCHITZ_EXPLORATION_WEIGHT = 0.05
+EPSILON_GREEDY_EPSILON = 0.05
+THOMPSON_PRIOR_ALPHA = 1.0
+THOMPSON_PRIOR_BETA = 1.0
 ARM_SHUFFLE_SEED = 42
 
 CONTROLLED_LEARNING_BATCHES = 900
@@ -819,6 +822,9 @@ class LayerBanditPolicy:
         self.reward_scale_ms = 100.0
         self.global_warmup_complete = False
         self.last_batch_was_warmup = False
+        self.excluded_algorithm_timing_ms = 0.0
+        if not hasattr(self, "last_selection_mode"):
+            self.last_selection_mode = "initial"
 
         self.arms = self._build_candidate_arms()
         if self.arm_shuffle_seed is not None:
@@ -1036,8 +1042,10 @@ class LayerBanditPolicy:
         """Choose the next arm with UCB, testing unseen arms first."""
         for arm in self.arms:
             if int(self.stats[arm]["pulls"]) == 0:
+                self.last_selection_mode = "untried_arm"
                 return arm
 
+        self.last_selection_mode = "ucb1_score"
         best_arm = self.arms[0]
         best_score = None
         for arm in self.arms:
@@ -1080,6 +1088,163 @@ class LayerBanditPolicy:
     @staticmethod
     def _format_arm(arm):
         return f"({int(arm[0])},{int(arm[1])})"
+
+
+class EpsilonGreedyBanditPolicy(LayerBanditPolicy):
+    """Non-contextual epsilon-greedy policy on the shared reward signal.
+
+    The initialization phase observes every candidate arm once, matching the
+    explicit unseen-arm exploration used by UCB1. Afterwards, epsilon controls
+    random exploration and all remaining decisions choose the largest sample
+    mean reward. A private seeded RNG keeps repeated experiments reproducible.
+    """
+
+    policy_name = "epsilon_greedy"
+
+    def __init__(
+        self,
+        *args,
+        epsilon=EPSILON_GREEDY_EPSILON,
+        decision_random_seed=ARM_SHUFFLE_SEED,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.epsilon = float(epsilon)
+        if not 0.0 <= self.epsilon <= 1.0:
+            raise ValueError(f"epsilon must be in [0, 1], got {self.epsilon}")
+        self.decision_random_seed = int(decision_random_seed)
+        self._rng = random.Random(self.decision_random_seed)
+        self.last_selection_mode = "initial"
+
+    def _select_next_arm(self):
+        """Observe unseen arms once, then make one epsilon-greedy decision."""
+        for arm in self.arms:
+            if int(self.stats[arm]["pulls"]) == 0:
+                self.last_selection_mode = "untried_arm"
+                return arm
+
+        if self._rng.random() < self.epsilon:
+            self.last_selection_mode = "epsilon_explore"
+            return self._rng.choice(self.arms)
+
+        self.last_selection_mode = "greedy_exploit"
+        return max(self.arms, key=lambda arm: float(self.stats[arm]["reward"]))
+
+    def arm_score_snapshot(self, selected_arm):
+        """Return sample-mean rewards, which are epsilon-greedy's value scores."""
+        selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        rows = []
+        for arm in self.arms:
+            stats = self.stats[arm]
+            pulls = int(stats["pulls"])
+            reward = float(stats["reward"])
+            rows.append(
+                {
+                    "arm": self._format_arm(arm),
+                    "reward": "" if pulls == 0 else f"{reward:.6f}",
+                    "score": "untried" if pulls == 0 else f"{reward:.6f}",
+                    "selected": 1 if arm == selected_arm else 0,
+                    "next_selected": 1 if arm == self.current_arm else 0,
+                }
+            )
+        return rows
+
+
+class ThompsonSamplingBanditPolicy(LayerBanditPolicy):
+    """Beta Thompson sampling for the shared bounded per-batch reward.
+
+    The scheduler reward lies in (0, 1]. Each observation therefore updates a
+    Beta posterior with fractional success ``reward`` and fractional failure
+    ``1 - reward``. This preserves the existing continuous reward instead of
+    introducing an arbitrary Bernoulli threshold.
+    """
+
+    policy_name = "thompson_sampling"
+
+    def __init__(
+        self,
+        *args,
+        prior_alpha=THOMPSON_PRIOR_ALPHA,
+        prior_beta=THOMPSON_PRIOR_BETA,
+        decision_random_seed=ARM_SHUFFLE_SEED,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.thompson_prior_alpha = float(prior_alpha)
+        self.thompson_prior_beta = float(prior_beta)
+        if self.thompson_prior_alpha <= 0.0 or self.thompson_prior_beta <= 0.0:
+            raise ValueError(
+                "Thompson prior parameters must be positive; "
+                f"got alpha={self.thompson_prior_alpha}, "
+                f"beta={self.thompson_prior_beta}."
+            )
+        self.decision_random_seed = int(decision_random_seed)
+        self._rng = random.Random(self.decision_random_seed)
+        self.last_selection_mode = "initial"
+        self.last_posterior_samples = {}
+        for stats in self.stats.values():
+            self._initialize_posterior(stats)
+
+    def _initialize_posterior(self, stats):
+        stats.setdefault("posterior_alpha", self.thompson_prior_alpha)
+        stats.setdefault("posterior_beta", self.thompson_prior_beta)
+
+    def _ensure_arm(self, arm):
+        """Give a dynamically introduced arm the same Beta prior."""
+        super()._ensure_arm(arm)
+        if hasattr(self, "thompson_prior_alpha"):
+            self._initialize_posterior(self.stats[arm])
+
+    def _update_ucb_arm_reward(self, arm, cost):
+        """Update shared mean statistics and the selected arm's posterior."""
+        latest_reward = self._reward_from_cost(cost)
+        super()._update_ucb_arm_reward(arm, cost)
+        stats = self.stats[arm]
+        self._initialize_posterior(stats)
+        stats["posterior_alpha"] += latest_reward
+        stats["posterior_beta"] += 1.0 - latest_reward
+
+    def _select_next_arm(self):
+        """Sample every posterior once and select the largest sampled reward."""
+        self.last_selection_mode = "posterior_sample"
+        self.last_posterior_samples = {}
+        for arm in self.arms:
+            stats = self.stats[arm]
+            self._initialize_posterior(stats)
+            self.last_posterior_samples[arm] = self._rng.betavariate(
+                float(stats["posterior_alpha"]),
+                float(stats["posterior_beta"]),
+            )
+        return max(self.arms, key=lambda arm: self.last_posterior_samples[arm])
+
+    def arm_score_snapshot(self, selected_arm):
+        """Return posterior parameters and the samples used by the last choice."""
+        selected_arm = tuple(selected_arm) if selected_arm is not None else None
+        rows = []
+        for arm in self.arms:
+            stats = self.stats[arm]
+            self._initialize_posterior(stats)
+            alpha = float(stats["posterior_alpha"])
+            beta = float(stats["posterior_beta"])
+            posterior_mean = alpha / (alpha + beta)
+            sampled_score = self.last_posterior_samples.get(arm, posterior_mean)
+            rows.append(
+                {
+                    "arm": self._format_arm(arm),
+                    "reward": (
+                        ""
+                        if int(stats["pulls"]) == 0
+                        else f"{float(stats['reward']):.6f}"
+                    ),
+                    "score": f"{sampled_score:.6f}",
+                    "posterior_alpha": f"{alpha:.6f}",
+                    "posterior_beta": f"{beta:.6f}",
+                    "posterior_mean": f"{posterior_mean:.6f}",
+                    "selected": 1 if arm == selected_arm else 0,
+                    "next_selected": 1 if arm == self.current_arm else 0,
+                }
+            )
+        return rows
 
 
 class ContextualBanditPolicy(LayerBanditPolicy):
@@ -1483,7 +1648,11 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
 
     def _update_arm_cost(self, arm, cost):
         """Update direct reward, online slopes, confidence bounds, and audit."""
+        audit_started_ns = time.perf_counter_ns()
         before_state = self._audit_state()
+        self.excluded_algorithm_timing_ms += (
+            time.perf_counter_ns() - audit_started_ns
+        ) / 1_000_000.0
         q1_before = self.q1
         q2_before = self.q2
 
@@ -1493,7 +1662,11 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
         self._enforce_probe_slope_floors()
         self._refresh_active_arms()
 
+        audit_started_ns = time.perf_counter_ns()
         after_state = self._audit_state()
+        self.excluded_algorithm_timing_ms += (
+            time.perf_counter_ns() - audit_started_ns
+        ) / 1_000_000.0
         self.last_pull_audit = {
             "updated_arm": arm,
             "pull_index": self.total_pulls,
@@ -1510,6 +1683,7 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
         """Run at most two conflict probes, then use the optimistic bound."""
         probe_arm = self._take_next_conflict_probe()
         if probe_arm is not None:
+            self.last_selection_mode = "conflict_probe"
             return probe_arm
 
         if not self.conflicting_arms:
@@ -1521,12 +1695,15 @@ class LipschitzBanditPolicy(LayerBanditPolicy):
             self.conflict_probe_cycle_active = True
             probe_arm = self._take_next_conflict_probe()
             if probe_arm is not None:
+                self.last_selection_mode = "conflict_probe"
                 return probe_arm
 
         candidates = self.active_arms or self.arms
         if not candidates:
+            self.last_selection_mode = "keep_current"
             return self.current_arm
 
+        self.last_selection_mode = "lipschitz_ucb"
         best_arm = self.current_arm if self.current_arm in candidates else candidates[0]
         best_score = self._confidence_bounds(best_arm)[1]
         for arm in candidates:
@@ -1890,6 +2067,8 @@ class ContextualLipschitzBanditPolicy(ContextualBanditPolicy):
 
 BANDIT_POLICY_CLASSES = {
     "ucb": LayerBanditPolicy,
+    "epsilon_greedy": EpsilonGreedyBanditPolicy,
+    "thompson_sampling": ThompsonSamplingBanditPolicy,
     "contextual": ContextualBanditPolicy,
     "contextual_controlled": ContextualControlledBanditPolicy,
     "contextual_woscenario": ContextualWithoutScenarioBanditPolicy,
@@ -1926,6 +2105,19 @@ def create_bandit_policy(
     elif normalized_name == "lipschitz":
         policy_kwargs.update(
             exploration_weight=LIPSCHITZ_EXPLORATION_WEIGHT,
+            arm_shuffle_seed=arm_shuffle_seed,
+        )
+    elif normalized_name == "epsilon_greedy":
+        policy_kwargs.update(
+            epsilon=EPSILON_GREEDY_EPSILON,
+            decision_random_seed=ARM_SHUFFLE_SEED,
+            arm_shuffle_seed=arm_shuffle_seed,
+        )
+    elif normalized_name == "thompson_sampling":
+        policy_kwargs.update(
+            prior_alpha=THOMPSON_PRIOR_ALPHA,
+            prior_beta=THOMPSON_PRIOR_BETA,
+            decision_random_seed=ARM_SHUFFLE_SEED,
             arm_shuffle_seed=arm_shuffle_seed,
         )
     elif normalized_name in {"contextual_controlled", "contextual_woscenario"}:
@@ -2018,6 +2210,9 @@ class Scheduler:
             "score_before",
             "score",
             "score_delta",
+            "posterior_alpha",
+            "posterior_beta",
+            "posterior_mean",
             "score_rank",
             "in_top_k",
             "confidence_lower",
@@ -2057,6 +2252,13 @@ class Scheduler:
             "scenario",
             "arm_shuffle_seed",
             "exploration_weight",
+            "decision_random_seed",
+            "epsilon",
+            "thompson_prior_alpha",
+            "thompson_prior_beta",
+            "time_comm_delay_0_to_1_ms",
+            "time_comm_delay_1_to_2_ms",
+            "time_comm_delay_2_to_0_ms",
             "batch",
             "prompt_index",
             "input_tokens",
@@ -2064,6 +2266,7 @@ class Scheduler:
             "decode_step_count",
             "used_arm",
             "next_arm",
+            "next_selection_mode",
             "pull_completed",
             "bottleneck_time_ms",
             "cost_ms_per_step",
@@ -2071,6 +2274,7 @@ class Scheduler:
             "cumulative_reward",
             "scheduler_select_ms",
             "scheduler_update_ms",
+            "scheduler_audit_ms",
             "scheduler_algorithm_ms",
             "scheduler_algorithm_cumulative_ms",
             "partition_transition_wall_ms",
@@ -2085,6 +2289,13 @@ class Scheduler:
             "scenario",
             "arm_shuffle_seed",
             "exploration_weight",
+            "decision_random_seed",
+            "epsilon",
+            "thompson_prior_alpha",
+            "thompson_prior_beta",
+            "time_comm_delay_0_to_1_ms",
+            "time_comm_delay_1_to_2_ms",
+            "time_comm_delay_2_to_0_ms",
             "candidate_arm_order",
             "status",
             "total_batches",
@@ -2095,7 +2306,12 @@ class Scheduler:
             "mean_observed_reward",
             "total_scheduler_select_ms",
             "total_scheduler_update_ms",
+            "total_scheduler_audit_ms",
             "total_scheduler_algorithm_ms",
+            "mean_scheduler_algorithm_ms",
+            "p50_scheduler_algorithm_ms",
+            "p95_scheduler_algorithm_ms",
+            "max_scheduler_algorithm_ms",
             "total_partition_transition_ms",
             "total_inference_wall_ms",
             "measured_inference_wall_ms",
@@ -2256,14 +2472,23 @@ class Scheduler:
         """Update the active policy from the completed batch summary."""
         batch = int(batch)
         pulls_before = int(self.bandit.total_pulls)
+        excluded_before_ms = float(
+            getattr(self.bandit, "excluded_algorithm_timing_ms", 0.0)
+        )
         started_ns = time.perf_counter_ns()
         selected_arm = self.bandit.update_after_batch(
             batch=batch,
             batch_summary_history=self.batch_summary_history,
         )
-        update_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        update_wall_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        excluded_after_ms = float(
+            getattr(self.bandit, "excluded_algorithm_timing_ms", 0.0)
+        )
+        audit_ms = max(0.0, excluded_after_ms - excluded_before_ms)
+        update_ms = max(0.0, update_wall_ms - audit_ms)
         timing = self.algorithm_timing_history.setdefault(batch, {})
         timing["update_ms"] = update_ms
+        timing["audit_ms"] = audit_ms
         timing["algorithm_ms"] = float(timing.get("select_ms", 0.0)) + update_ms
         timing["pull_completed"] = int(self.bandit.total_pulls) > pulls_before
         self.cumulative_algorithm_ms += timing["algorithm_ms"]
@@ -2375,6 +2600,8 @@ class Scheduler:
 
         used_arm = summary.get("arm")
         next_arm = self.bandit.current_arm
+        policy_parameters = self._policy_parameter_snapshot()
+        environment_parameters = self._environment_parameter_snapshot(batch)
         raw_row = {
             "run_id": self.run_id,
             "policy": self.bandit_policy_name,
@@ -2382,7 +2609,8 @@ class Scheduler:
             "arm_shuffle_seed": (
                 "" if self.bandit.arm_shuffle_seed is None else self.bandit.arm_shuffle_seed
             ),
-            "exploration_weight": self.bandit.exploration_weight,
+            **policy_parameters,
+            **environment_parameters,
             "batch": batch,
             "prompt_index": int(prompt_index),
             "input_tokens": int(context.get("input_tokens_max", 0)),
@@ -2390,6 +2618,7 @@ class Scheduler:
             "decode_step_count": int(summary.get("decode_step_count", 0)),
             "used_arm": self.bandit._format_arm(used_arm) if used_arm is not None else "",
             "next_arm": self.bandit._format_arm(next_arm) if next_arm is not None else "",
+            "next_selection_mode": getattr(self.bandit, "last_selection_mode", ""),
             "pull_completed": int(pull_completed),
             "bottleneck_time_ms": bottleneck_time_ms,
             "cost_ms_per_step": cost_ms_per_step,
@@ -2397,6 +2626,7 @@ class Scheduler:
             "cumulative_reward": self.cumulative_reward,
             "scheduler_select_ms": float(timing.get("select_ms", 0.0)),
             "scheduler_update_ms": float(timing.get("update_ms", 0.0)),
+            "scheduler_audit_ms": float(timing.get("audit_ms", 0.0)),
             "scheduler_algorithm_ms": float(timing.get("algorithm_ms", 0.0)),
             "scheduler_algorithm_cumulative_ms": float(
                 timing.get("algorithm_cumulative_ms", self.cumulative_algorithm_ms)
@@ -2426,6 +2656,7 @@ class Scheduler:
         rows = list(self.batch_metric_history)
         measured_rows = [row for row in rows if int(row["pull_completed"]) == 1]
         inference_values = sorted(float(row["inference_wall_ms"]) for row in measured_rows)
+        algorithm_values = sorted(float(row["scheduler_algorithm_ms"]) for row in rows)
 
         def percentile(values, fraction):
             if not values:
@@ -2439,6 +2670,8 @@ class Scheduler:
             float(row["inference_wall_ms"]) for row in measured_rows
         )
         overhead_denominator = total_algorithm_ms + total_inference_ms
+        policy_parameters = self._policy_parameter_snapshot()
+        environment_parameters = self._environment_parameter_snapshot()
         summary = {
             "run_id": self.run_id,
             "policy": self.bandit_policy_name,
@@ -2446,7 +2679,8 @@ class Scheduler:
             "arm_shuffle_seed": (
                 "" if self.bandit.arm_shuffle_seed is None else self.bandit.arm_shuffle_seed
             ),
-            "exploration_weight": self.bandit.exploration_weight,
+            **policy_parameters,
+            **environment_parameters,
             "candidate_arm_order": "|".join(
                 self.bandit._format_arm(arm) for arm in self.bandit.arms
             ),
@@ -2469,7 +2703,18 @@ class Scheduler:
             "total_scheduler_update_ms": sum(
                 float(row["scheduler_update_ms"]) for row in rows
             ),
+            "total_scheduler_audit_ms": sum(
+                float(row["scheduler_audit_ms"]) for row in rows
+            ),
             "total_scheduler_algorithm_ms": total_algorithm_ms,
+            "mean_scheduler_algorithm_ms": (
+                total_algorithm_ms / len(algorithm_values) if algorithm_values else 0.0
+            ),
+            "p50_scheduler_algorithm_ms": percentile(algorithm_values, 0.50),
+            "p95_scheduler_algorithm_ms": percentile(algorithm_values, 0.95),
+            "max_scheduler_algorithm_ms": (
+                max(algorithm_values) if algorithm_values else 0.0
+            ),
             "total_partition_transition_ms": sum(
                 float(row["partition_transition_wall_ms"]) for row in rows
             ),
@@ -2497,6 +2742,53 @@ class Scheduler:
             writer = csv.DictWriter(f, fieldnames=self.run_summary_fieldnames)
             writer.writeheader()
             writer.writerow(output)
+
+    def _policy_parameter_snapshot(self):
+        """Return structured policy parameters shared by batch/run CSV files."""
+        uses_exploration_weight = self.bandit_policy_name not in {
+            "epsilon_greedy",
+            "thompson_sampling",
+        }
+        return {
+            "exploration_weight": (
+                float(self.bandit.exploration_weight)
+                if uses_exploration_weight
+                else ""
+            ),
+            "decision_random_seed": getattr(
+                self.bandit,
+                "decision_random_seed",
+                "",
+            ),
+            "epsilon": getattr(self.bandit, "epsilon", ""),
+            "thompson_prior_alpha": getattr(
+                self.bandit,
+                "thompson_prior_alpha",
+                "",
+            ),
+            "thompson_prior_beta": getattr(
+                self.bandit,
+                "thompson_prior_beta",
+                "",
+            ),
+        }
+
+    def _environment_parameter_snapshot(self, batch=None):
+        """Return the three pipeline-link delays used by a batch or run."""
+        if batch is None:
+            snapshot = self.environment_data or {}
+        else:
+            snapshot = self.environment_history.get(int(batch), {})
+        delays = list(snapshot.get("time_comm_delay", []))
+
+        def delay_at(index):
+            return float(delays[index]) if index < len(delays) else ""
+
+        return {
+            "time_comm_delay_0_to_1_ms": delay_at(0),
+            "time_comm_delay_1_to_2_ms": delay_at(1),
+            "time_comm_delay_2_to_0_ms": delay_at(2),
+        }
 
     def append_arm_details(self, batch, selected_arm, snapshot="post_update", context=None):
         """Append a ranked policy-state snapshot and its compact Top-K set."""

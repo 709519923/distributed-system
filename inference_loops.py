@@ -71,6 +71,9 @@ from scheduler import (
 CONTROLLED_CONTEXTUAL_POLICIES = frozenset(
     {"contextual_controlled", "contextual_woscenario"}
 )
+SINGLE_SCENARIO_POLICIES = frozenset(
+    {"ucb", "lipschitz", "epsilon_greedy", "thompson_sampling"}
+)
 
 
 def cloud_base_kv_transfer_has_effect(environment, src_rank, world_size):
@@ -968,8 +971,12 @@ def rank0_generate_dynamic(
     experiment_scenario = getattr(args, "experiment_scenario", None)
     context_manifest = getattr(args, "context_manifest", None)
     if experiment_scenario is not None:
-        if args.bandit_policy not in {"ucb", "lipschitz"}:
-            raise ValueError("--experiment-scenario requires --bandit-policy ucb or lipschitz.")
+        if args.bandit_policy not in SINGLE_SCENARIO_POLICIES:
+            valid_policies = ", ".join(sorted(SINGLE_SCENARIO_POLICIES))
+            raise ValueError(
+                "--experiment-scenario requires --bandit-policy in: "
+                f"{valid_policies}."
+            )
         if not args.allocation_csv:
             raise ValueError("--experiment-scenario requires --allocation-csv.")
         if int(args.batch_size) != 1:
@@ -1034,7 +1041,6 @@ def rank0_generate_dynamic(
         print(f"[Rank 0] No prompts found in {args.input_csv}")
         broadcast_boundaries(stop_boundaries(world_size), world_size, comm_device, rank=0)
         return
-
     total_layers = get_total_layers_from_config(args.model_dir)
     default_boundaries = default_boundaries_for_world_size(args, world_size, total_layers)
     scheduler = None
@@ -1182,6 +1188,11 @@ def rank0_generate_dynamic(
                 environment.apply_batch(batch_number)
                 environment = broadcast_environment(environment, rank=0, device=comm_device)
                 print(f"[Rank 0] Batch {batch_number}: environment={environment.describe()}")
+                if scheduler is not None:
+                    scheduler.update_environment_data(
+                        batch_number,
+                        environment.snapshot(),
+                    )
             if model is None:
                 model, _, load_mode = load_model_part(
                     args.model_dir,

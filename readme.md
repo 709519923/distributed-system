@@ -23,15 +23,17 @@ WORLD_SIZE_VALUE=${WORLD_SIZE_VALUE:-3}
 PREFILL_MODE=${PREFILL_MODE:-distributed}
 BATCH_SIZE=${BATCH_SIZE:-1}
 SPLIT_LAYERS=${SPLIT_LAYERS:-5,15}
-SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler.csv}
 BANDIT_POLICY=${BANDIT_POLICY:-ucb}
-INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.228:29510}
+EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-D}
+SCENARIO_LOWER=${EXPERIMENT_SCENARIO,,}
+RUN_TAG=${RUN_TAG:-${EXPERIMENT_SCENARIO}}
+SCHEDULER_CSV=${SCHEDULER_CSV:-scheduler_${BANDIT_POLICY}_${RUN_TAG}.csv}
+INIT_METHOD=${INIT_METHOD:-tcp://10.50.1.130:29510}
 COMPUTE_DEVICE=${COMPUTE_DEVICE:-cuda}
 MODEL_DIR=${MODEL_DIR:-/home/dingcong/models/TinyLlama}
-INPUT_CSV=${INPUT_CSV:-./dataset/input10.csv}
-OUTPUT_CSV=${OUTPUT_CSV:-outputs_kv.csv}
+INPUT_CSV=${INPUT_CSV:-./dataset/single_scenario_${SCENARIO_LOWER}_500.csv}
+OUTPUT_CSV=${OUTPUT_CSV:-outputs_${BANDIT_POLICY}_${RUN_TAG}.csv}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-1800}
-EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-}
 FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-}
 ```
 
@@ -43,14 +45,14 @@ PREFILL_MODE      distributed 或 cloud-base
 BATCH_SIZE        每个 batch 的 prompt 数量
 SPLIT_LAYERS      默认 transformer 层切分点，例如 5,15
 SCHEDULER_CSV     Rank 0 使用的调度文件，不存在时自动创建
-BANDIT_POLICY     ucb、contextual、contextual_controlled、lipschitz 等调度策略
+BANDIT_POLICY     ucb、lipschitz、epsilon_greedy、thompson_sampling 等调度策略
 INIT_METHOD       torch.distributed rendezvous 地址
 COMPUTE_DEVICE    Rank 0 的计算设备，cuda 或 cpu
 MODEL_DIR         TinyLlama 模型目录
 INPUT_CSV         Rank 0 读取的输入 CSV
 OUTPUT_CSV        Rank 0 写出的结果 CSV
 MAX_INPUT_TOKENS  输入 prompt 最大 token 长度
-EXPERIMENT_SCENARIO 单场景 UCB1/Lipschitz 实验；可选 A、B、C、D、E、F
+EXPERIMENT_SCENARIO 单场景 bandit 实验；可选 A、B、C、D、E、F
 FORCE_DECODE_STEPS 固定 decode forward 次数；空值表示按 EOS / max_new_tokens 自然停止
 ```
 
@@ -62,25 +64,66 @@ FORCE_DECODE_STEPS=${FORCE_DECODE_STEPS:-128}
 
 该参数对应命令行 `--force-decode-steps 128`。它会忽略 EOS，强制执行 128 次 prefill 之后的 decode forward。prefill 直接得到的 first token 不计入这 128 步。
 
-## 单场景 UCB1 / Lipschitz 对比
+## A-F 单场景四算法对比
 
-单场景 CSV 只需包含 `prompt` 列。每次显式指定一个场景，并分别运行两个 policy：
-
-```bash
-BANDIT_POLICY=${BANDIT_POLICY:-ucb}
-EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-D}
-BATCH_SIZE=${BATCH_SIZE:-1}
-INPUT_CSV=${INPUT_CSV:-./dataset/single_scenario_d_500.csv}
-```
-
-第二组只需把 `BANDIT_POLICY` 改为 `lipschitz`。场景固定输出为：
+当前分支的 `run.sh` 默认运行 D 场景，但可通过 `EXPERIMENT_SCENARIO=A` 到
+`EXPERIMENT_SCENARIO=F` 切换。CSV 只需包含 `prompt` 列，不限制数据行数；
+`BATCH_SIZE=1` 时每一行自然形成一个 batch，输入多少行就运行多少个 batch。
+默认网络环境在 `environment.py` 中固定为：
 
 ```text
-A=90  B=400  C=256  D=32  E=768  F=512 token IDs
+Rank 0 -> Rank 1: 10 ms
+Rank 1 -> Rank 2: 30 ms
+Rank 2 -> Rank 0: 40 ms
+其他两条链路: 0 ms
 ```
 
+四组实验分别把 `BANDIT_POLICY` 设为：
+
+```bash
+BANDIT_POLICY=ucb
+BANDIT_POLICY=lipschitz
+BANDIT_POLICY=epsilon_greedy
+BANDIT_POLICY=thompson_sampling
+```
+
+每组都在三台机器上运行 `./run.sh 0`、`./run.sh 1`、`./run.sh 2`。Rank 0
+会根据 policy 自动使用互不覆盖的 scheduler/output 文件名。若数据文件不在
+`./dataset/`，可显式传入 `INPUT_CSV=/path/to/data.csv`。
+
+例如切换到 E 场景时，Rank 0 可以运行：
+
+```bash
+EXPERIMENT_SCENARIO=E BANDIT_POLICY=lipschitz ./run.sh 0
+```
+
+未显式设置 `INPUT_CSV` 时，脚本会随场景自动选择
+`single_scenario_a_500.csv` 到 `single_scenario_f_500.csv`。使用其他行数的
+数据集时直接设置 `INPUT_CSV` 即可。
+
+四个策略共用 195 个候选 arm、seed 42、首个完成 batch 全局 warmup、逐 batch
+reward 和计时口径。关键参数为：
+
+| Policy | 参数/规则 |
+|---|---|
+| `ucb` | 探索权重 `0.01`，未观测 arm 优先，之后使用经典 UCB1 score |
+| `lipschitz` | 探索权重 `0.05`，`q1=q2=0.5` 初始化，使用在线距离与置信界 |
+| `epsilon_greedy` | `epsilon=0.05`，每个 arm 先观测一次，再做探索/利用 |
+| `thompson_sampling` | 每个 arm 使用 `Beta(1,1)` 先验，连续 reward 作分数计数更新 |
+
+各场景的输入检查范围和固定输出为：
+
+| 场景 | 输入 token 范围 | 输出 token IDs |
+|---|---:|---:|
+| A | 800–1500 | 90 |
+| B | 10–150 | 400 |
+| C | 200–600 | 256 |
+| D | 1500–1800 | 32 |
+| E | 10–64 | 768 |
+| F | 800–1100 | 512 |
+
 prefill first token 计入目标总数，所以实际 `decode_step_count=target_output_tokens-1`。
-scenario 只控制输出长度与日志标签，不参与 UCB1/Lipschitz 选臂。该模式不能与
+scenario 只控制输出长度与日志标签，不参与四个非 contextual policy 选臂。该模式不能与
 `FORCE_DECODE_STEPS` 同时使用；decode 参数仍由实验者使用现有配置手动调整。
 
 每次运行新增：
@@ -90,8 +133,28 @@ bandit_logs/batch_metrics_{policy}_{scenario}_{timestamp}.csv
 bandit_logs/run_summary_{policy}_{scenario}_{timestamp}.csv
 ```
 
-前者每个 batch 一行，记录统一 reward、累计 reward、scheduler select/update
-耗时、推理墙钟时间和切层时间；后者记录整次运行汇总。
+前者每个 batch 一行，记录 `policy`、策略参数、`used_arm`、`next_arm`、统一
+reward、累计 reward、`scheduler_select_ms`、`scheduler_update_ms`、
+`scheduler_algorithm_ms`、三条链路的实际 delay、推理墙钟时间和切层时间。
+算法计时不包含 CSV/文本日志写盘；Lipschitz 为详细审计生成置信界快照的时间
+单独记录在 `scheduler_audit_ms`，也不混入算法时间。后者记录整次运行汇总，并额外给出 scheduler 算法耗时的
+mean/p50/p95/max 以及 `algorithm_overhead_percent`。
+
+四组都完成后运行：
+
+```bash
+python extract_bandit_results.py \
+  --log-dir bandit_logs \
+  --scenario D
+```
+
+脚本根据配套 `run_summary` 的 `status=complete` 识别完整运行，并检查四个
+policy 的 batch 数相同、batch 号从 1 连续排列。输出：
+
+```text
+bandit_logs/comparison_batches_D.csv   # 4 × N 行逐 batch 数据
+bandit_logs/comparison_summary_D.csv   # 4 行算法汇总
+```
 
 ## Contextual Controlled Policy
 
@@ -210,7 +273,7 @@ Bandwidth[4], time_comm_delay[4] = Rank 2 -> Rank 1
 
 ```python
 DEFAULT_BANDWIDTH = [None, None, None, None, None]
-DEFAULT_TIME_COMM_DELAY = [0.0, 0.0, 0.0, 0.0, 0.0]
+DEFAULT_TIME_COMM_DELAY = [10.0, 30.0, 40.0, 0.0, 0.0]
 DEFAULT_SCHEDULE = {}
 ```
 
